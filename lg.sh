@@ -953,14 +953,64 @@ log_ok "Part B complete"
 section "LAYER 9: Namespace Isolation (systemd-nspawn)"
 
 setup_nspawn() {
-    # Availability check
+    # ── Auto-install systemd-nspawn if missing ────────────────────────────────
     if ! command -v systemd-nspawn &>/dev/null; then
-        log_warn "systemd-nspawn not found"
-        command -v apt-get &>/dev/null && log_info "Install: apt install systemd-container -y"
-        command -v yum     &>/dev/null && log_info "Install: yum install systemd-container -y"
-        command -v dnf     &>/dev/null && log_info "Install: dnf install systemd-container -y"
+        log_warn "systemd-nspawn not found — attempting automatic installation..."
+
+        if [ "$DRY_RUN" = true ]; then
+            log_dry "Install systemd-container package"
+        else
+            NSPAWN_INSTALLED=false
+
+            if command -v apt-get &>/dev/null; then
+                log_info "Detected: apt — installing systemd-container..."
+                DEBIAN_FRONTEND=noninteractive apt-get install -y -qq systemd-container 2>/dev/null \
+                    && NSPAWN_INSTALLED=true
+
+            elif command -v dnf &>/dev/null; then
+                log_info "Detected: dnf — installing systemd-container..."
+                dnf install -y -q systemd-container 2>/dev/null \
+                    && NSPAWN_INSTALLED=true
+
+            elif command -v yum &>/dev/null; then
+                log_info "Detected: yum — installing systemd-container..."
+                yum install -y -q systemd-container 2>/dev/null \
+                    && NSPAWN_INSTALLED=true
+
+            elif command -v apk &>/dev/null; then
+                log_info "Detected: apk — installing systemd-nspawn..."
+                apk add -q systemd 2>/dev/null \
+                    && NSPAWN_INSTALLED=true
+
+            elif command -v pacman &>/dev/null; then
+                log_info "Detected: pacman — systemd-nspawn is part of systemd..."
+                pacman -S --noconfirm -q systemd 2>/dev/null \
+                    && NSPAWN_INSTALLED=true
+
+            else
+                log_warn "No supported package manager found"
+            fi
+
+            if [ "$NSPAWN_INSTALLED" = true ] && command -v systemd-nspawn &>/dev/null; then
+                log_ok "systemd-nspawn installed successfully"
+            else
+                log_warn "Could not install systemd-nspawn automatically"
+                log_info "Install manually then re-run:"
+                log_info "  Debian/Ubuntu : apt install systemd-container -y"
+                log_info "  CentOS/RHEL   : yum install systemd-container -y"
+                log_info "  Fedora        : dnf install systemd-container -y"
+                log_info "  Alpine        : apk add systemd"
+                return 1
+            fi
+        fi
+    fi
+
+    # ── Verify systemd-nspawn is available ────────────────────────────────────
+    if ! command -v systemd-nspawn &>/dev/null && [ "$DRY_RUN" = false ]; then
+        log_warn "systemd-nspawn still not available — skipping isolation"
         return 1
     fi
+
     log_ok "systemd-nspawn: $(systemd-nspawn --version 2>/dev/null | head -1)"
 
     # Discover sites
