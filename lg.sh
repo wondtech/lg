@@ -22,7 +22,7 @@
 #   sudo lg --cron           Silent mode for cron jobs
 #   sudo lg --dry-run        Preview changes without applying
 #   sudo lg --undo           Rollback all changes from last run
-#   sudo lg --setup-auto     Install daily cron + new-user hook
+#   sudo lg --watch          Watch for new sites and isolate them automatically
 # ══════════════════════════════════════════════════════════════════════════════
 
 set -uo pipefail
@@ -145,12 +145,12 @@ UNDO_MODE=false
 
 for arg in "$@"; do
     case "$arg" in
-        --cron)       RUN_MODE="cron";       exec > /dev/null 2>&1 ;;
-        --auto)       RUN_MODE="auto" ;;
-        --setup-auto) RUN_MODE="setup-auto" ;;
-        --dry-run)    DRY_RUN=true ;;
-        --undo)       UNDO_MODE=true ;;
-        --help|-h)    grep '^#   sudo lg' "$0"; exit 0 ;;
+        --cron)    RUN_MODE="cron";  exec > /dev/null 2>&1 ;;
+        --auto)    RUN_MODE="auto" ;;
+        --dry-run) DRY_RUN=true ;;
+        --undo)    UNDO_MODE=true ;;
+        --watch)   ;; # handled after globals are set
+        --help|-h) grep '^#   sudo lg' "$0"; exit 0 ;;
     esac
 done
 
@@ -173,6 +173,15 @@ chmod 700 "$BACKUP_DIR"
 # Tee output to log file (not in dry-run, not in cron)
 if [ "$DRY_RUN" = false ] && [ "$RUN_MODE" != "cron" ]; then
     exec > >(tee -a "$LOG_FILE") 2>&1
+fi
+
+# ── Ask for alert email once — used by Auditd, ClamAV, and Watch mode ────────
+if [[ "$RUN_MODE" == "interactive" ]] && [ "$DRY_RUN" = false ] && [ "$UNDO_MODE" = false ]; then
+    echo ""
+    read -r -p "  Alert email for security notifications (default: root): " _INPUT_EMAIL
+    [ -n "$_INPUT_EMAIL" ] && ALERT_EMAIL="$_INPUT_EMAIL"
+    echo -e "  ${GREEN}[OK]${NC}      Alert email: ${ALERT_EMAIL}"
+    echo ""
 fi
 
 # Dry-run banner
@@ -832,6 +841,66 @@ EOF
         chmod 640 "$AUDIT_RULES"
         echo "AUDITD_RULE:${AUDIT_RULES}" >> "$UNDO_MANIFEST"
 
+        # ── Email alert script — triggered by audisp ──────────────────────────
+        AUDISP_ALERT="/etc/audit/lg-alert.sh"
+        cat > "$AUDISP_ALERT" << ALERTEOF
+#!/bin/bash
+# Linux Guardian — Auditd email alert
+# Called by audispd when a monitored rule fires
+ALERT_EMAIL="${ALERT_EMAIL}"
+LOG="${LOG_FILE}"
+
+read -r -t 1 LINE || true
+[ -z "\$LINE" ] && exit 0
+
+# Only alert on our rule keys
+echo "\$LINE" | grep -qE '"key":"(webshell|tmp_exec|priv_esc|passwd_change|shadow_change|sudoers_change|home_exec)"' || exit 0
+
+TS=\$(date '+%Y-%m-%d %H:%M:%S')
+HOST=\$(hostname)
+KEY=\$(echo "\$LINE" | grep -oP '"key":"\K[^"]+')
+COMM=\$(echo "\$LINE" | grep -oP '"comm":"\K[^"]+' || echo "unknown")
+PID=\$(echo "\$LINE"  | grep -oP '"pid":\K[0-9]+'  || echo "?")
+
+SUBJECT="[LG ALERT] \${KEY} detected on \${HOST}"
+BODY=\$(printf "Linux Guardian Security Alert\n\nHost:    %s\nTime:    %s\nKey:     %s\nProcess: %s (PID %s)\n\nRaw event:\n%s\n\nLog: %s" \
+    "\$HOST" "\$TS" "\$KEY" "\$COMM" "\$PID" "\$LINE" "\$LOG")
+
+echo "\$BODY" | mail -s "\$SUBJECT" "\$ALERT_EMAIL" 2>/dev/null
+echo "\$TS [ALERT] \$KEY — \$COMM (PID \$PID)" >> "\$LOG"
+ALERTEOF
+        chmod 750 "$AUDISP_ALERT"
+        echo "AUDITD_RULE:${AUDISP_ALERT}" >> "$UNDO_MANIFEST"
+        log_ok "Alert script: ${AUDISP_ALERT}  (email: ${ALERT_EMAIL})"
+
+        # ── Register alert script with audisp ─────────────────────────────────
+        AUDISP_PLUGIN_DIR=""
+        [ -d /etc/audisp/plugins.d ] && AUDISP_PLUGIN_DIR="/etc/audisp/plugins.d"
+        [ -d /etc/audit/plugins.d  ] && AUDISP_PLUGIN_DIR="/etc/audit/plugins.d"
+
+        if [ -n "$AUDISP_PLUGIN_DIR" ]; then
+            cat > "${AUDISP_PLUGIN_DIR}/lg-alert.conf" << PLUGEOF
+active = yes
+direction = out
+path = ${AUDISP_ALERT}
+type = always
+format = json
+PLUGEOF
+            log_ok "Audisp plugin registered: ${AUDISP_PLUGIN_DIR}/lg-alert.conf"
+            echo "AUDITD_RULE:${AUDISP_PLUGIN_DIR}/lg-alert.conf" >> "$UNDO_MANIFEST"
+        else
+            log_warn "audisp plugins directory not found — email alerts via cron fallback"
+            # Fallback: cron checks audit log every minute
+            AUDIT_CRON="/etc/cron.d/lg-audit-alert"
+            cat > "$AUDIT_CRON" << CRONEOF
+# Linux Guardian — audit alert fallback (runs every minute)
+* * * * * root ausearch -k webshell -k tmp_exec -k priv_esc -ts recent 2>/dev/null | grep -q 'type=SYSCALL' && ausearch -k webshell -k tmp_exec -k priv_esc -ts recent 2>/dev/null | mail -s "[LG ALERT] Suspicious activity on \$(hostname)" ${ALERT_EMAIL}
+CRONEOF
+            chmod 640 "$AUDIT_CRON"
+            echo "AUDITD_RULE:${AUDIT_CRON}" >> "$UNDO_MANIFEST"
+            log_ok "Fallback cron alert installed: ${AUDIT_CRON}"
+        fi
+
         systemctl enable auditd 2>/dev/null
         systemctl restart auditd 2>/dev/null \
             && log_ok "Auditd restarted" \
@@ -875,12 +944,7 @@ else
 fi
 
 if [ -d /etc/pure-ftpd ] && [ "$DRY_RUN" = false ]; then
-    if [[ "$RUN_MODE" == "cron" || "$RUN_MODE" == "auto" ]]; then
-        ALERT_EMAIL="root"
-    else
-        read -r -p "  Alert email for ClamAV (default: root): " ALERT_EMAIL
-        [ -z "$ALERT_EMAIL" ] && ALERT_EMAIL="root"
-    fi
+    log_info "ClamAV alert email: ${ALERT_EMAIL}"
     cat > /etc/pure-ftpd/clamav_check.sh << CLAMAVEOF
 #!/bin/bash
 # Linux Guardian — ClamAV upload scanner
@@ -1087,10 +1151,32 @@ setup_nspawn() {
         getent passwd www-data apache 2>/dev/null | head -1 > "${SITE_DIR}/etc/passwd"
         getent group  www-data apache 2>/dev/null | head -1 > "${SITE_DIR}/etc/group"
 
+        # Detect site owner and working directory
+        # /var/www/sitename      → WorkingDirectory=/var/www
+        # /home/user/public_html → WorkingDirectory=/home/user/public_html
+        if [[ "$site" == /home/* ]]; then
+            SITE_OWNER=$(echo "$site" | cut -d/ -f3)
+            WORK_DIR="/home/${SITE_OWNER}/public_html"
+            CONTAINER_WORKDIR="/home/${SITE_OWNER}/public_html"
+            # Create home path inside container
+            mkdir -p "${SITE_DIR}/home/${SITE_OWNER}/public_html"
+            BIND_TARGET="${SITE_DIR}/home/${SITE_OWNER}/public_html"
+        else
+            SITE_OWNER="www-data"
+            WORK_DIR="/var/www"
+            CONTAINER_WORKDIR="/var/www"
+            BIND_TARGET="${SITE_DIR}/var/www"
+        fi
+
+        # Determine site user (prefer actual owner over www-data)
+        SITE_USER=$(stat -c '%U' "$site" 2>/dev/null || echo "www-data")
+        # Fall back to www-data if user doesn't exist inside container
+        id "$SITE_USER" &>/dev/null || SITE_USER="www-data"
+
         # Bind site files read-only
-        if mount --bind "$site" "${SITE_DIR}/var/www" 2>/dev/null; then
-            mount -o remount,ro,bind "${SITE_DIR}/var/www" 2>/dev/null || true
-            log_ok "Site bound read-only: $site"
+        if mount --bind "$site" "$BIND_TARGET" 2>/dev/null; then
+            mount -o remount,ro,bind "$BIND_TARGET" 2>/dev/null || true
+            log_ok "Site bound read-only: $site → $BIND_TARGET"
         else
             log_warn "Could not bind: $site"
         fi
@@ -1104,8 +1190,8 @@ setup_nspawn() {
         mkdir -p /etc/systemd/nspawn
         cat > "/etc/systemd/nspawn/${SN}.nspawn" << EOF
 [Exec]
-User=www-data
-WorkingDirectory=/var/www
+User=${SITE_USER}
+WorkingDirectory=${CONTAINER_WORKDIR}
 
 [Files]
 TemporaryFileSystem=/tmp:noexec,nosuid,nodev,size=32M
@@ -1178,39 +1264,262 @@ fi
 log_ok "Layer 9 complete"
 
 # ══════════════════════════════════════════════════════════════════════════════
-# PART C — Auto-update (cron + new-user hook)
+# PART C — Watch Mode (auto-isolate new sites)
+# Monitors /var/www and /home for new sites and isolates them automatically
+# Usage: sudo lg --watch
 # ══════════════════════════════════════════════════════════════════════════════
-section "PART C: Auto-update Setup"
 
-setup_auto_update() {
-    local SCRIPT_PATH
-    SCRIPT_PATH=$(realpath "$0" 2>/dev/null || echo "$0")
-    local CRON_JOB="0 3 * * * ${SCRIPT_PATH} --cron >> ${LOG_FILE} 2>&1"
+watch_mode() {
+    section "WATCH MODE — Auto-isolating new sites"
 
-    crontab -l 2>/dev/null | grep -v "$SCRIPT_PATH" | crontab - 2>/dev/null || true
-    ( crontab -l 2>/dev/null; echo "$CRON_JOB" ) | crontab -
-    log_ok "Cron job installed — daily at 03:00"
+    # ── Require inotifywait ───────────────────────────────────────────────────
+    if ! command -v inotifywait &>/dev/null; then
+        log_warn "inotifywait not found — attempting install..."
+        if command -v apt-get &>/dev/null; then
+            DEBIAN_FRONTEND=noninteractive apt-get install -y -qq inotify-tools 2>/dev/null
+        elif command -v dnf &>/dev/null; then
+            dnf install -y -q inotify-tools 2>/dev/null
+        elif command -v yum &>/dev/null; then
+            yum install -y -q inotify-tools 2>/dev/null
+        elif command -v apk &>/dev/null; then
+            apk add -q inotify-tools 2>/dev/null
+        elif command -v pacman &>/dev/null; then
+            pacman -S --noconfirm -q inotify-tools 2>/dev/null
+        fi
 
-    cat > /usr/local/bin/lg-user-hook << HOOKEOF
-#!/bin/bash
-# Linux Guardian — new user security hook
-NEW_USER="\$1"
-[ -z "\$NEW_USER" ] && exit 0
-USER_HOME=\$(getent passwd "\$NEW_USER" | cut -d: -f6)
-if [ -d "\$USER_HOME/public_html" ]; then
-    logger -t lg-hardening "Hardening new user: \$NEW_USER"
-    ${SCRIPT_PATH} --auto >> ${LOG_FILE} 2>&1
-fi
-HOOKEOF
-    chmod 750 /usr/local/bin/lg-user-hook
-    log_ok "New-user hook: /usr/local/bin/lg-user-hook"
-    log_info "cPanel link: ln -s /usr/local/bin/lg-user-hook /scripts/prewwwacct"
+        if ! command -v inotifywait &>/dev/null; then
+            log_error "Could not install inotify-tools — watch mode unavailable"
+            log_info "Install manually:"
+            log_info "  Debian/Ubuntu : apt install inotify-tools -y"
+            log_info "  CentOS/RHEL   : yum install inotify-tools -y"
+            log_info "  Fedora        : dnf install inotify-tools -y"
+            log_info "  Alpine        : apk add inotify-tools"
+            exit 1
+        fi
+        log_ok "inotify-tools installed"
+    fi
+
+    # ── Collect already-isolated sites (skip on next detection) ──────────────
+    KNOWN_SITES=()
+    for d in /var/lib/lg-nspawn/*/; do
+        [ -d "$d" ] && KNOWN_SITES+=("$(basename "$d")")
+    done
+
+    log_ok "Watch mode started — monitoring for new sites"
+    log_info "Watching: /var/www  |  /home"
+    log_info "Log: ${LOG_FILE}"
+    log_info "Press Ctrl+C to stop"
+    echo ""
+
+    # ── Watch loop ────────────────────────────────────────────────────────────
+    inotifywait \
+        --monitor \
+        --quiet \
+        --event create \
+        --event moved_to \
+        --format '%w%f' \
+        /var/www \
+        /home \
+        2>/dev/null | while IFS= read -r NEW_PATH; do
+
+        # Only care about directories
+        [ -d "$NEW_PATH" ] || continue
+
+        # Normalise site name
+        SN=$(echo "$NEW_PATH" \
+            | sed 's|/var/www/||;s|/home/||;s|/public_html||;s|/$||;s|/||g' \
+            | tr -cd '[:alnum:]-_' \
+            | cut -c1-32)
+
+        # Skip if empty name
+        [ -z "$SN" ] && continue
+
+        # Skip known/already-isolated sites
+        ALREADY_KNOWN=false
+        for k in "${KNOWN_SITES[@]:-}"; do
+            [ "$k" = "$SN" ] && ALREADY_KNOWN=true && break
+        done
+        [ "$ALREADY_KNOWN" = true ] && continue
+
+        # Skip system directories
+        case "$SN" in
+            html|cgi-bin|lost+found|tmp|var|etc|bin|usr|lib|lib64|proc|sys|dev)
+                continue ;;
+        esac
+
+        # ── New site detected ─────────────────────────────────────────────────
+        TS=$(date '+%Y-%m-%d %H:%M:%S')
+        echo ""
+        echo -e "  ${GREEN}[${TS}]${NC} New site detected: ${BOLD}${SN}${NC}  (${NEW_PATH})"
+        echo "${TS} [WATCH] New site detected: ${SN} (${NEW_PATH})" >> "$LOG_FILE"
+
+        # Wait briefly for site files to be fully written
+        sleep 2
+
+        # ── Isolate in nspawn container ───────────────────────────────────────
+        NSPAWN_BASE="/var/lib/lg-nspawn"
+        SITE_DIR="${NSPAWN_BASE}/${SN}"
+
+        mkdir -p "${SITE_DIR}"/{bin,lib,lib64,usr/lib,etc,tmp,var/www,proc,sys,dev,run}
+
+        # Copy required binaries
+        for b in sh php php-fpm; do
+            bp=$(command -v "$b" 2>/dev/null || true)
+            [ -n "$bp" ] && cp "$bp" "${SITE_DIR}/bin/" 2>/dev/null || true
+        done
+
+        # Copy shared libraries
+        for bp in "${SITE_DIR}"/bin/*; do
+            [ -f "$bp" ] || continue
+            ldd "$bp" 2>/dev/null | grep -Eo '/[^ ]+\.so[^ ]*' | while read -r lib; do
+                [ -f "$lib" ] && cp --parents "$lib" "${SITE_DIR}/" 2>/dev/null || true
+            done
+        done
+
+        # Minimal /etc
+        cp /etc/resolv.conf "${SITE_DIR}/etc/" 2>/dev/null || true
+        cp /etc/localtime   "${SITE_DIR}/etc/" 2>/dev/null || true
+        getent passwd www-data apache 2>/dev/null | head -1 \
+            > "${SITE_DIR}/etc/passwd"
+        getent group www-data apache 2>/dev/null | head -1 \
+            > "${SITE_DIR}/etc/group"
+
+        # Detect site owner and working directory
+        if [[ "$NEW_PATH" == /home/* ]]; then
+            SITE_OWNER=$(echo "$NEW_PATH" | cut -d/ -f3)
+            CONTAINER_WORKDIR="/home/${SITE_OWNER}/public_html"
+            mkdir -p "${SITE_DIR}/home/${SITE_OWNER}/public_html"
+            BIND_TARGET="${SITE_DIR}/home/${SITE_OWNER}/public_html"
+        else
+            SITE_OWNER="www-data"
+            CONTAINER_WORKDIR="/var/www"
+            BIND_TARGET="${SITE_DIR}/var/www"
+        fi
+
+        SITE_USER=$(stat -c '%U' "$NEW_PATH" 2>/dev/null || echo "www-data")
+        id "$SITE_USER" &>/dev/null || SITE_USER="www-data"
+
+        # Bind site files read-only
+        if mount --bind "$NEW_PATH" "$BIND_TARGET" 2>/dev/null; then
+            mount -o remount,ro,bind "$BIND_TARGET" 2>/dev/null || true
+        fi
+
+        # noexec /tmp inside container
+        mount -t tmpfs -o size=32M,noexec,nosuid,nodev \
+            tmpfs "${SITE_DIR}/tmp" 2>/dev/null || true
+
+        # Assign IP from pool
+        SITE_IP_LAST=$(( 10 + $(ls /var/lib/lg-nspawn/ 2>/dev/null | wc -l) ))
+        SITE_IP="10.200.0.${SITE_IP_LAST}"
+
+        # nspawn config
+        mkdir -p /etc/systemd/nspawn
+        cat > "/etc/systemd/nspawn/${SN}.nspawn" << EOF
+[Exec]
+User=${SITE_USER}
+WorkingDirectory=${CONTAINER_WORKDIR}
+
+[Files]
+TemporaryFileSystem=/tmp:noexec,nosuid,nodev,size=32M
+
+[Network]
+VirtualEthernet=yes
+Bridge=nspawn-br0
+EOF
+
+        # systemd service
+        cat > "/etc/systemd/system/nspawn-${SN}.service" << EOF
+[Unit]
+Description=Linux Guardian — Isolated site: ${SN}
+After=network.target
+
+[Service]
+Type=notify
+ExecStart=/usr/bin/systemd-nspawn \
+    --machine=${SN} \
+    --directory=${SITE_DIR} \
+    --user=www-data \
+    --private-users=pick \
+    --private-users-chown \
+    --network-bridge=nspawn-br0 \
+    --tmpfs=/tmp:noexec,nosuid,nodev,size=32M \
+    --read-only \
+    --drop-capability=CAP_SYS_ADMIN \
+    --drop-capability=CAP_NET_ADMIN \
+    --drop-capability=CAP_SYS_PTRACE \
+    /bin/php-fpm --nodaemonize
+Restart=on-failure
+RestartSec=5
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+        systemctl daemon-reload
+        systemctl enable "nspawn-${SN}.service" 2>/dev/null
+        systemctl start  "nspawn-${SN}.service" 2>/dev/null
+
+        if systemctl is-active --quiet "nspawn-${SN}.service" 2>/dev/null; then
+            echo -e "  ${GREEN}[OK]${NC}      ${SN} isolated successfully  (IP: ${SITE_IP})"
+            echo "${TS} [WATCH] ${SN} isolated successfully (IP: ${SITE_IP})" >> "$LOG_FILE"
+        else
+            echo -e "  ${YELLOW}[WARN]${NC}    ${SN} container not active — check: journalctl -u nspawn-${SN}"
+            echo "${TS} [WATCH] ${SN} container failed to start" >> "$LOG_FILE"
+        fi
+
+        # ── Apply open_basedir for the new site in all php.ini files ─────────
+        NEW_BASEDIR="${NEW_PATH}:/tmp:/usr/share/php:/usr/share/pear"
+        UPDATED_INI=0
+        while IFS= read -r inifile; do
+            [ -f "$inifile" ] || continue
+            # Skip CLI php.ini — open_basedir not needed there
+            [[ "$inifile" == *cli* ]] && continue
+
+            if grep -qE "^\s*open_basedir\s*=" "$inifile"; then
+                # Append new path if not already present
+                CURRENT=$(grep -E "^\s*open_basedir\s*=" "$inifile" | head -1)
+                if ! echo "$CURRENT" | grep -q "$NEW_PATH"; then
+                    sed -i "s|^\s*open_basedir\s*=.*|&:${NEW_PATH}|" "$inifile"
+                    echo "${TS} [WATCH] open_basedir updated for ${SN} in ${inifile}" >> "$LOG_FILE"
+                    UPDATED_INI=$((UPDATED_INI + 1))
+                fi
+            else
+                echo "open_basedir = ${NEW_BASEDIR}" >> "$inifile"
+                echo "${TS} [WATCH] open_basedir added for ${SN} in ${inifile}" >> "$LOG_FILE"
+                UPDATED_INI=$((UPDATED_INI + 1))
+            fi
+        done < <(find / -maxdepth 7 -type f -name "php.ini" 2>/dev/null | sort -u)
+
+        if [ "$UPDATED_INI" -gt 0 ]; then
+            echo -e "  ${GREEN}[OK]${NC}      open_basedir updated in ${UPDATED_INI} php.ini file(s)"
+            echo "${TS} [WATCH] open_basedir updated in ${UPDATED_INI} php.ini(s) for ${SN}" >> "$LOG_FILE"
+            # Restart web server to apply changes
+            for svc in apache2 httpd nginx php-fpm; do
+                systemctl is-active --quiet "$svc" 2>/dev/null \
+                    && systemctl restart "$svc" 2>/dev/null \
+                    && echo -e "  ${GREEN}[OK]${NC}      Restarted: ${svc}" \
+                    || true
+            done
+        fi
+
+        # Add to known sites so we don't process it again
+        KNOWN_SITES+=("$SN")
+        echo ""
+    done
 }
 
-if [[ "${1:-}" == "--setup-auto" ]]; then
-    setup_auto_update
-else
-    log_info "Run 'sudo lg --setup-auto' to install daily cron + new-user hook"
+# ── Entry point for --watch ───────────────────────────────────────────────────
+if [[ "${1:-}" == "--watch" ]]; then
+    if [ "$(id -u)" -ne 0 ]; then
+        log_error "Watch mode must be run as root"
+        exit 1
+    fi
+    watch_mode
+    exit 0
 fi
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1245,6 +1554,7 @@ if [ "$DRY_RUN" = false ]; then
     echo ""
     echo -e "  ${CYAN}Backups:${NC}  $BACKUP_DIR"
     echo -e "  ${CYAN}Rollback:${NC} sudo $0 --undo"
+    echo -e "  ${CYAN}Watch:${NC}    sudo $0 --watch"
     echo -e "  ${CYAN}Log:${NC}      $LOG_FILE"
     echo ""
     echo -e "${YELLOW}Verify:${NC}"
