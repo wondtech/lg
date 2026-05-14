@@ -638,51 +638,144 @@ fi
 log_ok "Layer 5 complete"
 
 # ══════════════════════════════════════════════════════════════════════════════
-# LAYER 6 — noexec on /tmp and /var/tmp
-# Prevent execution of attacker-uploaded binaries from writable dirs
+# LAYER 6 — noexec on writable directories
+# Auto-detects site roots and applies noexec to prevent binary execution
 # ══════════════════════════════════════════════════════════════════════════════
-section "LAYER 6: noexec on /tmp and /var/tmp"
+section "LAYER 6: noexec on writable directories (auto-detect)"
 
-apply_noexec() {
-    local mnt="$1" size="${2:-256M}"
+# ── Helper: apply noexec to a single directory ────────────────────────────────
+# For /tmp /var/tmp : safe to overlay with tmpfs if not a mountpoint
+# For site dirs     : bind-mount only — never replace with tmpfs (has real data)
+_apply_noexec_dir() {
+    local mnt="$1"
+    local allow_tmpfs="${2:-false}"   # true only for /tmp and /var/tmp
+    local size="${3:-256M}"
 
-    if mountpoint -q "$mnt" 2>/dev/null; then
-        if mount | grep -q " on $mnt .*noexec"; then
-            log_ok "$mnt is already noexec"
-        elif [ "$DRY_RUN" = true ]; then
-            log_dry "remount $mnt noexec,nosuid,nodev"
-        else
-            mount -o remount,noexec,nosuid,nodev "$mnt" 2>/dev/null \
-                && log_ok "$mnt remounted noexec" \
-                || log_warn "Could not remount $mnt"
-            echo "MOUNT_NOEXEC:${mnt}" >> "$UNDO_MANIFEST"
-        fi
-    else
-        if [ "$DRY_RUN" = true ]; then
-            log_dry "Mount tmpfs noexec on $mnt (size=${size})"
-        else
-            mount -t tmpfs -o "size=${size},noexec,nosuid,nodev" tmpfs "$mnt" 2>/dev/null \
-                && log_ok "$mnt overlaid with noexec tmpfs (${size})" \
-                || log_warn "$mnt tmpfs mount failed — add manually to /etc/fstab"
-            echo "MOUNT_NOEXEC:${mnt}" >> "$UNDO_MANIFEST"
-        fi
+    # Already noexec?
+    if mount 2>/dev/null | grep -qE " on ${mnt} .*noexec"; then
+        log_ok "${mnt}  →  already noexec"
+        return 0
     fi
 
-    # Persist across reboots
-    if [ "$DRY_RUN" = false ]; then
-        if ! grep -qE "tmpfs\s+${mnt}\s" /etc/fstab 2>/dev/null; then
-            echo "# Linux Guardian: noexec ${mnt}" >> /etc/fstab
-            echo "tmpfs ${mnt} tmpfs defaults,noexec,nosuid,nodev,size=${size} 0 0" >> /etc/fstab
-            echo "FSTAB_TMP:${mnt}" >> "$UNDO_MANIFEST"
-            log_ok "Added to /etc/fstab: $mnt"
+    if mountpoint -q "$mnt" 2>/dev/null; then
+        # Separate mountpoint — safe to remount
+        if [ "$DRY_RUN" = true ]; then
+            log_dry "remount ${mnt} noexec,nosuid,nodev"
         else
-            log_info "fstab entry already exists for $mnt"
+            mount -o remount,noexec,nosuid,nodev "$mnt" 2>/dev/null \
+                && log_ok "${mnt}  →  remounted noexec" \
+                || log_warn "${mnt}  →  remount failed"
+            echo "MOUNT_NOEXEC:${mnt}" >> "$UNDO_MANIFEST"
+        fi
+
+        # Persist in /etc/fstab
+        if [ "$DRY_RUN" = false ]; then
+            if grep -qE "\s${mnt}\s" /etc/fstab 2>/dev/null; then
+                if ! grep -E "\s${mnt}\s" /etc/fstab | grep -q "noexec"; then
+                    sed -i "/\s${mnt//\//\\/}\s/ s/defaults/defaults,noexec,nosuid,nodev/" \
+                        /etc/fstab 2>/dev/null
+                    echo "FSTAB_TMP:${mnt}" >> "$UNDO_MANIFEST"
+                    log_ok "${mnt}  →  noexec persisted in /etc/fstab"
+                fi
+            fi
+        fi
+
+    elif [ "$allow_tmpfs" = "true" ]; then
+        # Not a mountpoint + tmpfs allowed (/tmp, /var/tmp)
+        if [ "$DRY_RUN" = true ]; then
+            log_dry "overlay ${mnt} with tmpfs noexec (size=${size})"
+        else
+            mount -t tmpfs -o "size=${size},noexec,nosuid,nodev" tmpfs "$mnt" 2>/dev/null \
+                && log_ok "${mnt}  →  overlaid with noexec tmpfs (${size})" \
+                || log_warn "${mnt}  →  tmpfs overlay failed"
+            echo "MOUNT_NOEXEC:${mnt}" >> "$UNDO_MANIFEST"
+        fi
+
+        # Persist in /etc/fstab
+        if [ "$DRY_RUN" = false ]; then
+            if ! grep -qE "tmpfs\s+${mnt}\s" /etc/fstab 2>/dev/null; then
+                echo "# Linux Guardian: noexec ${mnt}" >> /etc/fstab
+                echo "tmpfs ${mnt} tmpfs defaults,noexec,nosuid,nodev,size=${size} 0 0" \
+                    >> /etc/fstab
+                echo "FSTAB_TMP:${mnt}" >> "$UNDO_MANIFEST"
+                log_ok "${mnt}  →  added to /etc/fstab"
+            fi
+        fi
+
+    else
+        # Not a mountpoint + no tmpfs allowed → bind-mount on itself
+        if [ "$DRY_RUN" = true ]; then
+            log_dry "bind-mount ${mnt} noexec,nosuid,nodev"
+        else
+            mount --bind "$mnt" "$mnt" 2>/dev/null
+            mount -o remount,noexec,nosuid,nodev,bind "$mnt" 2>/dev/null \
+                && log_ok "${mnt}  →  bind-mounted noexec" \
+                || log_warn "${mnt}  →  bind-mount failed"
+            echo "MOUNT_NOEXEC:${mnt}" >> "$UNDO_MANIFEST"
         fi
     fi
 }
 
-apply_noexec "/tmp"     "256M"
-apply_noexec "/var/tmp" "128M"
+# ── Auto-detect all site root directories ────────────────────────────────────
+detect_site_roots() {
+    local roots=()
+
+    # 1. /var/www subdirectories (each site)
+    for d in /var/www/*/; do
+        [ -d "$d" ] && roots+=("${d%/}")
+    done
+    # If no subdirs, use /var/www itself
+    [ ${#roots[@]} -eq 0 ] && [ -d /var/www ] && roots+=("/var/www")
+
+    # 2. /home/USER/public_html
+    for d in /home/*/public_html/; do
+        [ -d "$d" ] && roots+=("${d%/}")
+    done
+
+    # 3. Custom paths from Apache/Nginx config (DocumentRoot / root)
+    for conf in \
+        /etc/apache2/sites-enabled/*.conf \
+        /etc/httpd/conf.d/*.conf \
+        /etc/nginx/sites-enabled/* \
+        /etc/nginx/conf.d/*.conf; do
+        [ -f "$conf" ] || continue
+        while IFS= read -r docroot; do
+            [ -d "$docroot" ] && roots+=("$docroot")
+        done < <(grep -hEi \
+            '^\s*(DocumentRoot|root)\s+"?([^";\s]+)"?' "$conf" 2>/dev/null \
+            | awk '{print $NF}' | tr -d '"')
+    done
+
+    # Deduplicate
+    printf '%s\n' "${roots[@]}" | sort -u
+}
+
+# ── Apply noexec to /tmp and /var/tmp ─────────────────────────────────────────
+log_info "Applying noexec to temp directories..."
+_apply_noexec_dir "/tmp"     "true"  "256M"
+_apply_noexec_dir "/var/tmp" "true"  "128M"
+
+# ── Auto-detect and apply noexec to site directories ─────────────────────────
+log_info "Auto-detecting site directories..."
+echo ""
+
+SITE_ROOTS=()
+while IFS= read -r root; do
+    SITE_ROOTS+=("$root")
+done < <(detect_site_roots)
+
+if [ ${#SITE_ROOTS[@]} -eq 0 ]; then
+    log_warn "No site directories detected"
+else
+    log_info "Detected ${#SITE_ROOTS[@]} site root(s):"
+    for r in "${SITE_ROOTS[@]}"; do
+        echo "    → $r"
+    done
+    echo ""
+    for root in "${SITE_ROOTS[@]}"; do
+        _apply_noexec_dir "$root" "false"
+    done
+fi
 
 log_ok "Layer 6 complete"
 
@@ -1471,6 +1564,23 @@ EOF
             echo "${TS} [WATCH] ${SN} container failed to start" >> "$LOG_FILE"
         fi
 
+        # ── noexec on the new site directory ─────────────────────────────────
+        # Uses the same _apply_noexec_dir function from LAYER 6
+        if mount 2>/dev/null | grep -qE " on ${NEW_PATH} .*noexec"; then
+            echo -e "  ${GREEN}[OK]${NC}      ${NEW_PATH}  →  already noexec"
+            echo "${TS} [WATCH] ${NEW_PATH} already noexec" >> "$LOG_FILE"
+        else
+            # Try bind-mount on itself with noexec
+            if mount --bind "$NEW_PATH" "$NEW_PATH" 2>/dev/null && \
+               mount -o remount,noexec,nosuid,nodev,bind "$NEW_PATH" 2>/dev/null; then
+                echo -e "  ${GREEN}[OK]${NC}      ${NEW_PATH}  →  noexec applied"
+                echo "${TS} [WATCH] ${NEW_PATH} noexec applied" >> "$LOG_FILE"
+            else
+                echo -e "  ${YELLOW}[WARN]${NC}    ${NEW_PATH}  →  noexec failed (check mount permissions)"
+                echo "${TS} [WATCH] ${NEW_PATH} noexec failed" >> "$LOG_FILE"
+            fi
+        fi
+
         # ── Apply open_basedir for the new site in all php.ini files ─────────
         NEW_BASEDIR="${NEW_PATH}:/tmp:/usr/share/php:/usr/share/pear"
         UPDATED_INI=0
@@ -1505,6 +1615,16 @@ EOF
                     || true
             done
         fi
+
+        # ── Summary for this site ─────────────────────────────────────────────
+        echo ""
+        echo -e "  ${BOLD}${SN} hardening summary:${NC}"
+        echo -e "    [9] nspawn isolation  →  $(systemctl is-active "nspawn-${SN}.service" 2>/dev/null || echo 'failed')"
+        mount 2>/dev/null | grep -qE " on ${NEW_PATH} .*noexec" \
+            && echo -e "    [6] noexec            →  active" \
+            || echo -e "    [6] noexec            →  failed"
+        echo -e "    [5] open_basedir      →  updated in ${UPDATED_INI} file(s)"
+        echo "${TS} [WATCH] ${SN} complete: nspawn + noexec + open_basedir" >> "$LOG_FILE"
 
         # Add to known sites so we don't process it again
         KNOWN_SITES+=("$SN")
