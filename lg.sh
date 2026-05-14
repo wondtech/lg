@@ -42,6 +42,42 @@ if [ "$(id -u)" -ne 0 ]; then
     exit 1
 fi
 
+############################################
+# Updating System Packages
+############################################
+
+echo -e "${BOLD}${GREEN}=== Updating System Packages ===${NC}"
+echo ""
+
+if command -v apt-get &>/dev/null; then
+    echo "Detected: Debian/Ubuntu (apt)"
+    echo "Running apt-get update..."
+    apt-get update -qq 2>/dev/null && echo "[OK] Package list updated" || echo "[WARN] apt-get update failed"
+    echo "Running apt-get upgrade..."
+    apt-get upgrade -y -qq 2>/dev/null && echo "[OK] Packages upgraded" || echo "[WARN] apt-get upgrade failed"
+elif command -v yum &>/dev/null; then
+    echo "Detected: CentOS/RHEL (yum)"
+    echo "Running yum update..."
+    yum update -y -q 2>/dev/null && echo "[OK] Packages updated" || echo "[WARN] yum update failed"
+elif command -v dnf &>/dev/null; then
+    echo "Detected: Fedora (dnf)"
+    echo "Running dnf update..."
+    dnf update -y -q 2>/dev/null && echo "[OK] Packages updated" || echo "[WARN] dnf update failed"
+elif command -v apk &>/dev/null; then
+    echo "Detected: Alpine (apk)"
+    echo "Running apk update..."
+    apk update -q 2>/dev/null && echo "[OK] Package index updated" || echo "[WARN] apk update failed"
+    echo "Running apk upgrade..."
+    apk upgrade -q 2>/dev/null && echo "[OK] Packages upgraded" || echo "[WARN] apk upgrade failed"
+elif command -v pacman &>/dev/null; then
+    echo "Detected: Arch Linux (pacman)"
+    echo "Running pacman -Syu..."
+    pacman -Syu --noconfirm -q 2>/dev/null && echo "[OK] Packages updated" || echo "[WARN] pacman update failed"
+else
+    echo "[WARN] No supported package manager found (apt/yum/dnf/apk/pacman)"
+fi
+echo ""
+
 RUN_MODE="interactive"
 if [[ "${1:-}" == "--cron" ]]; then
     RUN_MODE="cron"
