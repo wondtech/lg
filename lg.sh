@@ -1255,6 +1255,25 @@ setup_nspawn() {
             || iptables -t nat -A POSTROUTING -s 10.200.0.0/24 -j MASQUERADE 2>/dev/null
     fi
 
+    # ── Detect systemd version for compatible flag selection ─────────────────
+    SYSTEMD_VER=$(systemd-nspawn --version 2>/dev/null | awk 'NR==1{print $2}')
+    log_info "systemd version: ${SYSTEMD_VER}"
+
+    # ── Stop all existing lg nspawn services before rebuilding ────────────────
+    EXISTING_SERVICES=$(systemctl list-units --type=service --all \
+        --no-legend 2>/dev/null | awk '{print $1}' | grep '^nspawn-')
+
+    if [ -n "$EXISTING_SERVICES" ]; then
+        log_info "Stopping existing nspawn containers..."
+        while IFS= read -r svc; do
+            systemctl stop    "$svc" 2>/dev/null
+            systemctl disable "$svc" 2>/dev/null
+            log_ok "Stopped: $svc"
+        done <<< "$EXISTING_SERVICES"
+        systemctl daemon-reload
+        echo ""
+    fi
+
     SITE_IP_LAST=10
     for site in "${SITES[@]}"; do
         SN=$(echo "$site" | sed 's|/var/www/||;s|/home/||;s|/public_html||;s|/$||;s|/||g')
@@ -1286,6 +1305,15 @@ setup_nspawn() {
         SITE_IP_LAST=$((SITE_IP_LAST + 1))
 
         echo "  ── Container: ${SN} ──"
+
+        # Stop and clean up any existing container for this site
+        if systemctl is-active --quiet "nspawn-${SN}.service" 2>/dev/null || \
+           systemctl is-failed --quiet "nspawn-${SN}.service" 2>/dev/null; then
+            log_info "Stopping existing container: nspawn-${SN}"
+            systemctl stop    "nspawn-${SN}.service" 2>/dev/null
+            systemctl disable "nspawn-${SN}.service" 2>/dev/null
+            log_ok "Stopped: nspawn-${SN}"
+        fi
 
         # Minimal root filesystem
         mkdir -p "${SITE_DIR}"/{bin,lib,lib64,usr/lib,etc,tmp,var/www,proc,sys,dev,run}
@@ -1360,7 +1388,27 @@ VirtualEthernet=yes
 Bridge=nspawn-br0
 EOF
 
-        # systemd service
+        # systemd service — built with version-compatible flags
+        NSPAWN_FLAGS="/usr/bin/systemd-nspawn"
+        NSPAWN_FLAGS+=" --machine=${SN}"
+        NSPAWN_FLAGS+=" --directory=${SITE_DIR}"
+        NSPAWN_FLAGS+=" --user=${SITE_USER}"
+        NSPAWN_FLAGS+=" --network-bridge=nspawn-br0"
+        NSPAWN_FLAGS+=" --tmpfs=/tmp:noexec,nosuid,nodev,size=32M"
+        NSPAWN_FLAGS+=" --read-only"
+
+        if [ "${SYSTEMD_VER:-0}" -ge 242 ] 2>/dev/null; then
+            NSPAWN_FLAGS+=" --private-users=pick"
+            NSPAWN_FLAGS+=" --drop-capability=CAP_SYS_ADMIN"
+            NSPAWN_FLAGS+=" --drop-capability=CAP_NET_ADMIN"
+            NSPAWN_FLAGS+=" --drop-capability=CAP_SYS_PTRACE"
+        else
+            # systemd < 242: --capability=none drops all caps safely
+            NSPAWN_FLAGS+=" --capability=none"
+        fi
+
+        NSPAWN_FLAGS+=" /bin/php-fpm --nodaemonize"
+
         cat > "/etc/systemd/system/nspawn-${SN}.service" << EOF
 [Unit]
 Description=Linux Guardian — Isolated site: ${SN}
@@ -1368,18 +1416,7 @@ After=network.target
 
 [Service]
 Type=notify
-ExecStart=/usr/bin/systemd-nspawn \
-    --machine=${SN} \
-    --directory=${SITE_DIR} \
-    --user=www-data \
-    --private-users=pick \
-    --network-bridge=nspawn-br0 \
-    --tmpfs=/tmp:noexec,nosuid,nodev,size=32M \
-    --read-only \
-    --drop-capability=CAP_SYS_ADMIN \
-    --drop-capability=CAP_NET_ADMIN \
-    --drop-capability=CAP_SYS_PTRACE \
-    /bin/php-fpm --nodaemonize
+ExecStart=${NSPAWN_FLAGS}
 Restart=on-failure
 RestartSec=5
 NoNewPrivileges=yes
@@ -1630,7 +1667,27 @@ VirtualEthernet=yes
 Bridge=nspawn-br0
 EOF
 
-        # systemd service
+        # systemd service — version-compatible flags
+        W_SYSTEMD_VER=$(systemd-nspawn --version 2>/dev/null | awk 'NR==1{print $2}')
+        W_NSPAWN_FLAGS="/usr/bin/systemd-nspawn"
+        W_NSPAWN_FLAGS+=" --machine=${SN}"
+        W_NSPAWN_FLAGS+=" --directory=${SITE_DIR}"
+        W_NSPAWN_FLAGS+=" --user=${SITE_USER}"
+        W_NSPAWN_FLAGS+=" --network-bridge=nspawn-br0"
+        W_NSPAWN_FLAGS+=" --tmpfs=/tmp:noexec,nosuid,nodev,size=32M"
+        W_NSPAWN_FLAGS+=" --read-only"
+
+        if [ "${W_SYSTEMD_VER:-0}" -ge 242 ] 2>/dev/null; then
+            W_NSPAWN_FLAGS+=" --private-users=pick"
+            W_NSPAWN_FLAGS+=" --drop-capability=CAP_SYS_ADMIN"
+            W_NSPAWN_FLAGS+=" --drop-capability=CAP_NET_ADMIN"
+            W_NSPAWN_FLAGS+=" --drop-capability=CAP_SYS_PTRACE"
+        else
+            W_NSPAWN_FLAGS+=" --capability=none"
+        fi
+
+        W_NSPAWN_FLAGS+=" /bin/php-fpm --nodaemonize"
+
         cat > "/etc/systemd/system/nspawn-${SN}.service" << EOF
 [Unit]
 Description=Linux Guardian — Isolated site: ${SN}
@@ -1638,18 +1695,7 @@ After=network.target
 
 [Service]
 Type=notify
-ExecStart=/usr/bin/systemd-nspawn \
-    --machine=${SN} \
-    --directory=${SITE_DIR} \
-    --user=www-data \
-    --private-users=pick \
-    --network-bridge=nspawn-br0 \
-    --tmpfs=/tmp:noexec,nosuid,nodev,size=32M \
-    --read-only \
-    --drop-capability=CAP_SYS_ADMIN \
-    --drop-capability=CAP_NET_ADMIN \
-    --drop-capability=CAP_SYS_PTRACE \
-    /bin/php-fpm --nodaemonize
+ExecStart=${W_NSPAWN_FLAGS}
 Restart=on-failure
 RestartSec=5
 NoNewPrivileges=yes
