@@ -52,17 +52,17 @@ echo ""
 if command -v apt-get &>/dev/null; then
     echo "Detected: Debian/Ubuntu (apt)"
     echo "Running apt-get update..."
-    apt-get update -qq 2>/dev/null && echo "[OK] Package list updated" || echo "[WARN] apt-get update failed"
+    DEBIAN_FRONTEND=noninteractive apt-get update -qq 2>&1 | tail -5 && echo "[OK] Package list updated" || echo "[WARN] apt-get update failed"
     echo "Running apt-get upgrade..."
-    apt-get upgrade -y -qq 2>/dev/null && echo "[OK] Packages upgraded" || echo "[WARN] apt-get upgrade failed"
+    DEBIAN_FRONTEND=noninteractive apt-get upgrade -y -qq 2>&1 | tail -5 && echo "[OK] Packages upgraded" || echo "[WARN] apt-get upgrade failed"
 elif command -v yum &>/dev/null; then
     echo "Detected: CentOS/RHEL (yum)"
     echo "Running yum update..."
-    yum update -y -q 2>/dev/null && echo "[OK] Packages updated" || echo "[WARN] yum update failed"
+    yum update -y --quiet 2>&1 | tail -10 && echo "[OK] Packages updated" || echo "[WARN] yum update failed"
 elif command -v dnf &>/dev/null; then
     echo "Detected: Fedora (dnf)"
     echo "Running dnf update..."
-    dnf update -y -q 2>/dev/null && echo "[OK] Packages updated" || echo "[WARN] dnf update failed"
+    dnf update -y --quiet 2>&1 | tail -10 && echo "[OK] Packages updated" || echo "[WARN] dnf update failed"
 elif command -v apk &>/dev/null; then
     echo "Detected: Alpine (apk)"
     echo "Running apk update..."
@@ -72,7 +72,7 @@ elif command -v apk &>/dev/null; then
 elif command -v pacman &>/dev/null; then
     echo "Detected: Arch Linux (pacman)"
     echo "Running pacman -Syu..."
-    pacman -Syu --noconfirm -q 2>/dev/null && echo "[OK] Packages updated" || echo "[WARN] pacman update failed"
+    pacman -Syu --noconfirm -q 2>&1 | tail -10 && echo "[OK] Packages updated" || echo "[WARN] pacman update failed"
 else
     echo "[WARN] No supported package manager found (apt/yum/dnf/apk/pacman)"
 fi
