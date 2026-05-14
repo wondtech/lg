@@ -295,6 +295,47 @@ echo -e "${GREEN}[OK] Network security hardening complete${NC}"
 echo ""
 
 ############################################
+# PART 4.5: MySQL/MariaDB Hardening
+############################################
+echo -e "${BOLD}${GREEN}=== PART 4.5: MySQL/MariaDB Hardening ===${NC}"
+echo ""
+
+MY_CNF=""
+if [ -f /etc/my.cnf ]; then
+    MY_CNF="/etc/my.cnf"
+elif [ -f /etc/mysql/my.cnf ]; then
+    MY_CNF="/etc/mysql/my.cnf"
+elif [ -f /etc/my.cnf.d/server.cnf ]; then
+    MY_CNF="/etc/my.cnf.d/server.cnf"
+elif [ -f /etc/my.cnf.d/mariadb-server.cnf ]; then
+    MY_CNF="/etc/my.cnf.d/mariadb-server.cnf"
+fi
+
+if [ -n "$MY_CNF" ]; then
+    echo "Found MySQL config: $MY_CNF"
+    if grep -q "^bind-address" "$MY_CNF" 2>/dev/null; then
+        sed -i 's/^bind-address.*/bind-address=127.0.0.1/' "$MY_CNF"
+        echo "[OK] bind-address set to 127.0.0.1"
+    else
+        echo "" >> "$MY_CNF"
+        echo "# Hardened by Linux Guardian on $(date)" >> "$MY_CNF"
+        echo "bind-address=127.0.0.1" >> "$MY_CNF"
+        echo "[OK] Added bind-address=127.0.0.1"
+    fi
+    echo -n "Restarting MariaDB... "
+    if systemctl restart mariadb 2>/dev/null; then
+        echo "[OK] MariaDB restarted"
+    elif systemctl restart mysqld 2>/dev/null; then
+        echo "[OK] MySQL restarted"
+    else
+        echo "[WARN] Failed to restart MySQL/MariaDB"
+    fi
+else
+    echo "[SKIP] my.cnf not found"
+fi
+echo ""
+
+############################################
 # PART 5: PHP Security Hardening
 ############################################
 echo -e "${BOLD}${GREEN}=== PART 5: PHP Security Hardening ===${NC}"
