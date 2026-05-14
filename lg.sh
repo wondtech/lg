@@ -1170,13 +1170,57 @@ setup_nspawn() {
 
     log_ok "systemd-nspawn: $(systemd-nspawn --version 2>/dev/null | head -1)"
 
-    # Discover sites
+    # ── resolve_site_path ─────────────────────────────────────────────────────
+    # Given a site name (e.g. "wond"), find where it actually lives:
+    #   1. /var/www/wond
+    #   2. /home/wond/public_html
+    #   3. Apache/Nginx DocumentRoot in config files
+    # Returns the real path or empty string if not found.
+    resolve_site_path() {
+        local name="$1"
+
+        # 1. /var/www/<name>
+        [ -d "/var/www/${name}" ] && echo "/var/www/${name}" && return
+
+        # 2. /home/<name>/public_html
+        [ -d "/home/${name}/public_html" ] && echo "/home/${name}/public_html" && return
+
+        # 3. Search Apache/Nginx configs for DocumentRoot matching the name
+        for conf in \
+            /etc/apache2/sites-enabled/*.conf \
+            /etc/httpd/conf.d/*.conf \
+            /etc/nginx/sites-enabled/* \
+            /etc/nginx/conf.d/*.conf; do
+            [ -f "$conf" ] || continue
+            local docroot
+            docroot=$(grep -hEi '^\s*(DocumentRoot|root)\s+"?([^";\s]+)"?' "$conf" \
+                2>/dev/null | awk '{print $NF}' | tr -d '"' \
+                | grep -i "$name" | head -1)
+            [ -d "$docroot" ] && echo "$docroot" && return
+        done
+
+        # Not found
+        echo ""
+    }
+
+    # ── Discover sites ────────────────────────────────────────────────────────
     SITES=()
+
+    # /var/www/* subdirectories
     for d in /var/www/*/; do
-        [ -d "$d" ] && [[ "$d" != "/var/www/html/" ]] && SITES+=("$d")
+        [ -d "$d" ] && [[ "$d" != "/var/www/html/" ]] && SITES+=("${d%/}")
     done
-    for d in /home/*/public_html/; do [ -d "$d" ] && SITES+=("$d"); done
-    [ ${#SITES[@]} -eq 0 ] && [ -d "/var/www/html" ] && SITES+=("/var/www/html/")
+
+    # /home/*/public_html
+    for d in /home/*/public_html/; do
+        [ -d "$d" ] && SITES+=("${d%/}")
+    done
+
+    # Fallback: /var/www/html if nothing else found
+    [ ${#SITES[@]} -eq 0 ] && [ -d "/var/www/html" ] && SITES+=("/var/www/html")
+
+    # Deduplicate
+    mapfile -t SITES < <(printf '%s\n' "${SITES[@]}" | sort -u)
 
     if [ ${#SITES[@]} -eq 0 ]; then
         log_warn "No sites found in /var/www/* or /home/*/public_html"
@@ -1215,6 +1259,28 @@ setup_nspawn() {
     for site in "${SITES[@]}"; do
         SN=$(echo "$site" | sed 's|/var/www/||;s|/home/||;s|/public_html||;s|/$||;s|/||g')
         SN=$(echo "$SN" | tr -cd '[:alnum:]-_' | cut -c1-32)
+
+        # ── Resolve actual site path ──────────────────────────────────────────
+        # Use discovered path, but verify it exists.
+        # If site dir is missing try alternate locations automatically.
+        RESOLVED_PATH=""
+        if [ -d "$site" ]; then
+            RESOLVED_PATH="$site"
+        else
+            RESOLVED_PATH=$(resolve_site_path "$SN")
+        fi
+
+        if [ -z "$RESOLVED_PATH" ]; then
+            log_warn "Cannot find site directory for '${SN}'"
+            log_info "  Tried: /var/www/${SN}"
+            log_info "  Tried: /home/${SN}/public_html"
+            log_info "  Tried: Apache/Nginx config files"
+            log_warn "  Skipping ${SN}"
+            continue
+        fi
+
+        log_info "Site '${SN}' resolved to: ${RESOLVED_PATH}"
+        site="$RESOLVED_PATH"
         SITE_DIR="${NSPAWN_BASE}/${SN}"
         SITE_IP="10.200.0.${SITE_IP_LAST}"
         SITE_IP_LAST=$((SITE_IP_LAST + 1))
@@ -1448,6 +1514,57 @@ watch_mode() {
 
         # Wait briefly for site files to be fully written
         sleep 2
+
+        # ── Resolve actual site path ──────────────────────────────────────────
+        RESOLVED_PATH=""
+
+        # 1. Use the detected path if it exists
+        if [ -d "$NEW_PATH" ]; then
+            RESOLVED_PATH="$NEW_PATH"
+        fi
+
+        # 2. Try /var/www/<name>
+        if [ -z "$RESOLVED_PATH" ] && [ -d "/var/www/${SN}" ]; then
+            RESOLVED_PATH="/var/www/${SN}"
+            log_info "Resolved to /var/www/${SN}"
+        fi
+
+        # 3. Try /home/<name>/public_html
+        if [ -z "$RESOLVED_PATH" ] && [ -d "/home/${SN}/public_html" ]; then
+            RESOLVED_PATH="/home/${SN}/public_html"
+            log_info "Resolved to /home/${SN}/public_html"
+        fi
+
+        # 4. Search Apache/Nginx configs
+        if [ -z "$RESOLVED_PATH" ]; then
+            for conf in \
+                /etc/apache2/sites-enabled/*.conf \
+                /etc/httpd/conf.d/*.conf \
+                /etc/nginx/sites-enabled/* \
+                /etc/nginx/conf.d/*.conf; do
+                [ -f "$conf" ] || continue
+                docroot=$(grep -hEi '^\s*(DocumentRoot|root)\s+"?([^";\s]+)"?' "$conf" \
+                    2>/dev/null | awk '{print $NF}' | tr -d '"' \
+                    | grep -i "$SN" | head -1)
+                if [ -d "$docroot" ]; then
+                    RESOLVED_PATH="$docroot"
+                    log_info "Resolved from config ${conf}: ${RESOLVED_PATH}"
+                    break
+                fi
+            done
+        fi
+
+        if [ -z "$RESOLVED_PATH" ]; then
+            echo -e "  ${YELLOW}[WARN]${NC}    Cannot resolve site path for '${SN}'"
+            log_info "  Tried: /var/www/${SN}"
+            log_info "  Tried: /home/${SN}/public_html"
+            log_info "  Tried: Apache/Nginx configs"
+            echo "${TS} [WATCH] Cannot resolve path for ${SN} — skipped" >> "$LOG_FILE"
+            continue
+        fi
+
+        log_info "Site path resolved: ${RESOLVED_PATH}"
+        NEW_PATH="$RESOLVED_PATH"
 
         # ── Isolate in nspawn container ───────────────────────────────────────
         NSPAWN_BASE="/var/lib/lg-nspawn"
