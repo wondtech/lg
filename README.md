@@ -13,7 +13,7 @@ Linux Guardian implements a **Defence in Depth** strategy — multiple independe
 | Layer | Name | What it does |
 |-------|------|--------------|
 | [1] | **Binary Lockdown** | Restricts dangerous binaries (nc, gcc, python, perl, ruby, lua, node, etc.) to root only |
-| [2] | **Kernel Hardening** | Blocks vulnerable protocols (dccp, sctp, rds, tipc, rxrpc, esp4, esp6) and applies sysctl hardening (ASLR, SYN cookies, redirect filtering) |
+| [2] | **Kernel Hardening** | Blocks unused and vulnerable kernel modules (dccp, sctp, rds, tipc, rxrpc, esp4, esp6) eliminating their attack surface entirely, and applies sysctl hardening (ASLR, SYN cookies, reverse path filtering, kernel pointer hiding) to mitigate exploitation of kernel vulnerabilities such as Dirty Frag and CopyFail variants. |
 | [3] | **System Files** | Hardens permissions on /etc/shadow, /etc/passwd, /etc/sudoers, SSH config, and cron directories |
 | [4] | **MySQL / MariaDB** | Binds database to 127.0.0.1 — blocks remote access |
 | [5] | **PHP disable_functions** | Disables shell_exec, system, exec, passthru, proc_open and 60+ dangerous PHP functions |
@@ -33,12 +33,12 @@ Linux Guardian implements a **Defence in Depth** strategy — multiple independe
 - systemd (for nspawn isolation)
 
 ## Quick Install
-
 ```bash
-curl -L https://raw.githubusercontent.com/mogbil/lg/main/lg.sh -o /tmp/lg.sh \
-  && sudo mv /tmp/lg.sh /usr/local/bin/lg \
-  && sudo chmod +x /usr/local/bin/lg \
-  && sudo lg
+curl -L https://raw.githubusercontent.com/mogbil/lg/main/lg.sh -o /tmp/lg.sh && mv /tmp/lg.sh /usr/local/bin/lg && chmod +x /usr/local/bin/lg && lg
+```
+or
+```bash
+curl -L https://raw.githubusercontent.com/mogbil/lg/main/lg.sh -o /tmp/lg.sh && sudo mv /tmp/lg.sh /usr/local/bin/lg && sudo chmod +x /usr/local/bin/lg && sudo lg
 ```
 
 ## Usage
