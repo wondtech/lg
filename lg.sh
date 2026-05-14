@@ -1318,11 +1318,38 @@ setup_nspawn() {
         # Minimal root filesystem
         mkdir -p "${SITE_DIR}"/{bin,lib,lib64,usr/lib,etc,tmp,var/www,proc,sys,dev,run}
 
-        # Copy required binaries only
-        for b in sh php php-fpm; do
-            bp=$(command -v "$b" 2>/dev/null || true)
-            [ -n "$bp" ] && cp "$bp" "${SITE_DIR}/bin/" 2>/dev/null && log_info "Binary: $b"
+        # Copy required binaries — auto-detect php handler
+        # Search standard paths + /usr/local/bin explicitly
+        PHP_HANDLER=""
+        for b in php-fpm php-cgi php; do
+            bp=$(command -v "$b" 2>/dev/null \
+                || [ -x "/usr/local/bin/${b}" ] && echo "/usr/local/bin/${b}" \
+                || [ -x "/usr/bin/${b}"        ] && echo "/usr/bin/${b}"       \
+                || true)
+            bp=$(echo "$bp" | head -1)
+            if [ -n "$bp" ] && [ -x "$bp" ]; then
+                cp "$bp" "${SITE_DIR}/bin/${b}" 2>/dev/null \
+                    && log_info "Binary: $b  ($bp)"
+                [ -z "$PHP_HANDLER" ] && PHP_HANDLER="$b"
+            fi
         done
+
+        # Also copy sh
+        SH_PATH=$(command -v sh 2>/dev/null || echo "/bin/sh")
+        [ -x "$SH_PATH" ] && cp "$SH_PATH" "${SITE_DIR}/bin/sh" 2>/dev/null
+
+        log_info "PHP handler: ${PHP_HANDLER:-none}"
+
+        # Build PHP command
+        case "$PHP_HANDLER" in
+            php-fpm) PHP_CMD="/bin/php-fpm --nodaemonize" ;;
+            php-cgi) PHP_CMD="/bin/php-cgi" ;;
+            php)     PHP_CMD="/bin/php" ;;
+            *)
+                log_warn "No PHP handler found in container"
+                PHP_CMD="/bin/sh"
+                ;;
+        esac
 
         # Copy shared libraries
         for bp in "${SITE_DIR}"/bin/*; do
@@ -1407,7 +1434,7 @@ EOF
             NSPAWN_FLAGS+=" --capability=none"
         fi
 
-        NSPAWN_FLAGS+=" /bin/php-fpm --nodaemonize"
+        NSPAWN_FLAGS+=" ${PHP_CMD}"
 
         cat > "/etc/systemd/system/nspawn-${SN}.service" << EOF
 [Unit]
@@ -1602,11 +1629,28 @@ watch_mode() {
 
         mkdir -p "${SITE_DIR}"/{bin,lib,lib64,usr/lib,etc,tmp,var/www,proc,sys,dev,run}
 
-        # Copy required binaries
-        for b in sh php php-fpm; do
-            bp=$(command -v "$b" 2>/dev/null || true)
-            [ -n "$bp" ] && cp "$bp" "${SITE_DIR}/bin/" 2>/dev/null || true
+        # Copy required binaries — auto-detect php handler
+        PHP_HANDLER=""
+        for b in php-fpm php-cgi php; do
+            bp=$(command -v "$b" 2>/dev/null \
+                || { [ -x "/usr/local/bin/${b}" ] && echo "/usr/local/bin/${b}"; } \
+                || { [ -x "/usr/bin/${b}"        ] && echo "/usr/bin/${b}"; }       \
+                || true)
+            bp=$(echo "$bp" | head -1)
+            if [ -n "$bp" ] && [ -x "$bp" ]; then
+                cp "$bp" "${SITE_DIR}/bin/${b}" 2>/dev/null || true
+                [ -z "$PHP_HANDLER" ] && PHP_HANDLER="$b"
+            fi
         done
+        SH_PATH=$(command -v sh 2>/dev/null || echo "/bin/sh")
+        [ -x "$SH_PATH" ] && cp "$SH_PATH" "${SITE_DIR}/bin/sh" 2>/dev/null || true
+
+        case "$PHP_HANDLER" in
+            php-fpm) W_PHP_CMD="/bin/php-fpm --nodaemonize" ;;
+            php-cgi) W_PHP_CMD="/bin/php-cgi" ;;
+            php)     W_PHP_CMD="/bin/php" ;;
+            *)       W_PHP_CMD="/bin/sh" ;;
+        esac
 
         # Copy shared libraries
         for bp in "${SITE_DIR}"/bin/*; do
@@ -1686,7 +1730,7 @@ EOF
             W_NSPAWN_FLAGS+=" --capability=none"
         fi
 
-        W_NSPAWN_FLAGS+=" /bin/php-fpm --nodaemonize"
+        W_NSPAWN_FLAGS+=" ${W_PHP_CMD}"
 
         cat > "/etc/systemd/system/nspawn-${SN}.service" << EOF
 [Unit]
