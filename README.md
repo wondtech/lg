@@ -23,7 +23,7 @@ Linux Guardian v1.0 - Linux Server Security Hardening Script
 ## Quick Install
 
 ```bash
-curl -L https://github.com/mogbil/lg/lg.sh | sudo tee /usr/local/bin/lg > /dev/null && sudo chmod +x /usr/local/bin/lg && sudo lg
+curl -L https://raw.githubusercontent.com/mogbil/lg/main/lg.sh | sudo tee /usr/local/bin/lg > /dev/null && sudo chmod +x /usr/local/bin/lg && sudo lg
 ```
 
 
