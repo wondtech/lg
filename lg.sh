@@ -52,6 +52,13 @@ elif [[ "${1:-}" == "--setup-auto" ]]; then
     RUN_MODE="setup-auto"
 fi
 
+TIMESTAMP=$(date +%Y%m%d_%H%M%S)
+BACKUP_DIR="/root/lg"
+mkdir -p "$BACKUP_DIR"
+
+SNUFF_INSTALLED=false
+SNUFF_SKIP=false
+
 SCRIPT_NAME=$(basename "$0")
 
 ############################################
@@ -205,7 +212,7 @@ echo ""
 echo "Applying comprehensive kernel vulnerability protections..."
 echo ""
 
-echo "--- [1/4] Blocking vulnerable protocols ---"
+echo "--- Kernel Vulnerability Protection ---"
 if [ -d /etc/modprobe.d ]; then
     cat > /etc/modprobe.d/dirtyfrag.conf << 'KERNEL_BLOCK'
     install esp4 /bin/false
@@ -228,133 +235,17 @@ for mod in esp4 esp6 rxrpc dccp sctp rds tipc; do
     fi
 done
 
-echo ""
-echo "--- [2/4] Applying sysctl hardening ---"
-SYSCTL_SETTINGS=(
-    "kernel.dmesg_restrict=1"
-    "kernel.kptr_restrict=2"
-    "kernel.yama.ptrace_scope=1"
-    "kernel.sysrq=0"
-    "kernel.core_uses_pid=1"
-    "kernel.ctrl-alt-del=0"
-    "kernel.community_emissions=0"
-    "kernel.stack_trace=0"
-    "kernel.ftrace_enabled=0"
-    "net.ipv4.conf.all.rp_filter=1"
-    "net.ipv4.conf.default.rp_filter=1"
-    "net.ipv4.conf.all.accept_source_route=0"
-    "net.ipv4.conf.default.accept_source_route=0"
-    "net.ipv6.conf.all.accept_source_route=0"
-    "net.ipv6.conf.default.accept_source_route=0"
-    "net.ipv4.conf.all.accept_redirects=0"
-    "net.ipv4.conf.default.accept_redirects=0"
-    "net.ipv6.conf.all.accept_redirects=0"
-    "net.ipv6.conf.default.accept_redirects=0"
-    "net.ipv4.conf.all.send_redirects=0"
-    "net.ipv4.conf.default.send_redirects=0"
-    "net.ipv4.icmp_echo_ignore_broadcasts=1"
-    "net.ipv4.icmp_ignore_bogus_error_responses=1"
-    "net.ipv4.tcp_syncookies=1"
-    "net.ipv4.tcp_timestamps=0"
-    "net.ipv4.conf.all.log_martians=1"
-    "net.ipv4.conf.default.log_martians=1"
-    "net.core.bpf_jit_limit=262144"
-    "net.core.bpf_jit_harden=2"
-    "fs.suid_dumpable=0"
-    "fs.protected_hardlinks=1"
-    "fs.protected_symlinks=1"
-)
-
-for setting in "${SYSCTL_SETTINGS[@]}"; do
-    key="${setting%%=*}"
-    value="${setting##*=}"
-    current=$(sysctl -n "$key" 2>/dev/null)
-    if [ "$current" != "$value" ]; then
-        sysctl -w "$key=$value" 2>/dev/null && echo "[OK] $key=$value" || echo "[WARN] Failed: $key"
-    else
-        echo "[SKIP] $key already set to $value"
-    fi
-done
-
-echo ""
-echo "--- [3/4] Disabling unused filesystems ---"
-if [ -d /etc/modprobe.d ]; then
-    cat > /etc/modprobe.d/disable-filesystems.conf << 'FS_BLOCK'
-    install cramfs /bin/false
-    install freevxfs /bin/false
-    install jffs2 /bin/false
-    install hfs /bin/false
-    install hfsplus /bin/false
-    install squashfs /bin/false
-    install udf /bin/false
-    install vfat /bin/false
-    install fat /bin/false
-    install ntfs /bin/false
-    install gfs2 /bin/false
-    install ocfs2 /bin/false
-    install configfs /bin/false
-    install efivars /bin/false
-FS_BLOCK
-    chmod 644 /etc/modprobe.d/disable-filesystems.conf
-    echo "[OK] Disabled unused filesystems"
-fi
-
-echo ""
-echo "--- [4/4] Disabling core dumps ---"
-printf "* hard core 0\n* soft core 0\n" >> /etc/security/limits.conf 2>/dev/null
-sysctl -w kernel.core_pattern="|/bin/false" 2>/dev/null && echo "[OK] Core dumps disabled" || echo "[SKIP] Already disabled"
-
 echo -e "${GREEN}[OK] Kernel vulnerability protection complete${NC}"
 echo ""
 
 ############################################
-# PART 4: Network Security Hardening
+# PART 4: Securing system files
 ############################################
-echo -e "${BOLD}${GREEN}=== PART 4: Network Security Hardening ===${NC}"
+echo -e "${BOLD}${GREEN}=== PART 4: Securing system files ===${NC}"
 echo ""
 
-echo "--- [1/3] Hardening SSH ---"
-if [ -f /etc/ssh/sshd_config ]; then
-    SSH_CONFIG="/etc/ssh/sshd_config"
-    BACKUP_SSH="${BACKUP_DIR}/sshd_config.${TIMESTAMP}"
-    mkdir -p "$BACKUP_DIR"
-    cp "$SSH_CONFIG" "$BACKUP_SSH" 2>/dev/null
-
-    sed -i 's/^PermitEmptyPasswords.*/PermitEmptyPasswords no/' "$SSH_CONFIG" 2>/dev/null
-    sed -i 's/^PermitRootLogin.*/PermitRootLogin no/' "$SSH_CONFIG" 2>/dev/null
-    sed -i 's/^Protocol.*/Protocol 2/' "$SSH_CONFIG" 2>/dev/null
-    sed -i 's/^#*MaxAuthTries.*/MaxAuthTries 3/' "$SSH_CONFIG" 2>/dev/null
-    sed -i 's/^#*PermitUserEnvironment.*/PermitUserEnvironment no/' "$SSH_CONFIG" 2>/dev/null
-    sed -i 's/^X11Forwarding.*/X11Forwarding no/' "$SSH_CONFIG" 2>/dev/null
-    sed -i 's/^#*StrictModes.*/StrictModes yes/' "$SSH_CONFIG" 2>/dev/null
-    sed -i 's/^#*AllowAgentForwarding.*/AllowAgentForwarding no/' "$SSH_CONFIG" 2>/dev/null
-    sed -i 's/^#*AllowTcpForwarding.*/AllowTcpForwarding no/' "$SSH_CONFIG" 2>/dev/null
-
-    echo "[OK] SSH hardened (backup: $BACKUP_SSH)"
-fi
-
 echo ""
-echo "--- [2/3] Configuring firewall ---"
-if command -v iptables &>/dev/null; then
-    iptables -F 2>/dev/null
-    iptables -X 2>/dev/null
-    iptables -P INPUT DROP 2>/dev/null
-    iptables -P FORWARD DROP 2>/dev/null
-    iptables -P OUTPUT ACCEPT 2>/dev/null
-    iptables -A INPUT -i lo -j ACCEPT 2>/dev/null
-    iptables -A INPUT -m state --state ESTABLISHED,RELATED -j ACCEPT 2>/dev/null
-    iptables -A INPUT -p tcp --dport 22 -j ACCEPT 2>/dev/null
-    iptables -A INPUT -p tcp --dport 80 -j ACCEPT 2>/dev/null
-    iptables -A INPUT -p tcp --dport 443 -j ACCEPT 2>/dev/null
-    iptables -A INPUT -p icmp --icmp-type echo-request -j ACCEPT 2>/dev/null
-    echo "[OK] Basic firewall rules applied"
-else
-    echo "[SKIP] iptables not available"
-fi
-
-echo ""
-echo "--- [3/3] Securing system files ---"
-chmod 600 /etc/passwd 2>/dev/null && echo "[OK] /etc/passwd secured"
+echo "--- Securing system files ---"
 chmod 600 /etc/shadow 2>/dev/null && echo "[OK] /etc/shadow secured"
 chmod 600 /etc/group 2>/dev/null && echo "[OK] /etc/group secured"
 chmod 700 /etc/cron.d 2>/dev/null && echo "[OK] /etc/cron.d secured"
@@ -363,9 +254,6 @@ chmod 700 /etc/cron.hourly 2>/dev/null && echo "[OK] /etc/cron.hourly secured"
 chmod 700 /etc/cron.monthly 2>/dev/null && echo "[OK] /etc/cron.monthly secured"
 chmod 700 /etc/cron.weekly 2>/dev/null && echo "[OK] /etc/cron.weekly secured"
 
-if [ -f /boot/grub/grub.cfg ]; then
-    chmod 600 /boot/grub/grub.cfg 2>/dev/null && echo "[OK] GRUB secured"
-fi
 
 echo -e "${GREEN}[OK] Network security hardening complete${NC}"
 echo ""
@@ -381,11 +269,15 @@ echo ""
 
 SEARCH_PATHS=("/")
 
-mapfile -t PHP_INI_FILES < <(
-    for path in "${SEARCH_PATHS[@]}"; do
-        [ -d "$path" ] && find "$path" -maxdepth 6 -type f -name "php.ini" 2>/dev/null
-    done | sort -u
-)
+PHP_INI_FILES=()
+TMP_FILE=$(mktemp)
+for path in "${SEARCH_PATHS[@]}"; do
+    [ -d "$path" ] && find "$path" -maxdepth 6 -type f -name "php.ini" 2>/dev/null
+done | sort -u > "$TMP_FILE"
+while IFS= read -r line; do
+    PHP_INI_FILES+=("$line")
+done < "$TMP_FILE"
+rm -f "$TMP_FILE"
 
 if [ ${#PHP_INI_FILES[@]} -eq 0 ]; then
     echo -e "${RED}[!] No php.ini files found${NC}"
@@ -489,8 +381,6 @@ if [ "$PHP_SKIP" = false ]; then
     echo -e "${BOLD}${BLUE}=== [4/6] Applying hardening ===${NC}"
     echo ""
 
-    TIMESTAMP=$(date +%Y%m%d_%H%M%S)
-    BACKUP_DIR="/root/lg"
     mkdir -p "$BACKUP_DIR"
     chmod 700 "$BACKUP_DIR"
 
@@ -538,7 +428,6 @@ if [ "$PHP_SKIP" = false ]; then
             ["session.cookie_httponly"]="1"
             ["session.cookie_secure"]="1"
             ["session.use_strict_mode"]="1"
-            ["sql.safe_mode"]="On"
             ["enable_dl"]="Off"
             ["realpath_cache_size"]="4096K"
             ["max_execution_time"]="30"

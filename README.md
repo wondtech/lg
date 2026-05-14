@@ -6,43 +6,41 @@ Linux Guardian v1.0 - Linux Server Security Hardening Script
 
 ## Features
 
-- **Binary Lockdown** — Secures dangerous binaries (cc, gcc, python, perl, nc, etc.)
-- **Kernel Protection** — Applies sysctl hardening and blocks vulnerable protocols, like (Dirty Frag, Copy Fail 1,2,3 etc.)
-- **Network Hardening** — SSH configuration, iptables firewall, file permissions
-- **PHP Security** — Hardens php.ini with disable_functions and security settings
+- **Binary Lockdown** — Secures dangerous binaries (nc, gcc, python, perl, ruby, lua, node, etc.)
+- **Kernel Protection** — Blocks vulnerable protocols (esp4, esp6, rxrpc, dccp, sctp, rds, tipc) and (Dirty Frag, Copy Fail 1,2,3 etc.)
+- **System Files** — Secures /etc/shadow, /etc/group, and cron directories
+- **PHP Security** — Hardens php.ini with disable_functions, open_basedir, and security settings
 - **FTP Protection** — Pure-FTPd + ClamAV upload scanning
-- **Snuffleupagus** — Optional PHP RASP security module installation
+- **Snuffleupagus** — Optional PHP RASP security module
 
 ## Requirements
 
 - Linux server (Debian/Ubuntu/CentOS/RHEL)
-- Root privileges
-- PHP (for PHP hardening feature)
-- bash 4.0+
+- Root privileges (sudo)
+- PHP (for PHP hardening)
+- bash 3.2+
 
 ## Quick Install
 
 ```bash
-curl -L https://raw.githubusercontent.com/mogbil/lg/main/lg.sh | sudo tee /usr/local/bin/lg > /dev/null && sudo chmod +x /usr/local/bin/lg && sudo lg
+curl -L https://raw.githubusercontent.com/mogbil/lg/main/lg.sh -o /tmp/lg.sh && sudo mv /tmp/lg.sh /usr/local/bin/lg && sudo chmod +x /usr/local/bin/lg && sudo lg
 ```
-
 
 ## Run
 
 ```bash
-# Interactive mode
+# Interactive mode (prompts for confirmation)
 sudo lg
-
-# Silent mode for cron
-sudo lg --cron
 
 # Auto mode (no prompts)
 sudo lg --auto
 
+# Silent mode for cron
+sudo lg --cron
+
 # Install auto-update cron job + user hook
 sudo lg --setup-auto
 ```
-
 
 ## Auto-Update
 
