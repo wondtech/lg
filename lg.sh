@@ -1373,7 +1373,6 @@ ExecStart=/usr/bin/systemd-nspawn \
     --directory=${SITE_DIR} \
     --user=www-data \
     --private-users=pick \
-    --private-users-chown \
     --network-bridge=nspawn-br0 \
     --tmpfs=/tmp:noexec,nosuid,nodev,size=32M \
     --read-only \
@@ -1412,13 +1411,7 @@ EOF
     echo "    journalctl -u nspawn-<name>  — container logs"
 }
 
-if [[ "$RUN_MODE" == "interactive" ]] && [ "$DRY_RUN" = false ]; then
-    read -r -p "  Enable per-site nspawn isolation? [y/N]: " -n 1
-    echo ""
-    [[ $REPLY =~ ^[Yy]$ ]] && setup_nspawn || log_skip "nspawn isolation skipped"
-else
-    setup_nspawn
-fi
+setup_nspawn
 
 log_ok "Layer 9 complete"
 
@@ -1650,7 +1643,6 @@ ExecStart=/usr/bin/systemd-nspawn \
     --directory=${SITE_DIR} \
     --user=www-data \
     --private-users=pick \
-    --private-users-chown \
     --network-bridge=nspawn-br0 \
     --tmpfs=/tmp:noexec,nosuid,nodev,size=32M \
     --read-only \
