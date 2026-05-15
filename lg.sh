@@ -261,8 +261,72 @@ for arg in "$@"; do
         --auto)    RUN_MODE="auto" ;;
         --dry-run) DRY_RUN=true ;;
         --undo)    UNDO_MODE=true ;;
-        --watch)   ;; # handled after globals are set
-        --help|-h) grep '^#   sudo lg' "$0"; exit 0 ;;
+        --watch)   ;;
+        --help|-h)
+            echo -e "${BOLD}${CYAN}"
+            echo "────────────────────────────────────────────────────────────────────────"
+            echo "   Linux Guardian v1.0 — Server Security Hardening | WondTech.com"
+            echo "────────────────────────────────────────────────────────────────────────"
+            echo -e "${NC}"
+            echo -e "${BOLD}USAGE:${NC}"
+            echo "   sudo lg [OPTIONS]"
+            echo ""
+            echo -e "${BOLD}OPTIONS:${NC}"
+            echo "   (none)       Interactive mode — recommended for first run"
+            echo "                Prompts for email, timezone, and php.ini selection"
+            echo ""
+            echo "   --auto       Auto mode — no prompts, applies all layers"
+            echo "                Uses detected timezone and selects all php.ini files"
+            echo ""
+            echo "   --dry-run    Preview every change without applying anything"
+            echo "                Safe to run on production — zero modifications"
+            echo ""
+            echo "   --undo       Rollback all changes from the last run"
+            echo "                Restores files, permissions, mounts, and audit rules"
+            echo ""
+            echo "   --cron       Silent mode for scheduled cron jobs"
+            echo "                Logs to /var/log/lg-hardening.log only"
+            echo ""
+            echo "   --watch      Watch mode — monitor for new sites and harden automatically"
+            echo "                Applies noexec + open_basedir + PHP-FPM pool per new site"
+            echo ""
+            echo "   --help, -h   Show this help message"
+            echo ""
+            echo -e "${BOLD}SECURITY LAYERS:${NC}"
+            echo "   [1] Binary Lockdown       Restrict dangerous tools to root only"
+            echo "   [2] Kernel Hardening      Block unused modules + sysctl hardening"
+            echo "   [3] System Files          Secure permissions on sensitive files"
+            echo "   [4] MySQL / MariaDB       Bind database to 127.0.0.1"
+            echo "   [5] PHP Hardening         Disable 60+ dangerous functions globally"
+            echo "   [5.1] PHP-FPM Pools       Isolate each site with open_basedir"
+            echo "   [5.2] Panel PHP           Fix date.timezone in panel php.ini files"
+            echo "   [6] noexec                Prevent binary execution from /tmp + sites"
+            echo "   [7] AppArmor / SELinux    Enforce MAC + fix vmail/Dovecot contexts"
+            echo "   [8] Auditd                Real-time alerts for webshells + privesc"
+            echo "   [A] FTP + ClamAV          Scan uploaded files for malware"
+            echo "   [B] Snuffleupagus         PHP RASP runtime protection"
+            echo ""
+            echo -e "${BOLD}EXAMPLES:${NC}"
+            echo "   sudo lg                  # First run — interactive"
+            echo "   sudo lg --dry-run        # Preview changes safely"
+            echo "   sudo lg --auto           # Apply all layers without prompts"
+            echo "   sudo lg --undo           # Rollback last run"
+            echo "   sudo lg --watch          # Monitor for new sites"
+            echo "   sudo lg --cron           # Add to crontab for scheduled hardening"
+            echo ""
+            echo -e "${BOLD}FILES:${NC}"
+            echo "   Log:      /var/log/lg-hardening.log"
+            echo "   Backups:  /root/lg/backups/"
+            echo "   Undo:     sudo lg --undo"
+            echo ""
+            echo -e "${BOLD}VERIFY:${NC}"
+            echo "   bash -n /usr/local/bin/lg && echo 'Syntax OK'"
+            echo "   php -r 'echo ini_get(\"disable_functions\");' | tr , '\n' | head -5"
+            echo "   mount | grep noexec"
+            echo "   sestatus 2>/dev/null || apparmor_status 2>/dev/null"
+            echo ""
+            exit 0
+            ;;
     esac
 done
 
@@ -281,17 +345,15 @@ ALERT_EMAIL="root"
 mkdir -p "$BACKUP_DIR"
 chmod 700 "$BACKUP_DIR"
 
-# Redirect output:
-#   cron  → log file only (silent on terminal)
-#   other → tee to terminal + log file (not in dry-run)
+# Redirect output
 if [ "$RUN_MODE" = "cron" ]; then
     exec >> "$LOG_FILE" 2>&1
 elif [ "$DRY_RUN" = false ]; then
     exec > >(tee -a "$LOG_FILE") 2>&1
 fi
 
-# ── Detect server timezone (used for date.timezone in all php.ini files) ─────
-# Guarded with || true — timedatectl fails in containers/OpenVZ
+# ── Ask for alert email once — used by Auditd, ClamAV, and Watch mode ────────
+# Detect timezone first (used for date.timezone in php.ini)
 PHP_TIMEZONE=""
 PHP_TIMEZONE=$(timedatectl 2>/dev/null | awk '/Time zone/{print $3}' | head -1 || true)
 [ -z "$PHP_TIMEZONE" ] && \
@@ -300,16 +362,14 @@ PHP_TIMEZONE=$(timedatectl 2>/dev/null | awk '/Time zone/{print $3}' | head -1 |
     PHP_TIMEZONE=$(readlink /etc/localtime 2>/dev/null | sed 's|.*/zoneinfo/||' || true)
 [ -z "$PHP_TIMEZONE" ] && PHP_TIMEZONE="UTC"
 
-# ── Ask for alert email + timezone ───────────────────────────────────────────
 if [[ "$RUN_MODE" == "interactive" ]] && [ "$DRY_RUN" = false ] && [ "$UNDO_MODE" = false ]; then
     echo ""
     read -r -p "  Alert email for security notifications (default: root): " _INPUT_EMAIL
     [ -n "$_INPUT_EMAIL" ] && ALERT_EMAIL="$_INPUT_EMAIL"
     echo -e "  ${GREEN}[OK]${NC}      Alert email: ${ALERT_EMAIL}"
     echo ""
-    echo -e "  ${CYAN}[INFO]${NC}    PHP date.timezone — detected from server: ${BOLD}${PHP_TIMEZONE}${NC}"
-    echo -e "  ${CYAN}[INFO]${NC}    Examples: Asia/Riyadh  Asia/Dubai  Asia/Khartoum"
-    echo -e "            America/New_York  Europe/London  Asia/Singapore  UTC"
+    echo -e "  ${CYAN}[INFO]${NC}    PHP date.timezone — detected: ${BOLD}${PHP_TIMEZONE}${NC}"
+    echo -e "  ${CYAN}[INFO]${NC}    Examples: Asia/Riyadh  Asia/Dubai  UTC  America/New_York"
     echo ""
     read -r -p "  Enter timezone (press Enter to keep [${PHP_TIMEZONE}]): " _INPUT_TZ
     if [ -n "$_INPUT_TZ" ]; then
@@ -317,7 +377,7 @@ if [[ "$RUN_MODE" == "interactive" ]] && [ "$DRY_RUN" = false ] && [ "$UNDO_MODE
             PHP_TIMEZONE="$_INPUT_TZ"
             echo -e "  ${GREEN}[OK]${NC}      Timezone set to: ${PHP_TIMEZONE}"
         else
-            echo -e "  ${YELLOW}[WARN]${NC}    '${_INPUT_TZ}' not found in zoneinfo — keeping: ${PHP_TIMEZONE}"
+            echo -e "  ${YELLOW}[WARN]${NC}    Not found in zoneinfo — keeping: ${PHP_TIMEZONE}"
         fi
     else
         echo -e "  ${GREEN}[OK]${NC}      Timezone kept as: ${PHP_TIMEZONE}"
@@ -720,24 +780,6 @@ fi
 
 if [ "$PHP_SKIP" = false ] && [ ${#SELECTED_FILES[@]} -gt 0 ]; then
 
-    # ── Detect control panel for panel-specific php.ini paths ────────────────
-    _L5_PANEL="none"
-    { [ -d /usr/local/cwpsrv ] || [ -f /usr/local/cwp/php71/bin/php ]; } && _L5_PANEL="cwp"
-    [ -d /usr/local/cpanel ]                                               && _L5_PANEL="cpanel"
-    { [ -d /usr/local/psa ] || [ -d /opt/psa ]; }                         && _L5_PANEL="plesk"
-    [ -d /usr/local/directadmin ]                                          && _L5_PANEL="directadmin"
-    { [ -d /usr/local/CyberPanel ] || [ -f /usr/bin/cyberpanel ]; }       && _L5_PANEL="cyberpanel"
-    { [ -d /usr/local/hestia ] || [ -f /usr/local/hestia/bin/v-list-users ]; } && _L5_PANEL="hestia"
-    { [ -d /usr/local/vesta  ] || [ -f /usr/local/vesta/bin/v-list-users  ]; } && _L5_PANEL="vesta"
-    [ -d /usr/local/ispconfig ]                                            && _L5_PANEL="ispconfig"
-    { [ -d /www/server/panel ] || [ -f /usr/bin/bt ]; }                   && _L5_PANEL="aapanel"
-    { [ -d /usr/share/webmin ] || [ -f /usr/bin/webmin ]; }               && _L5_PANEL="webmin"
-    [ -d /usr/local/interworx ]                                            && _L5_PANEL="interworx"
-    { [ -d /var/www/froxlor ] || [ -d /usr/share/froxlor ]; }             && _L5_PANEL="froxlor"
-    [ -d /etc/runcloud ]                                                   && _L5_PANEL="runcloud"
-    [ -f /usr/bin/centmin ]                                                && _L5_PANEL="centminmod"
-    [ "$_L5_PANEL" != "none" ] && log_info "Panel detected (Layer 5): ${_L5_PANEL}"
-
     DISABLE_FUNCTIONS="exec,passthru,shell_exec,system,popen,proc_open,proc_close,\
 proc_get_status,proc_terminate,proc_nice,pcntl_exec,pcntl_fork,pcntl_signal,\
 pcntl_waitpid,pcntl_wait,pcntl_wifexited,pcntl_wifstopped,pcntl_wifsignaled,\
@@ -781,7 +823,6 @@ opcache_get_status,opcache_reset,putenv,apache_setenv"
         if [ "$DRY_RUN" = true ]; then
             log_dry "Apply global security settings → $inifile"
             log_dry "  disable_functions (global)"
-            log_dry "  date.timezone = ${PHP_TIMEZONE}"
             log_dry "  session, error, limits (global)"
             log_dry "  open_basedir → set per-site in PART 5.1"
             continue
@@ -798,7 +839,7 @@ opcache_get_status,opcache_reset,putenv,apache_setenv"
         fi
         log_ok "disable_functions applied (global)"
 
-        # ── date.timezone — prevents PHP warnings that cause 502 on panels ───
+        # ── date.timezone — prevents 502 errors on panels ─────────────────────
         if grep -qE "^\s*;*\s*date\.timezone" "$inifile"; then
             sed -i "s|^\s*;*\s*date\.timezone.*|date.timezone = ${PHP_TIMEZONE}|" "$inifile"
         else
@@ -834,8 +875,6 @@ fi
 
 log_ok "Layer 5 complete"
 
-
-# ══════════════════════════════════════════════════════════════════════════════
 # PART 5.1 — PHP-FPM Pool per Site
 # Auto-detects PHP-FPM config directory and creates isolated pool for each site
 # Each site gets: own user, open_basedir, disable_functions, session, error_log
@@ -1050,92 +1089,6 @@ EOF
 setup_phpfpm_pools || log_warn "Part 5.1: PHP-FPM pool setup encountered an issue — check log for details"
 
 log_ok "Part 5.1 complete"
-
-# ── Fix date.timezone in panel-specific php.ini files ────────────────────────
-# Panels store PHP versions in non-standard paths missed by the find above
-if [ "$PHP_SKIP" = false ] && [ "${_L5_PANEL:-none}" != "none" ] && [ "$DRY_RUN" = false ]; then
-    section "PART 5.2: Panel php.ini — date.timezone fix (${_L5_PANEL})"
-
-    # Helper: apply date.timezone to one php.ini (skip CLI)
-    _fix_tz_ini() {
-        local _ini="$1"
-        [ -f "$_ini" ] || return 0
-        [[ "$_ini" == *cli* ]] && return 0
-        backup_file "$_ini" "panel_phpini"
-        if grep -qE "^\s*;*\s*date\.timezone" "$_ini"; then
-            sed -i "s|^\s*;*\s*date\.timezone.*|date.timezone = ${PHP_TIMEZONE}|" "$_ini"
-        else
-            echo "date.timezone = ${PHP_TIMEZONE}" >> "$_ini"
-        fi
-        log_ok "date.timezone = ${PHP_TIMEZONE}: $(basename "$_ini")"
-    }
-
-    _P52_COUNT=0
-    case "$_L5_PANEL" in
-        cwp)
-            while IFS= read -r _ini; do
-                _fix_tz_ini "$_ini" && _P52_COUNT=$((_P52_COUNT+1))
-            done < <(find /usr/local/cwp/ -name "php.ini" 2>/dev/null | sort -u)
-            systemctl restart cwpsrv 2>/dev/null && log_ok "cwpsrv restarted" || true
-            ;;
-        cpanel)
-            while IFS= read -r _ini; do
-                _fix_tz_ini "$_ini" && _P52_COUNT=$((_P52_COUNT+1))
-            done < <({ find /usr/local/lib/php* -name "php.ini" 2>/dev/null
-                        find /opt/cpanel        -name "php.ini" 2>/dev/null
-                      } | sort -u)
-            ;;
-        plesk)
-            while IFS= read -r _ini; do
-                _fix_tz_ini "$_ini" && _P52_COUNT=$((_P52_COUNT+1))
-            done < <({ find /opt/plesk     -name "php.ini" 2>/dev/null
-                        find /usr/local/psa -name "php.ini" 2>/dev/null
-                      } | sort -u)
-            systemctl restart psa 2>/dev/null || true
-            ;;
-        directadmin)
-            while IFS= read -r _ini; do
-                _fix_tz_ini "$_ini" && _P52_COUNT=$((_P52_COUNT+1))
-            done < <(find /usr/local/php -name "php.ini" 2>/dev/null | sort -u)
-            ;;
-        cyberpanel)
-            while IFS= read -r _ini; do
-                _fix_tz_ini "$_ini" && _P52_COUNT=$((_P52_COUNT+1))
-            done < <(find /usr/local/lsws -name "php.ini" 2>/dev/null | sort -u)
-            systemctl restart lsws 2>/dev/null || true
-            ;;
-        hestia|vesta|ispconfig|webmin|froxlor|runcloud)
-            while IFS= read -r _ini; do
-                _fix_tz_ini "$_ini" && _P52_COUNT=$((_P52_COUNT+1))
-            done < <(find /etc/php -name "php.ini" 2>/dev/null | sort -u)
-            ;;
-        aapanel)
-            while IFS= read -r _ini; do
-                _fix_tz_ini "$_ini" && _P52_COUNT=$((_P52_COUNT+1))
-            done < <(find /www/server/php -name "php.ini" 2>/dev/null | sort -u)
-            ;;
-        interworx)
-            while IFS= read -r _ini; do
-                _fix_tz_ini "$_ini" && _P52_COUNT=$((_P52_COUNT+1))
-            done < <(find /usr/local/interworx -name "php.ini" 2>/dev/null | sort -u)
-            ;;
-        centminmod)
-            while IFS= read -r _ini; do
-                _fix_tz_ini "$_ini" && _P52_COUNT=$((_P52_COUNT+1))
-            done < <(find /usr/local/lib/php* -name "php.ini" 2>/dev/null | sort -u)
-            ;;
-    esac
-
-    if [ "$_P52_COUNT" -gt 0 ]; then
-        log_ok "Part 5.2: ${_P52_COUNT} panel php.ini file(s) updated (${_L5_PANEL})"
-    else
-        log_skip "Part 5.2: No extra php.ini files found for ${_L5_PANEL}"
-    fi
-elif [ "$PHP_SKIP" = false ] && [ "${_L5_PANEL:-none}" != "none" ] && [ "$DRY_RUN" = true ]; then
-    section "PART 5.2: Panel php.ini — date.timezone fix (${_L5_PANEL})"
-    log_dry "Set date.timezone = ${PHP_TIMEZONE} in all panel php.ini files"
-fi
-
 
 # Auto-detects site roots and applies noexec to prevent binary execution
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1456,34 +1409,17 @@ case "$MAC_SYSTEM" in
                 unset SEBOOLS
             fi
 
-            # ── Detect control panel + vmail ──────────────────────────────────
-            _L7_PANEL="none"
-            { [ -d /usr/local/cwpsrv ] || [ -f /usr/local/cwp/php71/bin/php ]; } && _L7_PANEL="cwp"
-            [ -d /usr/local/cpanel ]                                               && _L7_PANEL="cpanel"
-            { [ -d /usr/local/psa ] || [ -d /opt/psa ]; }                         && _L7_PANEL="plesk"
-            [ -d /usr/local/directadmin ]                                          && _L7_PANEL="directadmin"
-            { [ -d /usr/local/CyberPanel ] || [ -f /usr/bin/cyberpanel ]; }       && _L7_PANEL="cyberpanel"
-            { [ -d /usr/local/hestia ] || [ -f /usr/local/hestia/bin/v-list-users ]; } && _L7_PANEL="hestia"
-            { [ -d /usr/local/vesta  ] || [ -f /usr/local/vesta/bin/v-list-users  ]; } && _L7_PANEL="vesta"
-            [ -d /usr/local/ispconfig ]                                            && _L7_PANEL="ispconfig"
-            { [ -d /www/server/panel ] || [ -f /usr/bin/bt ]; }                   && _L7_PANEL="aapanel"
-            { [ -d /usr/share/webmin ] || [ -f /usr/bin/webmin ]; }               && _L7_PANEL="webmin"
-            [ -d /usr/local/interworx ]                                            && _L7_PANEL="interworx"
-            { [ -d /var/www/froxlor ] || [ -d /usr/share/froxlor ]; }             && _L7_PANEL="froxlor"
-            [ -d /etc/runcloud ]                                                   && _L7_PANEL="runcloud"
-            [ -f /usr/bin/centmin ]                                                && _L7_PANEL="centminmod"
-            [ "$_L7_PANEL" != "none" ] && log_info "Panel detected (Layer 7): ${_L7_PANEL}"
-
-            # Detect vmail path
-            _L7_VMAIL=""
-            for _vp in /var/vmail /home/vmail /var/mail/vhosts /var/spool/mail; do
-                [ -d "$_vp" ] && _L7_VMAIL="$_vp" && break
-            done
-            [ -n "$_L7_VMAIL" ] && log_info "Mail storage detected: ${_L7_VMAIL}"
-
-            # ── Fix SELinux contexts for vmail + Dovecot logs ─────────────────
+            # ── Fix vmail + Dovecot SELinux contexts ──────────────────────────
+            # This is the ONLY panel-specific fix in Layer 7
             if [ "$DRY_RUN" = false ]; then
+                # Detect vmail path
+                _L7_VMAIL=""
+                for _vp in /var/vmail /home/vmail /var/mail/vhosts /var/spool/mail; do
+                    [ -d "$_vp" ] && _L7_VMAIL="$_vp" && break
+                done
+
                 if [ -n "$_L7_VMAIL" ] && command -v semanage &>/dev/null; then
+                    log_info "Mail storage detected: ${_L7_VMAIL}"
                     semanage fcontext -a -t dovecot_var_t \
                         "${_L7_VMAIL}(/.*)?" 2>/dev/null \
                         || semanage fcontext -m -t dovecot_var_t \
@@ -1492,6 +1428,8 @@ case "$MAC_SYSTEM" in
                     restorecon -RFv "$_L7_VMAIL" 2>/dev/null | tail -3 || true
                     log_ok "SELinux: ${_L7_VMAIL} → dovecot_var_t"
                 fi
+
+                # Dovecot log files
                 for _dlog in /var/log/dovecot.log \
                              /var/log/dovecot-info.log \
                              /var/log/dovecot-debug.log; do
@@ -1505,6 +1443,8 @@ case "$MAC_SYSTEM" in
                     chcon -t dovecot_var_log_t "$_dlog" 2>/dev/null || true
                     log_ok "SELinux: ${_dlog} → dovecot_var_log_t"
                 done
+
+                # Restart Dovecot to apply context fixes
                 if systemctl is-active --quiet dovecot 2>/dev/null; then
                     systemctl restart dovecot 2>/dev/null \
                         && log_ok "Dovecot restarted" \
@@ -1516,112 +1456,7 @@ case "$MAC_SYSTEM" in
                 fi
             else
                 log_dry "Fix SELinux: vmail → dovecot_var_t, dovecot logs → dovecot_var_log_t"
-            fi
-
-            # ── Fix SELinux contexts for control panels ───────────────────────
-            if [ "$DRY_RUN" = false ] && [ "$_L7_PANEL" != "none" ]; then
-                log_info "Fixing SELinux contexts for panel: ${_L7_PANEL}"
-                _sel_fix() {
-                    local _type="$1" _path="$2"
-                    [ -e "$_path" ] || return 0
-                    command -v semanage &>/dev/null && {
-                        semanage fcontext -a -t "$_type" "${_path}(/.*)?" 2>/dev/null \
-                            || semanage fcontext -m -t "$_type" "${_path}(/.*)?" 2>/dev/null \
-                            || true
-                    }
-                    restorecon -RF "$_path" 2>/dev/null || true
-                    log_ok "SELinux: ${_path} → ${_type}"
-                }
-                case "$_L7_PANEL" in
-                    cwp)
-                        _sel_fix httpd_exec_t        /usr/local/cwpsrv/bin
-                        _sel_fix var_run_t           /usr/local/cwpsrv/var/run
-                        _sel_fix var_log_t           /usr/local/cwpsrv/var/log
-                        _sel_fix httpd_config_t      /usr/local/cwpsrv/conf
-                        _sel_fix httpd_sys_content_t /usr/local/cwpsrv/htdocs
-                        _sel_fix httpd_sys_content_t /usr/local/cwpsrv/var/services
-                        for _phpver in /usr/local/cwp/php*/; do
-                            [ -d "$_phpver" ] || continue
-                            _sel_fix httpd_exec_t        "${_phpver}bin"
-                            _sel_fix httpd_exec_t        "${_phpver}sbin"
-                            _sel_fix httpd_config_t      "${_phpver}etc"
-                            _sel_fix var_log_t           "${_phpver}var/log"
-                            _sel_fix var_run_t           "${_phpver}var/run"
-                            _sel_fix httpd_sys_content_t "${_phpver}var/sockets"
-                            _sel_fix httpd_sys_content_t "${_phpver}lib"
-                        done
-                        systemctl restart cwpsrv 2>/dev/null \
-                            && log_ok "cwpsrv restarted" || true
-                        ;;
-                    cpanel)
-                        _sel_fix httpd_sys_content_t /usr/local/cpanel
-                        _sel_fix httpd_sys_content_t /var/cpanel
-                        ;;
-                    plesk)
-                        for _phpver in /opt/plesk/php/*/; do
-                            [ -d "$_phpver" ] || continue
-                            _sel_fix httpd_exec_t   "${_phpver}bin"
-                            _sel_fix httpd_exec_t   "${_phpver}sbin"
-                            _sel_fix httpd_config_t "${_phpver}etc"
-                        done
-                        _sel_fix httpd_sys_content_t /usr/local/psa
-                        systemctl restart psa 2>/dev/null || true
-                        ;;
-                    directadmin)
-                        for _phpver in /usr/local/php/*/; do
-                            [ -d "$_phpver" ] || continue
-                            _sel_fix httpd_exec_t   "${_phpver}bin"
-                            _sel_fix httpd_exec_t   "${_phpver}sbin"
-                            _sel_fix httpd_config_t "${_phpver}etc"
-                        done
-                        _sel_fix httpd_sys_content_t /usr/local/directadmin
-                        ;;
-                    cyberpanel)
-                        for _phpver in /usr/local/lsws/lsphp*/; do
-                            [ -d "$_phpver" ] || continue
-                            _sel_fix httpd_exec_t   "${_phpver}bin"
-                            _sel_fix httpd_exec_t   "${_phpver}sbin"
-                            _sel_fix httpd_config_t "${_phpver}etc"
-                        done
-                        _sel_fix httpd_sys_content_t /usr/local/CyberPanel
-                        systemctl restart lsws 2>/dev/null || true
-                        ;;
-                    hestia|vesta)
-                        _sel_fix httpd_sys_content_t "/usr/local/${_L7_PANEL}"
-                        ;;
-                    ispconfig)
-                        _sel_fix httpd_sys_content_t /usr/local/ispconfig ;;
-                    aapanel)
-                        for _phpver in /www/server/php/*/; do
-                            [ -d "$_phpver" ] || continue
-                            _sel_fix httpd_exec_t   "${_phpver}bin"
-                            _sel_fix httpd_exec_t   "${_phpver}sbin"
-                            _sel_fix httpd_config_t "${_phpver}etc"
-                        done
-                        _sel_fix httpd_sys_content_t /www/server/panel
-                        ;;
-                    webmin)
-                        _sel_fix httpd_sys_content_t /usr/share/webmin
-                        _sel_fix httpd_config_t      /etc/webmin
-                        ;;
-                    interworx)
-                        _sel_fix httpd_exec_t        /usr/local/interworx/bin
-                        _sel_fix httpd_exec_t        /usr/local/interworx/sbin
-                        _sel_fix httpd_sys_content_t /usr/local/interworx
-                        ;;
-                    froxlor)
-                        _sel_fix httpd_sys_content_t /var/www/froxlor
-                        _sel_fix httpd_sys_content_t /usr/share/froxlor
-                        ;;
-                    runcloud)
-                        _sel_fix httpd_config_t      /etc/runcloud
-                        _sel_fix httpd_sys_content_t /var/www
-                        ;;
-                    centminmod)
-                        _sel_fix httpd_exec_t        /usr/local/nginx/sbin
-                        _sel_fix httpd_sys_content_t /usr/local/nginx
-                        ;;
-                esac
+                log_dry "Restart Dovecot"
             fi
         fi
         MAC_SYSTEM="selinux"
@@ -2634,18 +2469,8 @@ if [ "$DRY_RUN" = false ]; then
     echo "  [6] noexec /tmp           — uploaded binaries won't execute"
     echo "  [7] ${MAC_SYSTEM^^} (MAC)           — web exec policy enforced"
     echo "  [8] Auditd                — monitoring active"
-    if svc_installed clamscan clamdscan && svc_installed pure-ftpd pure-ftpd-mysql; then
-        echo "  [A] FTP + ClamAV          — upload scanning enabled"
-    elif svc_installed clamscan clamdscan; then
-        echo "  [A] ClamAV                — installed (FTP not detected)"
-    else
-        echo "  [A] FTP + ClamAV          — not installed (skipped)"
-    fi
-    if php -m 2>/dev/null | grep -qi snuffleupagus; then
-        echo "  [B] Snuffleupagus         — PHP RASP layer active"
-    else
-        echo "  [B] Snuffleupagus         — not installed (skipped)"
-    fi
+    echo "  [A] FTP + ClamAV          — $(svc_installed clamscan clamdscan && svc_installed pure-ftpd pure-ftpd-mysql && echo 'upload scanning enabled' || echo 'not installed (skipped)')"
+    echo "  [B] Snuffleupagus         — $(php -m 2>/dev/null | grep -qi snuffleupagus && echo 'PHP RASP layer active' || echo 'not installed (skipped)')"
     echo ""
     echo -e "  ${CYAN}Backups:${NC}  $BACKUP_DIR"
     echo -e "  ${CYAN}Rollback:${NC} sudo $0 --undo"
@@ -2673,3 +2498,101 @@ if [ "$DRY_RUN" = false ]; then
     sleep 10
     reboot
 fi
+# ── PART 5.2 — Fix date.timezone in panel php.ini files ──────────────────────
+# Detect panel and fix date.timezone only — nothing else
+_L5_PANEL="none"
+{ [ -d /usr/local/cwpsrv ] || [ -f /usr/local/cwp/php71/bin/php ]; } && _L5_PANEL="cwp"
+[ -d /usr/local/cpanel ]                                               && _L5_PANEL="cpanel"
+{ [ -d /usr/local/psa ] || [ -d /opt/psa ]; }                         && _L5_PANEL="plesk"
+[ -d /usr/local/directadmin ]                                          && _L5_PANEL="directadmin"
+{ [ -d /usr/local/CyberPanel ] || [ -f /usr/bin/cyberpanel ]; }       && _L5_PANEL="cyberpanel"
+{ [ -d /usr/local/hestia ] || [ -f /usr/local/hestia/bin/v-list-users ]; } && _L5_PANEL="hestia"
+{ [ -d /usr/local/vesta  ] || [ -f /usr/local/vesta/bin/v-list-users  ]; } && _L5_PANEL="vesta"
+[ -d /usr/local/ispconfig ]                                            && _L5_PANEL="ispconfig"
+{ [ -d /www/server/panel ] || [ -f /usr/bin/bt ]; }                   && _L5_PANEL="aapanel"
+{ [ -d /usr/share/webmin ] || [ -f /usr/bin/webmin ]; }               && _L5_PANEL="webmin"
+[ -d /usr/local/interworx ]                                            && _L5_PANEL="interworx"
+{ [ -d /var/www/froxlor ] || [ -d /usr/share/froxlor ]; }             && _L5_PANEL="froxlor"
+[ -d /etc/runcloud ]                                                   && _L5_PANEL="runcloud"
+[ -f /usr/bin/centmin ]                                                && _L5_PANEL="centminmod"
+
+if [ "$_L5_PANEL" != "none" ]; then
+    section "PART 5.2: Panel php.ini — date.timezone (${_L5_PANEL})"
+    log_info "Panel detected: ${_L5_PANEL} — setting date.timezone = ${PHP_TIMEZONE}"
+
+    # Helper: fix date.timezone in one php.ini (skip CLI)
+    _fix_tz_ini() {
+        local _ini="$1"
+        [ -f "$_ini" ] || return 0
+        [[ "$_ini" == *cli* ]] && return 0
+        if grep -qE "^\s*;*\s*date\.timezone" "$_ini"; then
+            sed -i "s|^\s*;*\s*date\.timezone.*|date.timezone = ${PHP_TIMEZONE}|" "$_ini"
+        else
+            echo "date.timezone = ${PHP_TIMEZONE}" >> "$_ini"
+        fi
+        log_ok "date.timezone fixed: $(basename "$_ini")"
+    }
+
+    if [ "$DRY_RUN" = false ]; then
+        _P52_COUNT=0
+        case "$_L5_PANEL" in
+            cwp)
+                while IFS= read -r _ini; do
+                    _fix_tz_ini "$_ini" && _P52_COUNT=$((_P52_COUNT+1))
+                done < <(find /usr/local/cwp/ -name "php.ini" 2>/dev/null | sort -u)
+                systemctl restart cwpsrv 2>/dev/null && log_ok "cwpsrv restarted" || true
+                ;;
+            cpanel)
+                while IFS= read -r _ini; do
+                    _fix_tz_ini "$_ini" && _P52_COUNT=$((_P52_COUNT+1))
+                done < <({ find /usr/local/lib/php* -name "php.ini" 2>/dev/null
+                            find /opt/cpanel -name "php.ini" 2>/dev/null; } | sort -u)
+                ;;
+            plesk)
+                while IFS= read -r _ini; do
+                    _fix_tz_ini "$_ini" && _P52_COUNT=$((_P52_COUNT+1))
+                done < <({ find /opt/plesk -name "php.ini" 2>/dev/null
+                            find /usr/local/psa -name "php.ini" 2>/dev/null; } | sort -u)
+                systemctl restart psa 2>/dev/null || true
+                ;;
+            directadmin)
+                while IFS= read -r _ini; do
+                    _fix_tz_ini "$_ini" && _P52_COUNT=$((_P52_COUNT+1))
+                done < <(find /usr/local/php -name "php.ini" 2>/dev/null | sort -u)
+                ;;
+            cyberpanel)
+                while IFS= read -r _ini; do
+                    _fix_tz_ini "$_ini" && _P52_COUNT=$((_P52_COUNT+1))
+                done < <(find /usr/local/lsws -name "php.ini" 2>/dev/null | sort -u)
+                systemctl restart lsws 2>/dev/null || true
+                ;;
+            hestia|vesta|ispconfig|webmin|froxlor|runcloud)
+                while IFS= read -r _ini; do
+                    _fix_tz_ini "$_ini" && _P52_COUNT=$((_P52_COUNT+1))
+                done < <(find /etc/php -name "php.ini" 2>/dev/null | sort -u)
+                ;;
+            aapanel)
+                while IFS= read -r _ini; do
+                    _fix_tz_ini "$_ini" && _P52_COUNT=$((_P52_COUNT+1))
+                done < <(find /www/server/php -name "php.ini" 2>/dev/null | sort -u)
+                ;;
+            interworx)
+                while IFS= read -r _ini; do
+                    _fix_tz_ini "$_ini" && _P52_COUNT=$((_P52_COUNT+1))
+                done < <(find /usr/local/interworx -name "php.ini" 2>/dev/null | sort -u)
+                ;;
+            centminmod)
+                while IFS= read -r _ini; do
+                    _fix_tz_ini "$_ini" && _P52_COUNT=$((_P52_COUNT+1))
+                done < <(find /usr/local/lib/php* -name "php.ini" 2>/dev/null | sort -u)
+                ;;
+        esac
+        [ "$_P52_COUNT" -gt 0 ] \
+            && log_ok "Part 5.2: ${_P52_COUNT} panel php.ini file(s) updated" \
+            || log_skip "Part 5.2: No extra php.ini files found for ${_L5_PANEL}"
+    else
+        log_dry "Set date.timezone = ${PHP_TIMEZONE} in all ${_L5_PANEL} php.ini files"
+    fi
+fi
+
+# ══════════════════════════════════════════════════════════════════════════════
