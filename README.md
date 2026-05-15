@@ -19,7 +19,7 @@ Linux Guardian implements a **Defence in Depth** strategy — multiple independe
 | [5] | **PHP Hardening** | Global php.ini: disables 60+ dangerous functions (shell_exec, system, exec, passthru, proc_open, pcntl_*, posix_*, fsockopen...) and applies security settings |
 | [5.1] | **PHP-FPM Pools** | Auto-detects all sites and creates an isolated pool per site — each site runs under its own user with its own open_basedir, session directory, and log files |
 | [6] | **noexec (auto-detect)** | Auto-detects site roots from /var/www, /home/*/public_html, and Apache/Nginx configs — applies noexec, nosuid, nodev to /tmp, /var/tmp, and all site directories |
-| [7] | **AppArmor / SELinux** | Auto-detects the available MAC system and enforces it — web server cannot exec binaries even if uploaded |
+| [7] | **AppArmor / SELinux** | Auto-detects the available MAC system and enforces it — schedules a full filesystem relabel on next boot (`fixfiles -F onboot`) to correct any unlabeled files — web server cannot exec binaries even if uploaded |
 | [8] | **Auditd** | Real-time monitoring — logs and emails instant alerts for webshell execution, privilege escalation, and critical file changes |
 | [A] | **FTP + ClamAV** | Pure-FTPd upload scanning — infected files are removed immediately and an alert email is sent |
 | [B] | **Snuffleupagus** | Optional PHP RASP module — auto-detects PHP mode (FPM / CGI / mod_php) and configures a shared rules file accordingly |
@@ -37,9 +37,17 @@ Linux Guardian implements a **Defence in Depth** strategy — multiple independe
 ```bash
 curl -L https://raw.githubusercontent.com/mogbil/lg/main/lg.sh -o /tmp/lg.sh && mv /tmp/lg.sh /usr/local/bin/lg && chmod +x /usr/local/bin/lg && lg
 ```
-with sudo
+
+With sudo:
+
 ```bash
 curl -L https://raw.githubusercontent.com/mogbil/lg/main/lg.sh -o /tmp/lg.sh && sudo mv /tmp/lg.sh /usr/local/bin/lg && sudo chmod +x /usr/local/bin/lg && sudo lg
+```
+
+Verify script integrity before running (recommended):
+
+```bash
+bash -n /usr/local/bin/lg && echo "Syntax OK" || echo "Syntax error — do not run"
 ```
 
 ## Usage
@@ -89,6 +97,21 @@ The undo command restores:
 - Dismounted noexec/nosuid/nodev mounts and /etc/fstab changes
 - AppArmor profiles set back to complain mode
 - Auditd rules removed
+
+## Reboot After Hardening
+
+The script **automatically reboots the server** after all layers are applied (10-second countdown with Ctrl+C cancel window). The reboot is required to:
+
+- Apply the SELinux filesystem relabel (`fixfiles -F onboot`) — corrects any `unlabeled_t` files
+- Activate kernel module blocks (`modprobe.d`)
+- Ensure all sysctl and MAC changes take full effect
+
+```
+⚠  SERVER WILL REBOOT IN 10 SECONDS TO APPLY SELinux RELABEL
+   Press Ctrl+C to cancel
+```
+
+> **Note:** The reboot is skipped in `--dry-run` mode.
 
 ## Alert Email
 
@@ -183,6 +206,25 @@ php -m | grep -i snuffleupagus
 cat /etc/snuffleupagus/lg.rules
 ```
 
+## SELinux Notes
+
+On RHEL / CentOS / Rocky / AlmaLinux systems, the script:
+
+1. Confirms SELinux is enabled and sets it to `enforcing`
+2. Applies hardened httpd booleans:
+
+| Boolean | Value | Effect |
+|---------|-------|--------|
+| `httpd_execmem` | off | Prevents httpd from executing code from memory |
+| `httpd_execute_tmp` | off | Prevents httpd from executing anything in /tmp |
+| `httpd_unified` | off | Isolates each httpd process to its own context |
+| `httpd_can_network_connect` | off | Blocks outbound network connections from httpd |
+| `httpd_can_network_relay` | off | Prevents httpd from acting as a proxy/relay |
+
+3. Runs `fixfiles -F onboot` to schedule a full filesystem relabel on the next boot — this corrects any files with `unlabeled_t` context (common on freshly provisioned servers)
+
+If the server was provisioned with SELinux disabled or via image copy, the relabel is **required** for SELinux to function correctly. The automatic reboot at the end of the script triggers this relabel.
+
 ## Monitoring (Auditd)
 
 Audit rules that monitor and send email alerts:
@@ -231,6 +273,16 @@ Log file: `/var/log/lg-hardening.log`
 ## Verification
 
 ```bash
+# Verify script syntax before running
+bash -n /usr/local/bin/lg && echo "Syntax OK"
+
+# Layer 1 — binary lockdown
+ls -l /usr/bin/python* /usr/bin/gcc /usr/bin/curl 2>/dev/null | awk '{print $1, $NF}'
+
+# Layer 2 — kernel hardening
+sysctl kernel.randomize_va_space kernel.dmesg_restrict fs.protected_hardlinks
+lsmod | grep -E "dccp|sctp|rds|tipc" || echo "Modules blocked"
+
 # Layer 5 — disable_functions
 php -r 'echo ini_get("disable_functions");' | tr , '\n' | head -10
 
@@ -244,8 +296,11 @@ mount | grep -E "noexec|nosuid"
 # Layer 7 — MAC
 sestatus 2>/dev/null || apparmor_status 2>/dev/null
 
+# Layer 7 — SELinux booleans (RHEL/AlmaLinux/Rocky)
+getsebool httpd_execmem httpd_execute_tmp httpd_unified httpd_can_network_connect httpd_can_network_relay
+
 # Layer 8 — Audit rules
-auditctl -l | grep lg
+auditctl -l | grep -E "webshell|tmp_exec|priv_esc"
 ausearch -k webshell -ts recent
 
 # Snuffleupagus
@@ -253,6 +308,21 @@ php -m | grep -i snuffleupagus
 
 # Watch mode log
 tail -f /var/log/lg-hardening.log
+```
+
+## Error Handling
+
+The script runs with `set -euo pipefail` — it stops immediately if any unexpected error occurs and prints the exit code along with the log path:
+
+```
+[ERROR]   Script exited unexpectedly (code: 1)
+[WARN]    Some layers may be incomplete — review log: /var/log/lg-hardening.log
+```
+
+Review the log to identify which layer failed:
+
+```bash
+tail -50 /var/log/lg-hardening.log
 ```
 
 ## License

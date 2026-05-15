@@ -24,7 +24,16 @@
 #   sudo lg --watch          Watch for new sites and isolate them automatically
 # ══════════════════════════════════════════════════════════════════════════════
 
-set -uo pipefail
+set -euo pipefail
+
+# ─── Trap: clean exit on error ───────────────────────────────────────────────
+_lg_exit() {
+    local code=$?
+    [ $code -eq 0 ] && return
+    echo -e "\n  ${RED}[ERROR]${NC}   Script exited unexpectedly (code: ${code})" >&2
+    echo -e "  ${YELLOW}[WARN]${NC}    Some layers may be incomplete — review log: ${LOG_FILE:-/var/log/lg-hardening.log}" >&2
+}
+trap '_lg_exit' EXIT
 
 # ─── Colours ────────────────────────────────────────────────────────────────
 RED='\033[0;31m'
@@ -409,14 +418,14 @@ if [ -d /etc/modprobe.d ]; then
         log_dry "Create $MODPROBE_CONF blocking: dccp sctp rds tipc rxrpc esp4 esp6"
     else
         cat > "$MODPROBE_CONF" << 'EOF'
-        # Linux Guardian — block unused/vulnerable kernel modules
-        install dccp  /bin/false
-        install sctp  /bin/false
-        install rds   /bin/false
-        install tipc  /bin/false
-        install rxrpc /bin/false
-        install esp4  /bin/false
-        install esp6  /bin/false
+# Linux Guardian — block unused/vulnerable kernel modules
+install dccp  /bin/false
+install sctp  /bin/false
+install rds   /bin/false
+install tipc  /bin/false
+install rxrpc /bin/false
+install esp4  /bin/false
+install esp6  /bin/false
 EOF
         chmod 644 "$MODPROBE_CONF"
         echo "MODPROBE:${MODPROBE_CONF}" >> "$UNDO_MANIFEST"
@@ -436,32 +445,32 @@ if [ "$DRY_RUN" = true ]; then
     log_dry "Create $SYSCTL_CONF with kernel/network hardening"
 else
     cat > "$SYSCTL_CONF" << 'EOF'
-    # Linux Guardian — Kernel & Network Hardening
+# Linux Guardian — Kernel & Network Hardening
 
-    # ASLR
-    kernel.randomize_va_space = 2
-    # Restrict kernel log to root
-    kernel.dmesg_restrict = 1
-    # Hide kernel pointers
-    kernel.kptr_restrict = 2
-    # Disable core dumps for setuid programs
-    fs.suid_dumpable = 0
-    # SYN flood protection
-    net.ipv4.tcp_syncookies = 1
-    # Reverse path filtering (anti-spoofing)
-    net.ipv4.conf.all.rp_filter     = 1
-    net.ipv4.conf.default.rp_filter = 1
-    # Ignore ICMP redirects
-    net.ipv4.conf.all.accept_redirects     = 0
-    net.ipv4.conf.default.accept_redirects = 0
-    net.ipv6.conf.all.accept_redirects     = 0
-    # Do not forward/send redirects
-    net.ipv4.conf.all.send_redirects = 0
-    # Ignore source-routed packets
-    net.ipv4.conf.all.accept_source_route = 0
-    # Protect hardlinks and symlinks (/tmp race attacks)
-    fs.protected_hardlinks = 1
-    fs.protected_symlinks  = 1
+# ASLR
+kernel.randomize_va_space = 2
+# Restrict kernel log to root
+kernel.dmesg_restrict = 1
+# Hide kernel pointers
+kernel.kptr_restrict = 2
+# Disable core dumps for setuid programs
+fs.suid_dumpable = 0
+# SYN flood protection
+net.ipv4.tcp_syncookies = 1
+# Reverse path filtering (anti-spoofing)
+net.ipv4.conf.all.rp_filter     = 1
+net.ipv4.conf.default.rp_filter = 1
+# Ignore ICMP redirects
+net.ipv4.conf.all.accept_redirects     = 0
+net.ipv4.conf.default.accept_redirects = 0
+net.ipv6.conf.all.accept_redirects     = 0
+# Do not forward/send redirects
+net.ipv4.conf.all.send_redirects = 0
+# Ignore source-routed packets
+net.ipv4.conf.all.accept_source_route = 0
+# Protect hardlinks and symlinks (/tmp race attacks)
+fs.protected_hardlinks = 1
+fs.protected_symlinks  = 1
 EOF
     chmod 644 "$SYSCTL_CONF"
     echo "SYSCTL:${SYSCTL_CONF}" >> "$UNDO_MANIFEST"
@@ -922,7 +931,7 @@ _apply_noexec_dir() {
         else
             mount -o remount,noexec,nosuid,nodev "$mnt" 2>/dev/null \
                 && log_ok "${mnt}  →  remounted noexec" \
-                || log_warn "${mnt}  →  remount failed"
+                || { log_warn "${mnt}  →  remount failed"; true; }
             echo "MOUNT_NOEXEC:${mnt}" >> "$UNDO_MANIFEST"
         fi
 
@@ -1153,11 +1162,24 @@ case "$MAC_SYSTEM" in
                 else
                     setenforce 1 2>/dev/null \
                         && log_ok "SELinux: enforcing mode active" \
-                        || log_warn "setenforce 1 failed — check SELinux policy"
+                        || { log_warn "setenforce 1 failed — check SELinux policy"; true; }
                     sed -i 's/^SELINUX=.*/SELINUX=enforcing/' /etc/selinux/config
                 fi
             else
                 log_ok "SELinux already enforcing"
+            fi
+
+            # Ensure all filesystem labels are correct on next boot
+            if [ "$DRY_RUN" = true ]; then
+                log_dry "fixfiles -F onboot — schedule full filesystem relabel on next boot"
+            else
+                if command -v fixfiles &>/dev/null; then
+                    fixfiles -F onboot 2>/dev/null \
+                        && log_ok "SELinux: full filesystem relabel scheduled on next boot" \
+                        || log_warn "fixfiles -F onboot failed — run manually if needed"
+                else
+                    log_skip "fixfiles not found — install policycoreutils"
+                fi
             fi
 
             # Harden httpd booleans
@@ -1249,9 +1271,9 @@ case "$MAC_SYSTEM" in
                     log_ok "SELinux set to enforcing in /etc/selinux/config"
                 else
                     cat > /etc/selinux/config << 'SECONF'
-                    # Linux Guardian — SELinux configuration
-                    SELINUX=enforcing
-                    SELINUXTYPE=targeted
+# Linux Guardian — SELinux configuration
+SELINUX=enforcing
+SELINUXTYPE=targeted
 SECONF
                     log_ok "SELinux config created"
                 fi
@@ -1259,6 +1281,12 @@ SECONF
                 setenforce 1 2>/dev/null \
                     && log_ok "SELinux enforcing — active now" \
                     || log_warn "SELinux will be enforcing after reboot"
+                # Schedule full relabel on next boot
+                if command -v fixfiles &>/dev/null; then
+                    fixfiles -F onboot 2>/dev/null \
+                        && log_ok "SELinux: full filesystem relabel scheduled on next boot" \
+                        || log_warn "fixfiles -F onboot failed — run manually if needed"
+                fi
                 MAC_SYSTEM="selinux"
             else
                 log_warn "SELinux install failed — trying AppArmor as fallback"
@@ -1332,8 +1360,15 @@ if [ "$MAC_SYSTEM" = "apparmor_install" ]; then
     log_info "Running AppArmor fallback install..."
     if install_apparmor; then
         enable_apparmor_boot && log_ok "AppArmor enabled on boot"
-        systemctl start apparmor 2>/dev/null             || service apparmor start 2>/dev/null || true
-        command -v apparmor_status &>/dev/null             && { log_ok "AppArmor installed and active"; MAC_SYSTEM="apparmor"; }             || log_warn "AppArmor installed — reboot may be required"
+        systemctl start apparmor 2>/dev/null \
+            || service apparmor start 2>/dev/null \
+            || true
+        if command -v apparmor_status &>/dev/null; then
+            log_ok "AppArmor installed and active"
+            MAC_SYSTEM="apparmor"
+        else
+            log_warn "AppArmor installed — reboot may be required"
+        fi
     else
         log_warn "AppArmor install also failed"
         MAC_SYSTEM="none"
@@ -1375,35 +1410,35 @@ if command -v auditctl &>/dev/null || [ "$DRY_RUN" = true ]; then
               || echo "33")
 
         cat > "$AUDIT_RULES" << EOF
-        ## Linux Guardian Audit Rules — ${TIMESTAMP}
+## Linux Guardian Audit Rules — ${TIMESTAMP}
 
-        # Webshell execution — exec from writable dirs
-        -a always,exit -F arch=b64 -S execve -F dir=/tmp     -k tmp_exec
-        -a always,exit -F arch=b32 -S execve -F dir=/tmp     -k tmp_exec
-        -a always,exit -F arch=b64 -S execve -F dir=/var/tmp -k tmp_exec
+# Webshell execution — exec from writable dirs
+-a always,exit -F arch=b64 -S execve -F dir=/tmp     -k tmp_exec
+-a always,exit -F arch=b32 -S execve -F dir=/tmp     -k tmp_exec
+-a always,exit -F arch=b64 -S execve -F dir=/var/tmp -k tmp_exec
 
-        # PHP/Apache exec (web user uid=${WWWUID})
-        -a always,exit -F arch=b64 -S execve -F uid=${WWWUID} -k webshell
+# PHP/Apache exec (web user uid=${WWWUID})
+-a always,exit -F arch=b64 -S execve -F uid=${WWWUID} -k webshell
 
-        # Critical file modifications
-        -w /etc/passwd          -p wa -k passwd_change
-        -w /etc/shadow          -p wa -k shadow_change
-        -w /etc/sudoers         -p wa -k sudoers_change
-        -w /etc/sudoers.d       -p wa -k sudoers_change
-        -w /etc/ssh/sshd_config -p wa -k sshd_config
-        -w /etc/crontab         -p wa -k cron_change
-        -w /etc/cron.d          -p wa -k cron_change
+# Critical file modifications
+-w /etc/passwd          -p wa -k passwd_change
+-w /etc/shadow          -p wa -k shadow_change
+-w /etc/sudoers         -p wa -k sudoers_change
+-w /etc/sudoers.d       -p wa -k sudoers_change
+-w /etc/ssh/sshd_config -p wa -k sshd_config
+-w /etc/crontab         -p wa -k cron_change
+-w /etc/cron.d          -p wa -k cron_change
 
-        # Privilege escalation
-        -a always,exit -F arch=b64 -S setuid   -k priv_esc
-        -a always,exit -F arch=b64 -S setgid   -k priv_esc
-        -a always,exit -F arch=b64 -S setreuid -k priv_esc
+# Privilege escalation
+-a always,exit -F arch=b64 -S setuid   -k priv_esc
+-a always,exit -F arch=b64 -S setgid   -k priv_esc
+-a always,exit -F arch=b64 -S setreuid -k priv_esc
 
-        # Exec from home directories
-        -a always,exit -F arch=b64 -S execve -F dir=/home -k home_exec
+# Exec from home directories
+-a always,exit -F arch=b64 -S execve -F dir=/home -k home_exec
 
-        # PHP config changes
-        -w /etc/php -p wa -k php_config
+# PHP config changes
+-w /etc/php -p wa -k php_config
 EOF
         chmod 640 "$AUDIT_RULES"
         echo "AUDITD_RULE:${AUDIT_RULES}" >> "$UNDO_MANIFEST"
@@ -1411,30 +1446,30 @@ EOF
         # ── Email alert script — triggered by audisp ──────────────────────────
         AUDISP_ALERT="/etc/audit/lg-alert.sh"
         cat > "$AUDISP_ALERT" << ALERTEOF
-        #!/bin/bash
-        # Linux Guardian — Auditd email alert
-        # Called by audispd when a monitored rule fires
-        ALERT_EMAIL="${ALERT_EMAIL}"
-        LOG="${LOG_FILE}"
+#!/bin/bash
+# Linux Guardian — Auditd email alert
+# Called by audispd when a monitored rule fires
+ALERT_EMAIL="${ALERT_EMAIL}"
+LOG="${LOG_FILE}"
 
-        read -r -t 1 LINE || true
-        [ -z "\$LINE" ] && exit 0
+read -r -t 1 LINE || true
+[ -z "\$LINE" ] && exit 0
 
-        # Only alert on our rule keys
-        echo "\$LINE" | grep -qE '"key":"(webshell|tmp_exec|priv_esc|passwd_change|shadow_change|sudoers_change|home_exec)"' || exit 0
+# Only alert on our rule keys
+echo "\$LINE" | grep -qE '"key":"(webshell|tmp_exec|priv_esc|passwd_change|shadow_change|sudoers_change|home_exec)"' || exit 0
 
-        TS=\$(date '+%Y-%m-%d %H:%M:%S')
-        HOST=\$(hostname)
-        KEY=\$(echo "\$LINE" | grep -oP '"key":"\K[^"]+')
-        COMM=\$(echo "\$LINE" | grep -oP '"comm":"\K[^"]+' || echo "unknown")
-        PID=\$(echo "\$LINE"  | grep -oP '"pid":\K[0-9]+'  || echo "?")
+TS=\$(date '+%Y-%m-%d %H:%M:%S')
+HOST=\$(hostname)
+KEY=\$(echo "\$LINE" | grep -oP '"key":"\K[^"]+')
+COMM=\$(echo "\$LINE" | grep -oP '"comm":"\K[^"]+' || echo "unknown")
+PID=\$(echo "\$LINE"  | grep -oP '"pid":\K[0-9]+'  || echo "?")
 
-        SUBJECT="[LG ALERT] \${KEY} detected on \${HOST}"
-        BODY=\$(printf "Linux Guardian Security Alert\n\nHost:    %s\nTime:    %s\nKey:     %s\nProcess: %s (PID %s)\n\nRaw event:\n%s\n\nLog: %s" \
-            "\$HOST" "\$TS" "\$KEY" "\$COMM" "\$PID" "\$LINE" "\$LOG")
+SUBJECT="[LG ALERT] \${KEY} detected on \${HOST}"
+BODY=\$(printf "Linux Guardian Security Alert\n\nHost:    %s\nTime:    %s\nKey:     %s\nProcess: %s (PID %s)\n\nRaw event:\n%s\n\nLog: %s" \
+    "\$HOST" "\$TS" "\$KEY" "\$COMM" "\$PID" "\$LINE" "\$LOG")
 
-        echo "\$BODY" | mail -s "\$SUBJECT" "\$ALERT_EMAIL" 2>/dev/null
-        echo "\$TS [ALERT] \$KEY — \$COMM (PID \$PID)" >> "\$LOG"
+echo "\$BODY" | mail -s "\$SUBJECT" "\$ALERT_EMAIL" 2>/dev/null
+echo "\$TS [ALERT] \$KEY — \$COMM (PID \$PID)" >> "\$LOG"
 ALERTEOF
         chmod 750 "$AUDISP_ALERT"
         echo "AUDITD_RULE:${AUDISP_ALERT}" >> "$UNDO_MANIFEST"
@@ -1447,11 +1482,11 @@ ALERTEOF
 
         if [ -n "$AUDISP_PLUGIN_DIR" ]; then
             cat > "${AUDISP_PLUGIN_DIR}/lg-alert.conf" << PLUGEOF
-            active = yes
-            direction = out
-            path = ${AUDISP_ALERT}
-            type = always
-            format = json
+active = yes
+direction = out
+path = ${AUDISP_ALERT}
+type = always
+format = json
 PLUGEOF
             log_ok "Audisp plugin registered: ${AUDISP_PLUGIN_DIR}/lg-alert.conf"
             echo "AUDITD_RULE:${AUDISP_PLUGIN_DIR}/lg-alert.conf" >> "$UNDO_MANIFEST"
@@ -1460,8 +1495,8 @@ PLUGEOF
             # Fallback: cron checks audit log every minute
             AUDIT_CRON="/etc/cron.d/lg-audit-alert"
             cat > "$AUDIT_CRON" << CRONEOF
-            # Linux Guardian — audit alert fallback (runs every minute)
-            * * * * * root ausearch -k webshell -k tmp_exec -k priv_esc -ts recent 2>/dev/null | grep -q 'type=SYSCALL' && ausearch -k webshell -k tmp_exec -k priv_esc -ts recent 2>/dev/null | mail -s "[LG ALERT] Suspicious activity on \$(hostname)" ${ALERT_EMAIL}
+# Linux Guardian — audit alert fallback (runs every minute)
+* * * * * root ausearch -k webshell -k tmp_exec -k priv_esc -ts recent 2>/dev/null | grep -q 'type=SYSCALL' && ausearch -k webshell -k tmp_exec -k priv_esc -ts recent 2>/dev/null | mail -s "[LG ALERT] Suspicious activity on \$(hostname)" ${ALERT_EMAIL}
 CRONEOF
             chmod 640 "$AUDIT_CRON"
             echo "AUDITD_RULE:${AUDIT_CRON}" >> "$UNDO_MANIFEST"
@@ -2119,7 +2154,21 @@ if [ "$DRY_RUN" = false ]; then
     echo -e "${YELLOW}Verify:${NC}"
     echo "  php -r 'echo ini_get(\"disable_functions\");' | tr , '\n' | head -5"
     echo "  mount | grep noexec"
-      echo "  ausearch -k webshell -ts recent"
+    echo "  ausearch -k webshell -ts recent"
     echo "  sestatus 2>/dev/null || apparmor_status 2>/dev/null"
 fi
 echo ""
+
+# ══════════════════════════════════════════════════════════════════════════════
+# REBOOT — Apply SELinux relabel and activate all hardening changes
+# ══════════════════════════════════════════════════════════════════════════════
+if [ "$DRY_RUN" = false ]; then
+    echo -e "${BOLD}${YELLOW}"
+    echo "════════════════════════════════════════════════════════════════════"
+    echo "  ⚠  SERVER WILL REBOOT IN 10 SECONDS TO APPLY SELinux RELABEL"
+    echo "  Press Ctrl+C to cancel"
+    echo "════════════════════════════════════════════════════════════════════"
+    echo -e "${NC}"
+    sleep 10
+    reboot
+fi
