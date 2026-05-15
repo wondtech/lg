@@ -14,7 +14,6 @@
 #   [8] Auditd                — Real-time monitoring and alerting
 #   [A] FTP + ClamAV          — Scan uploaded files for malware
 #   [B] Snuffleupagus         — PHP RASP
-
 #
 # Usage:
 #   sudo lg                  Interactive (recommended first run)
@@ -410,14 +409,14 @@ if [ -d /etc/modprobe.d ]; then
         log_dry "Create $MODPROBE_CONF blocking: dccp sctp rds tipc rxrpc esp4 esp6"
     else
         cat > "$MODPROBE_CONF" << 'EOF'
-# Linux Guardian — block unused/vulnerable kernel modules
-install dccp  /bin/false
-install sctp  /bin/false
-install rds   /bin/false
-install tipc  /bin/false
-install rxrpc /bin/false
-install esp4  /bin/false
-install esp6  /bin/false
+        # Linux Guardian — block unused/vulnerable kernel modules
+        install dccp  /bin/false
+        install sctp  /bin/false
+        install rds   /bin/false
+        install tipc  /bin/false
+        install rxrpc /bin/false
+        install esp4  /bin/false
+        install esp6  /bin/false
 EOF
         chmod 644 "$MODPROBE_CONF"
         echo "MODPROBE:${MODPROBE_CONF}" >> "$UNDO_MANIFEST"
@@ -437,32 +436,32 @@ if [ "$DRY_RUN" = true ]; then
     log_dry "Create $SYSCTL_CONF with kernel/network hardening"
 else
     cat > "$SYSCTL_CONF" << 'EOF'
-# Linux Guardian — Kernel & Network Hardening
+    # Linux Guardian — Kernel & Network Hardening
 
-# ASLR
-kernel.randomize_va_space = 2
-# Restrict kernel log to root
-kernel.dmesg_restrict = 1
-# Hide kernel pointers
-kernel.kptr_restrict = 2
-# Disable core dumps for setuid programs
-fs.suid_dumpable = 0
-# SYN flood protection
-net.ipv4.tcp_syncookies = 1
-# Reverse path filtering (anti-spoofing)
-net.ipv4.conf.all.rp_filter     = 1
-net.ipv4.conf.default.rp_filter = 1
-# Ignore ICMP redirects
-net.ipv4.conf.all.accept_redirects     = 0
-net.ipv4.conf.default.accept_redirects = 0
-net.ipv6.conf.all.accept_redirects     = 0
-# Do not forward/send redirects
-net.ipv4.conf.all.send_redirects = 0
-# Ignore source-routed packets
-net.ipv4.conf.all.accept_source_route = 0
-# Protect hardlinks and symlinks (/tmp race attacks)
-fs.protected_hardlinks = 1
-fs.protected_symlinks  = 1
+    # ASLR
+    kernel.randomize_va_space = 2
+    # Restrict kernel log to root
+    kernel.dmesg_restrict = 1
+    # Hide kernel pointers
+    kernel.kptr_restrict = 2
+    # Disable core dumps for setuid programs
+    fs.suid_dumpable = 0
+    # SYN flood protection
+    net.ipv4.tcp_syncookies = 1
+    # Reverse path filtering (anti-spoofing)
+    net.ipv4.conf.all.rp_filter     = 1
+    net.ipv4.conf.default.rp_filter = 1
+    # Ignore ICMP redirects
+    net.ipv4.conf.all.accept_redirects     = 0
+    net.ipv4.conf.default.accept_redirects = 0
+    net.ipv6.conf.all.accept_redirects     = 0
+    # Do not forward/send redirects
+    net.ipv4.conf.all.send_redirects = 0
+    # Ignore source-routed packets
+    net.ipv4.conf.all.accept_source_route = 0
+    # Protect hardlinks and symlinks (/tmp race attacks)
+    fs.protected_hardlinks = 1
+    fs.protected_symlinks  = 1
 EOF
     chmod 644 "$SYSCTL_CONF"
     echo "SYSCTL:${SYSCTL_CONF}" >> "$UNDO_MANIFEST"
@@ -818,49 +817,49 @@ setup_phpfpm_pools() {
         backup_file "$POOL_CONF" "phpfpm_pool"
 
         cat > "$POOL_CONF" << EOF
-; ══════════════════════════════════════════════════════
-; Linux Guardian — PHP-FPM Pool: ${SITE_NAME}
-; Generated: ${TIMESTAMP}
-;
-; Global settings (disable_functions, session security,
-; limits) are inherited from php.ini
-; Per-site: open_basedir + session path + logging
-; ══════════════════════════════════════════════════════
+        ; ══════════════════════════════════════════════════════
+        ; Linux Guardian — PHP-FPM Pool: ${SITE_NAME}
+        ; Generated: ${TIMESTAMP}
+        ;
+        ; Global settings (disable_functions, session security,
+        ; limits) are inherited from php.ini
+        ; Per-site: open_basedir + session path + logging
+        ; ══════════════════════════════════════════════════════
 
-[${SITE_NAME}]
+        [${SITE_NAME}]
 
-; ── Process user ───────────────────────────────────────
-user  = ${SITE_USER}
-group = ${SITE_GROUP}
+        ; ── Process user ───────────────────────────────────────
+        user  = ${SITE_USER}
+        group = ${SITE_GROUP}
 
-; ── Socket ─────────────────────────────────────────────
-listen       = ${SOCK_PATH}
-listen.owner = ${SOCK_OWNER}
-listen.group = ${SOCK_OWNER}
-listen.mode  = 0660
+        ; ── Socket ─────────────────────────────────────────────
+        listen       = ${SOCK_PATH}
+        listen.owner = ${SOCK_OWNER}
+        listen.group = ${SOCK_OWNER}
+        listen.mode  = 0660
 
-; ── Process management ─────────────────────────────────
-pm                   = dynamic
-pm.max_children      = 10
-pm.start_servers     = 2
-pm.min_spare_servers = 1
-pm.max_spare_servers = 3
-pm.max_requests      = 500
+        ; ── Process management ─────────────────────────────────
+        pm                   = dynamic
+        pm.max_children      = 10
+        pm.start_servers     = 2
+        pm.min_spare_servers = 1
+        pm.max_spare_servers = 3
+        pm.max_requests      = 500
 
-; ── Per-site: open_basedir ─────────────────────────────
-; Restricts file access to this site's directory only
-php_admin_value[open_basedir] = ${OPEN_BASEDIR}
+        ; ── Per-site: open_basedir ─────────────────────────────
+        ; Restricts file access to this site's directory only
+        php_admin_value[open_basedir] = ${OPEN_BASEDIR}
 
-; ── Per-site: session isolation ────────────────────────
-; Each site stores sessions in its own directory
-php_value[session.save_handler] = files
-php_value[session.save_path]    = ${SESSION_PATH}
+        ; ── Per-site: session isolation ────────────────────────
+        ; Each site stores sessions in its own directory
+        php_value[session.save_handler] = files
+        php_value[session.save_path]    = ${SESSION_PATH}
 
-; ── Per-site: logging ──────────────────────────────────
-php_admin_value[error_log] = ${ERROR_LOG}
-access.log                 = ${LOG_BASE}/${SITE_NAME}-access.log
-slowlog                    = ${LOG_BASE}/${SITE_NAME}-slow.log
-request_slowlog_timeout    = 5s
+        ; ── Per-site: logging ──────────────────────────────────
+        php_admin_value[error_log] = ${ERROR_LOG}
+        access.log                 = ${LOG_BASE}/${SITE_NAME}-access.log
+        slowlog                    = ${LOG_BASE}/${SITE_NAME}-slow.log
+        request_slowlog_timeout    = 5s
 EOF
 
         chmod 640 "$POOL_CONF"
@@ -1040,36 +1039,128 @@ log_ok "Layer 6 complete"
 
 # ══════════════════════════════════════════════════════════════════════════════
 # LAYER 7 — AppArmor / SELinux (MAC)
-# MAC policy: web server cannot exec binaries even if uploaded
+# Auto-installs and enforces the appropriate MAC system for this distro
 # ══════════════════════════════════════════════════════════════════════════════
-section "LAYER 7: MAC — AppArmor / SELinux"
+section "LAYER 7: MAC — AppArmor / SELinux (auto-install + enforce)"
 
-command -v sestatus        &>/dev/null && MAC_SYSTEM="selinux"
-command -v apparmor_status &>/dev/null && MAC_SYSTEM="apparmor"
-log_info "MAC system detected: ${MAC_SYSTEM}"
+# ── Helper: install AppArmor ──────────────────────────────────────────────────
+install_apparmor() {
+    log_info "Installing AppArmor..."
+    if command -v apt-get &>/dev/null; then
+        DEBIAN_FRONTEND=noninteractive apt-get install -y -qq \
+            apparmor apparmor-utils apparmor-profiles 2>/dev/null \
+            && log_ok "AppArmor installed (apt)" && return 0
+    elif command -v dnf &>/dev/null; then
+        dnf install -y -q apparmor apparmor-utils 2>/dev/null \
+            && log_ok "AppArmor installed (dnf)" && return 0
+    elif command -v yum &>/dev/null; then
+        yum install -y -q apparmor apparmor-utils 2>/dev/null \
+            && log_ok "AppArmor installed (yum)" && return 0
+    elif command -v apk &>/dev/null; then
+        apk add -q apparmor 2>/dev/null \
+            && log_ok "AppArmor installed (apk)" && return 0
+    elif command -v pacman &>/dev/null; then
+        pacman -S --noconfirm -q apparmor 2>/dev/null \
+            && log_ok "AppArmor installed (pacman)" && return 0
+    fi
+    return 1
+}
+
+# ── Helper: enable AppArmor on boot (distro-aware) ───────────────────────────
+enable_apparmor_boot() {
+    # systemd
+    if command -v systemctl &>/dev/null; then
+        systemctl enable apparmor 2>/dev/null && return 0
+    fi
+    # OpenRC (Alpine)
+    if command -v rc-update &>/dev/null; then
+        rc-update add apparmor boot 2>/dev/null && return 0
+    fi
+    # Arch — needs kernel params
+    if command -v pacman &>/dev/null; then
+        if [ -f /etc/default/grub ]; then
+            if ! grep -q "apparmor=1" /etc/default/grub; then
+                sed -i 's/GRUB_CMDLINE_LINUX="/GRUB_CMDLINE_LINUX="apparmor=1 security=apparmor /' \
+                    /etc/default/grub 2>/dev/null
+                grub-mkconfig -o /boot/grub/grub.cfg &>/dev/null
+                log_info "GRUB updated for AppArmor — reboot required"
+            fi
+        fi
+        return 0
+    fi
+    return 1
+}
+
+# ── Helper: detect distro family ─────────────────────────────────────────────
+detect_distro_family() {
+    local ID="" ID_LIKE=""
+    if [ -f /etc/os-release ]; then
+        # shellcheck source=/dev/null
+        . /etc/os-release
+        case "${ID:-}${ID_LIKE:-}" in
+            *rhel*|*centos*|*fedora*|*rocky*|*alma*) echo "rhel" ;;
+            *debian*|*ubuntu*)                        echo "debian" ;;
+            *alpine*)                                 echo "alpine" ;;
+            *arch*|*manjaro*)                         echo "arch" ;;
+            *)                                        echo "unknown" ;;
+        esac
+    else
+        echo "unknown"
+    fi
+}
+
+# ── Detect existing MAC system ────────────────────────────────────────────────
+DISTRO_FAMILY=$(detect_distro_family)
+log_info "Distro family: ${DISTRO_FAMILY}"
+
+# Prefer SELinux on RHEL family, AppArmor on others
+if command -v sestatus &>/dev/null; then
+    MAC_SYSTEM="selinux"
+elif command -v apparmor_status &>/dev/null; then
+    MAC_SYSTEM="apparmor"
+else
+    # Not installed — decide what to install
+    case "$DISTRO_FAMILY" in
+        rhel)    MAC_SYSTEM="selinux_install" ;;
+        *)       MAC_SYSTEM="apparmor_install" ;;
+    esac
+fi
+
+log_info "MAC system: ${MAC_SYSTEM}"
 echo ""
 
 case "$MAC_SYSTEM" in
+
+    # ── SELinux — already installed ───────────────────────────────────────────
     selinux)
         SE_STATUS=$(sestatus 2>/dev/null | awk '/SELinux status/{print $3}')
         SE_MODE=$(sestatus   2>/dev/null | awk '/Current mode/{print $3}')
-        log_info "Status: ${SE_STATUS}  Mode: ${SE_MODE}"
+        log_info "SELinux status: ${SE_STATUS}  mode: ${SE_MODE}"
 
         if [ "${SE_STATUS}" != "enabled" ]; then
-            log_warn "SELinux not enabled — edit /etc/selinux/config and reboot"
+            if [ "$DRY_RUN" = true ]; then
+                log_dry "Enable SELinux in /etc/selinux/config + reboot"
+            else
+                sed -i 's/^SELINUX=.*/SELINUX=enforcing/' /etc/selinux/config
+                log_warn "SELinux was disabled — set to enforcing in config"
+                log_warn "A reboot is required to fully enable SELinux"
+            fi
         else
+            # Ensure enforcing mode
             if [ "${SE_MODE}" != "enforcing" ]; then
                 if [ "$DRY_RUN" = true ]; then
                     log_dry "setenforce 1 + SELINUX=enforcing in /etc/selinux/config"
                 else
-                    setenforce 1
+                    setenforce 1 2>/dev/null \
+                        && log_ok "SELinux: enforcing mode active" \
+                        || log_warn "setenforce 1 failed — check SELinux policy"
                     sed -i 's/^SELINUX=.*/SELINUX=enforcing/' /etc/selinux/config
-                    log_ok "SELinux set to enforcing"
                 fi
             else
                 log_ok "SELinux already enforcing"
             fi
 
+            # Harden httpd booleans
             if [ "$DRY_RUN" = true ]; then
                 log_dry "Apply SELinux httpd security booleans"
             else
@@ -1088,13 +1179,21 @@ case "$MAC_SYSTEM" in
                 unset SEBOOLS
             fi
         fi
+        MAC_SYSTEM="selinux"
         ;;
 
+    # ── AppArmor — already installed ──────────────────────────────────────────
     apparmor)
         if [ "$DRY_RUN" = true ]; then
-            log_dry "Enable AppArmor + enforce web server profiles"
+            log_dry "Enable AppArmor service + enforce web server profiles"
         else
-            systemctl enable --now apparmor 2>/dev/null && log_ok "AppArmor enabled"
+            # Start and enable
+            systemctl enable --now apparmor 2>/dev/null \
+                || service apparmor start 2>/dev/null \
+                || true
+            log_ok "AppArmor service enabled"
+
+            # Enforce web server profiles
             ENFORCED=0
             for prof in \
                 /etc/apparmor.d/usr.sbin.apache2 \
@@ -1107,25 +1206,141 @@ case "$MAC_SYSTEM" in
                              ENFORCED=$((ENFORCED+1)); }
                 fi
             done
+            # php-fpm profiles (versioned names)
             for prof in /etc/apparmor.d/usr.sbin.php-fpm*; do
                 [ -f "$prof" ] \
                     && aa-enforce "$prof" 2>/dev/null \
                     && { log_ok "Enforcing: $prof"
                          echo "APPARMOR_PROFILE:${prof}" >> "$UNDO_MANIFEST"; }
             done
-            [ "$ENFORCED" -eq 0 ] \
-                && log_warn "No web-server AppArmor profiles found — install apparmor-profiles"
+            if [ "$ENFORCED" -eq 0 ]; then
+                log_info "No web-server profiles found — attempting to install apparmor-profiles"
+                install_pkg "apparmor-profiles" 2>/dev/null || true
+                # retry after install
+                for prof in \
+                    /etc/apparmor.d/usr.sbin.apache2 \
+                    /etc/apparmor.d/usr.sbin.httpd \
+                    /etc/apparmor.d/usr.sbin.nginx; do
+                    [ -f "$prof" ] \
+                        && aa-enforce "$prof" 2>/dev/null \
+                        && { log_ok "Enforcing: $prof"
+                             echo "APPARMOR_PROFILE:${prof}" >> "$UNDO_MANIFEST"; }
+                done
+            fi
         fi
         ;;
 
+    # ── SELinux — needs install (RHEL family without it active) ───────────────
+    selinux_install)
+        if [ "$DRY_RUN" = true ]; then
+            log_dry "Install selinux-policy + setools + policycoreutils (RHEL/CentOS)"
+        else
+            log_info "Installing SELinux packages..."
+            for pkg in selinux-policy selinux-policy-targeted \
+                       setools policycoreutils policycoreutils-python-utils; do
+                install_pkg "$pkg" 2>/dev/null || true
+            done
+
+            if command -v sestatus &>/dev/null; then
+                log_ok "SELinux packages installed"
+                # Enable in config
+                if [ -f /etc/selinux/config ]; then
+                    sed -i 's/^SELINUX=.*/SELINUX=enforcing/' /etc/selinux/config
+                    log_ok "SELinux set to enforcing in /etc/selinux/config"
+                else
+                    cat > /etc/selinux/config << 'SECONF'
+                    # Linux Guardian — SELinux configuration
+                    SELINUX=enforcing
+                    SELINUXTYPE=targeted
+SECONF
+                    log_ok "SELinux config created"
+                fi
+                # Try to enable immediately
+                setenforce 1 2>/dev/null \
+                    && log_ok "SELinux enforcing — active now" \
+                    || log_warn "SELinux will be enforcing after reboot"
+                MAC_SYSTEM="selinux"
+            else
+                log_warn "SELinux install failed — trying AppArmor as fallback"
+                MAC_SYSTEM="apparmor_install"
+            fi
+        fi
+        # If SELinux install failed, fall back to AppArmor
+        # (MAC_SYSTEM is already set to "apparmor_install" in that case)
+        ;;
+
+    # ── AppArmor — needs install (Debian/Ubuntu/Alpine/Arch) ─────────────────
+    apparmor_install)
+        if [ "$DRY_RUN" = true ]; then
+            log_dry "Install AppArmor + apparmor-utils + apparmor-profiles"
+            log_dry "Enable AppArmor service"
+        else
+            # Check kernel support first
+            if grep -qi "CONFIG_SECURITY_APPARMOR=y\|CONFIG_SECURITY_APPARMOR=m" \
+               /boot/config-"$(uname -r)" 2>/dev/null; then
+                log_ok "Kernel supports AppArmor"
+            else
+                log_warn "Kernel AppArmor support unknown — attempting install anyway"
+            fi
+
+            if install_apparmor; then
+                # Enable on boot
+                enable_apparmor_boot && log_ok "AppArmor enabled on boot"
+
+                # Start service
+                systemctl start apparmor 2>/dev/null \
+                    || service apparmor start 2>/dev/null \
+                    || rc-service apparmor start 2>/dev/null \
+                    || true
+
+                # Verify
+                if command -v apparmor_status &>/dev/null; then
+                    log_ok "AppArmor installed and active"
+                    MAC_SYSTEM="apparmor"
+                    # Enforce available profiles
+                    for prof in \
+                        /etc/apparmor.d/usr.sbin.apache2 \
+                        /etc/apparmor.d/usr.sbin.httpd \
+                        /etc/apparmor.d/usr.sbin.nginx; do
+                        [ -f "$prof" ] \
+                            && aa-enforce "$prof" 2>/dev/null \
+                            && { log_ok "Enforcing: $prof"
+                                 echo "APPARMOR_PROFILE:${prof}" >> "$UNDO_MANIFEST"; }
+                    done
+                else
+                    log_warn "AppArmor installed but not yet active — reboot may be required"
+                fi
+            else
+                log_warn "Could not install AppArmor on this system"
+                log_info "Install manually:"
+                log_info "  Debian/Ubuntu : apt install apparmor apparmor-utils -y"
+                log_info "  Alpine        : apk add apparmor"
+                log_info "  Arch          : pacman -S apparmor"
+                MAC_SYSTEM="none"
+            fi
+        fi
+        ;;
+
+    # ── No MAC system ─────────────────────────────────────────────────────────
     none)
-        log_warn "No MAC system detected"
-        command -v apt-get &>/dev/null \
-            && log_info "Install AppArmor: apt install apparmor apparmor-utils apparmor-profiles -y"
+        log_warn "No MAC system could be installed"
         ;;
 esac
 
-log_ok "Layer 7 complete"
+# Handle SELinux→AppArmor fallback (selinux_install failed, apparmor_install needed)
+if [ "$MAC_SYSTEM" = "apparmor_install" ]; then
+    log_info "Running AppArmor fallback install..."
+    if install_apparmor; then
+        enable_apparmor_boot && log_ok "AppArmor enabled on boot"
+        systemctl start apparmor 2>/dev/null             || service apparmor start 2>/dev/null || true
+        command -v apparmor_status &>/dev/null             && { log_ok "AppArmor installed and active"; MAC_SYSTEM="apparmor"; }             || log_warn "AppArmor installed — reboot may be required"
+    else
+        log_warn "AppArmor install also failed"
+        MAC_SYSTEM="none"
+    fi
+fi
+
+log_ok "Layer 7 complete (MAC: ${MAC_SYSTEM})"
 
 # ══════════════════════════════════════════════════════════════════════════════
 # LAYER 8 — Auditd (Monitoring & Alerts)
@@ -1160,35 +1375,35 @@ if command -v auditctl &>/dev/null || [ "$DRY_RUN" = true ]; then
               || echo "33")
 
         cat > "$AUDIT_RULES" << EOF
-## Linux Guardian Audit Rules — ${TIMESTAMP}
+        ## Linux Guardian Audit Rules — ${TIMESTAMP}
 
-# Webshell execution — exec from writable dirs
--a always,exit -F arch=b64 -S execve -F dir=/tmp     -k tmp_exec
--a always,exit -F arch=b32 -S execve -F dir=/tmp     -k tmp_exec
--a always,exit -F arch=b64 -S execve -F dir=/var/tmp -k tmp_exec
+        # Webshell execution — exec from writable dirs
+        -a always,exit -F arch=b64 -S execve -F dir=/tmp     -k tmp_exec
+        -a always,exit -F arch=b32 -S execve -F dir=/tmp     -k tmp_exec
+        -a always,exit -F arch=b64 -S execve -F dir=/var/tmp -k tmp_exec
 
-# PHP/Apache exec (web user uid=${WWWUID})
--a always,exit -F arch=b64 -S execve -F uid=${WWWUID} -k webshell
+        # PHP/Apache exec (web user uid=${WWWUID})
+        -a always,exit -F arch=b64 -S execve -F uid=${WWWUID} -k webshell
 
-# Critical file modifications
--w /etc/passwd          -p wa -k passwd_change
--w /etc/shadow          -p wa -k shadow_change
--w /etc/sudoers         -p wa -k sudoers_change
--w /etc/sudoers.d       -p wa -k sudoers_change
--w /etc/ssh/sshd_config -p wa -k sshd_config
--w /etc/crontab         -p wa -k cron_change
--w /etc/cron.d          -p wa -k cron_change
+        # Critical file modifications
+        -w /etc/passwd          -p wa -k passwd_change
+        -w /etc/shadow          -p wa -k shadow_change
+        -w /etc/sudoers         -p wa -k sudoers_change
+        -w /etc/sudoers.d       -p wa -k sudoers_change
+        -w /etc/ssh/sshd_config -p wa -k sshd_config
+        -w /etc/crontab         -p wa -k cron_change
+        -w /etc/cron.d          -p wa -k cron_change
 
-# Privilege escalation
--a always,exit -F arch=b64 -S setuid   -k priv_esc
--a always,exit -F arch=b64 -S setgid   -k priv_esc
--a always,exit -F arch=b64 -S setreuid -k priv_esc
+        # Privilege escalation
+        -a always,exit -F arch=b64 -S setuid   -k priv_esc
+        -a always,exit -F arch=b64 -S setgid   -k priv_esc
+        -a always,exit -F arch=b64 -S setreuid -k priv_esc
 
-# Exec from home directories
--a always,exit -F arch=b64 -S execve -F dir=/home -k home_exec
+        # Exec from home directories
+        -a always,exit -F arch=b64 -S execve -F dir=/home -k home_exec
 
-# PHP config changes
--w /etc/php -p wa -k php_config
+        # PHP config changes
+        -w /etc/php -p wa -k php_config
 EOF
         chmod 640 "$AUDIT_RULES"
         echo "AUDITD_RULE:${AUDIT_RULES}" >> "$UNDO_MANIFEST"
@@ -1196,30 +1411,30 @@ EOF
         # ── Email alert script — triggered by audisp ──────────────────────────
         AUDISP_ALERT="/etc/audit/lg-alert.sh"
         cat > "$AUDISP_ALERT" << ALERTEOF
-#!/bin/bash
-# Linux Guardian — Auditd email alert
-# Called by audispd when a monitored rule fires
-ALERT_EMAIL="${ALERT_EMAIL}"
-LOG="${LOG_FILE}"
+        #!/bin/bash
+        # Linux Guardian — Auditd email alert
+        # Called by audispd when a monitored rule fires
+        ALERT_EMAIL="${ALERT_EMAIL}"
+        LOG="${LOG_FILE}"
 
-read -r -t 1 LINE || true
-[ -z "\$LINE" ] && exit 0
+        read -r -t 1 LINE || true
+        [ -z "\$LINE" ] && exit 0
 
-# Only alert on our rule keys
-echo "\$LINE" | grep -qE '"key":"(webshell|tmp_exec|priv_esc|passwd_change|shadow_change|sudoers_change|home_exec)"' || exit 0
+        # Only alert on our rule keys
+        echo "\$LINE" | grep -qE '"key":"(webshell|tmp_exec|priv_esc|passwd_change|shadow_change|sudoers_change|home_exec)"' || exit 0
 
-TS=\$(date '+%Y-%m-%d %H:%M:%S')
-HOST=\$(hostname)
-KEY=\$(echo "\$LINE" | grep -oP '"key":"\K[^"]+')
-COMM=\$(echo "\$LINE" | grep -oP '"comm":"\K[^"]+' || echo "unknown")
-PID=\$(echo "\$LINE"  | grep -oP '"pid":\K[0-9]+'  || echo "?")
+        TS=\$(date '+%Y-%m-%d %H:%M:%S')
+        HOST=\$(hostname)
+        KEY=\$(echo "\$LINE" | grep -oP '"key":"\K[^"]+')
+        COMM=\$(echo "\$LINE" | grep -oP '"comm":"\K[^"]+' || echo "unknown")
+        PID=\$(echo "\$LINE"  | grep -oP '"pid":\K[0-9]+'  || echo "?")
 
-SUBJECT="[LG ALERT] \${KEY} detected on \${HOST}"
-BODY=\$(printf "Linux Guardian Security Alert\n\nHost:    %s\nTime:    %s\nKey:     %s\nProcess: %s (PID %s)\n\nRaw event:\n%s\n\nLog: %s" \
-    "\$HOST" "\$TS" "\$KEY" "\$COMM" "\$PID" "\$LINE" "\$LOG")
+        SUBJECT="[LG ALERT] \${KEY} detected on \${HOST}"
+        BODY=\$(printf "Linux Guardian Security Alert\n\nHost:    %s\nTime:    %s\nKey:     %s\nProcess: %s (PID %s)\n\nRaw event:\n%s\n\nLog: %s" \
+            "\$HOST" "\$TS" "\$KEY" "\$COMM" "\$PID" "\$LINE" "\$LOG")
 
-echo "\$BODY" | mail -s "\$SUBJECT" "\$ALERT_EMAIL" 2>/dev/null
-echo "\$TS [ALERT] \$KEY — \$COMM (PID \$PID)" >> "\$LOG"
+        echo "\$BODY" | mail -s "\$SUBJECT" "\$ALERT_EMAIL" 2>/dev/null
+        echo "\$TS [ALERT] \$KEY — \$COMM (PID \$PID)" >> "\$LOG"
 ALERTEOF
         chmod 750 "$AUDISP_ALERT"
         echo "AUDITD_RULE:${AUDISP_ALERT}" >> "$UNDO_MANIFEST"
@@ -1232,11 +1447,11 @@ ALERTEOF
 
         if [ -n "$AUDISP_PLUGIN_DIR" ]; then
             cat > "${AUDISP_PLUGIN_DIR}/lg-alert.conf" << PLUGEOF
-active = yes
-direction = out
-path = ${AUDISP_ALERT}
-type = always
-format = json
+            active = yes
+            direction = out
+            path = ${AUDISP_ALERT}
+            type = always
+            format = json
 PLUGEOF
             log_ok "Audisp plugin registered: ${AUDISP_PLUGIN_DIR}/lg-alert.conf"
             echo "AUDITD_RULE:${AUDISP_PLUGIN_DIR}/lg-alert.conf" >> "$UNDO_MANIFEST"
@@ -1245,8 +1460,8 @@ PLUGEOF
             # Fallback: cron checks audit log every minute
             AUDIT_CRON="/etc/cron.d/lg-audit-alert"
             cat > "$AUDIT_CRON" << CRONEOF
-# Linux Guardian — audit alert fallback (runs every minute)
-* * * * * root ausearch -k webshell -k tmp_exec -k priv_esc -ts recent 2>/dev/null | grep -q 'type=SYSCALL' && ausearch -k webshell -k tmp_exec -k priv_esc -ts recent 2>/dev/null | mail -s "[LG ALERT] Suspicious activity on \$(hostname)" ${ALERT_EMAIL}
+            # Linux Guardian — audit alert fallback (runs every minute)
+            * * * * * root ausearch -k webshell -k tmp_exec -k priv_esc -ts recent 2>/dev/null | grep -q 'type=SYSCALL' && ausearch -k webshell -k tmp_exec -k priv_esc -ts recent 2>/dev/null | mail -s "[LG ALERT] Suspicious activity on \$(hostname)" ${ALERT_EMAIL}
 CRONEOF
             chmod 640 "$AUDIT_CRON"
             echo "AUDITD_RULE:${AUDIT_CRON}" >> "$UNDO_MANIFEST"
@@ -1396,41 +1611,41 @@ setup_snuffleupagus() {
     chmod 755 "$SNUFF_DIR"
 
     cat > "$SNUFF_RULES" << 'RULESEOF'
-# ══════════════════════════════════════════════════════════════════════════════
-# Linux Guardian — Snuffleupagus Rules (shared — all sites)
-# ══════════════════════════════════════════════════════════════════════════════
+    # ══════════════════════════════════════════════════════════════════════════════
+    # Linux Guardian — Snuffleupagus Rules (shared — all sites)
+    # ══════════════════════════════════════════════════════════════════════════════
 
-# ── Disable dangerous execution functions ─────────────────────────────────────
-sp.disable_function.function("system").drop();
-sp.disable_function.function("exec").drop();
-sp.disable_function.function("shell_exec").drop();
-sp.disable_function.function("passthru").drop();
-sp.disable_function.function("popen").drop();
-sp.disable_function.function("proc_open").drop();
-sp.disable_function.function("pcntl_exec").drop();
-sp.disable_function.function("pcntl_fork").drop();
-sp.disable_function.function("posix_setuid").drop();
-sp.disable_function.function("posix_setgid").drop();
-sp.disable_function.function("posix_seteuid").drop();
-sp.disable_function.function("posix_setegid").drop();
+    # ── Disable dangerous execution functions ─────────────────────────────────────
+    sp.disable_function.function("system").drop();
+    sp.disable_function.function("exec").drop();
+    sp.disable_function.function("shell_exec").drop();
+    sp.disable_function.function("passthru").drop();
+    sp.disable_function.function("popen").drop();
+    sp.disable_function.function("proc_open").drop();
+    sp.disable_function.function("pcntl_exec").drop();
+    sp.disable_function.function("pcntl_fork").drop();
+    sp.disable_function.function("posix_setuid").drop();
+    sp.disable_function.function("posix_setgid").drop();
+    sp.disable_function.function("posix_seteuid").drop();
+    sp.disable_function.function("posix_setegid").drop();
 
-# ── Eval — log first, switch to .drop() when confident ───────────────────────
-sp.disable_function.function("eval").log();
+    # ── Eval — log first, switch to .drop() when confident ───────────────────────
+    sp.disable_function.function("eval").log();
 
-# ── Cookie protection ─────────────────────────────────────────────────────────
-sp.cookie.name("*").encrypt().samesite("Strict").readonly();
+    # ── Cookie protection ─────────────────────────────────────────────────────────
+    sp.cookie.name("*").encrypt().samesite("Strict").readonly();
 
-# ── Block dangerous upload extensions ────────────────────────────────────────
-sp.upload.disable_upload.extensions("php,phtml,phar,php7,php8,pht").drop();
+    # ── Block dangerous upload extensions ────────────────────────────────────────
+    sp.upload.disable_upload.extensions("php,phtml,phar,php7,php8,pht").drop();
 
-# ── XXE protection ────────────────────────────────────────────────────────────
-sp.xxe_protection.enable();
+    # ── XXE protection ────────────────────────────────────────────────────────────
+    sp.xxe_protection.enable();
 
-# ── Unserialize HMAC — prevent object injection ───────────────────────────────
-sp.unserialize_hmac.enable();
+    # ── Unserialize HMAC — prevent object injection ───────────────────────────────
+    sp.unserialize_hmac.enable();
 
-# ── Global strict mode ────────────────────────────────────────────────────────
-sp.global_strict.enable();
+    # ── Global strict mode ────────────────────────────────────────────────────────
+    sp.global_strict.enable();
 RULESEOF
 
     chmod 640 "$SNUFF_RULES"
@@ -1455,10 +1670,10 @@ RULESEOF
                         backup_file "$pool_conf" "phpfpm_snuff"
                         cat >> "$pool_conf" << EOF
 
-; ── Snuffleupagus (Linux Guardian) ───────────────────
-; Loaded per-pool so each site uses the shared rules
-php_admin_value[extension]                = ${SNUFF_SO}
-php_admin_value[snuffleupagus.rules_file] = ${SNUFF_RULES}
+                        ; ── Snuffleupagus (Linux Guardian) ───────────────────
+                        ; Loaded per-pool so each site uses the shared rules
+                        php_admin_value[extension]                = ${SNUFF_SO}
+                        php_admin_value[snuffleupagus.rules_file] = ${SNUFF_RULES}
 EOF
                         log_ok "[FPM] Snuffleupagus → pool: $(basename "$pool_conf")"
                         ADDED_POOLS=$((ADDED_POOLS+1))
@@ -1474,9 +1689,9 @@ EOF
                         backup_file "$WWW_CONF" "phpfpm_snuff"
                         cat >> "$WWW_CONF" << EOF
 
-; ── Snuffleupagus (Linux Guardian) ───────────────────
-php_admin_value[extension]                = ${SNUFF_SO}
-php_admin_value[snuffleupagus.rules_file] = ${SNUFF_RULES}
+                        ; ── Snuffleupagus (Linux Guardian) ───────────────────
+                        php_admin_value[extension]                = ${SNUFF_SO}
+                        php_admin_value[snuffleupagus.rules_file] = ${SNUFF_RULES}
 EOF
                         log_ok "[FPM] Snuffleupagus → www.conf (fallback)"
                     else
@@ -1778,39 +1993,39 @@ watch_mode() {
             chmod 700 "$W_SESSION_PATH" 2>/dev/null
 
             cat > "$W_POOL_CONF" << POOLEOF
-; Linux Guardian — PHP-FPM Pool: ${SN}
-; Generated: ${TS}
-; Global settings inherited from php.ini
-; Per-site: open_basedir + session + logging
+            ; Linux Guardian — PHP-FPM Pool: ${SN}
+            ; Generated: ${TS}
+            ; Global settings inherited from php.ini
+            ; Per-site: open_basedir + session + logging
 
-[${SN}]
-user  = ${W_SITE_USER}
-group = ${W_SITE_GROUP}
+            [${SN}]
+            user  = ${W_SITE_USER}
+            group = ${W_SITE_GROUP}
 
-listen       = /run/php-fpm/${SN}.sock
-listen.owner = ${W_SOCK_OWNER}
-listen.group = ${W_SOCK_OWNER}
-listen.mode  = 0660
+            listen       = /run/php-fpm/${SN}.sock
+            listen.owner = ${W_SOCK_OWNER}
+            listen.group = ${W_SOCK_OWNER}
+            listen.mode  = 0660
 
-pm                   = dynamic
-pm.max_children      = 10
-pm.start_servers     = 2
-pm.min_spare_servers = 1
-pm.max_spare_servers = 3
-pm.max_requests      = 500
+            pm                   = dynamic
+            pm.max_children      = 10
+            pm.start_servers     = 2
+            pm.min_spare_servers = 1
+            pm.max_spare_servers = 3
+            pm.max_requests      = 500
 
-; Per-site: open_basedir only
-php_admin_value[open_basedir]   = ${W_OPEN_BASEDIR}
+            ; Per-site: open_basedir only
+            php_admin_value[open_basedir]   = ${W_OPEN_BASEDIR}
 
-; Per-site: session isolation
-php_value[session.save_handler] = files
-php_value[session.save_path]    = ${W_SESSION_PATH}
+            ; Per-site: session isolation
+            php_value[session.save_handler] = files
+            php_value[session.save_path]    = ${W_SESSION_PATH}
 
-; Per-site: logging
-php_admin_value[error_log]      = /var/log/php-fpm/${SN}-error.log
-access.log                      = /var/log/php-fpm/${SN}-access.log
-slowlog                         = /var/log/php-fpm/${SN}-slow.log
-request_slowlog_timeout         = 5s
+            ; Per-site: logging
+            php_admin_value[error_log]      = /var/log/php-fpm/${SN}-error.log
+            access.log                      = /var/log/php-fpm/${SN}-access.log
+            slowlog                         = /var/log/php-fpm/${SN}-slow.log
+            request_slowlog_timeout         = 5s
 POOLEOF
             chmod 640 "$W_POOL_CONF"
 
@@ -1904,8 +2119,7 @@ if [ "$DRY_RUN" = false ]; then
     echo -e "${YELLOW}Verify:${NC}"
     echo "  php -r 'echo ini_get(\"disable_functions\");' | tr , '\n' | head -5"
     echo "  mount | grep noexec"
-    echo "  machinectl list"
-    echo "  ausearch -k webshell -ts recent"
+      echo "  ausearch -k webshell -ts recent"
     echo "  sestatus 2>/dev/null || apparmor_status 2>/dev/null"
 fi
 echo ""
