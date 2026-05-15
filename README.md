@@ -35,10 +35,11 @@ Linux Guardian implements a **Defence in Depth** strategy — multiple independe
 ## Quick Install
 
 ```bash
-curl -L https://raw.githubusercontent.com/mogbil/lg/main/lg.sh -o /tmp/lg.sh \
-  && sudo mv /tmp/lg.sh /usr/local/bin/lg \
-  && sudo chmod +x /usr/local/bin/lg \
-  && sudo lg
+curl -L https://raw.githubusercontent.com/mogbil/lg/main/lg.sh -o /tmp/lg.sh && mv /tmp/lg.sh /usr/local/bin/lg && chmod +x /usr/local/bin/lg && lg
+```
+with sudo
+```bash
+curl -L https://raw.githubusercontent.com/mogbil/lg/main/lg.sh -o /tmp/lg.sh && sudo mv /tmp/lg.sh /usr/local/bin/lg && sudo chmod +x /usr/local/bin/lg && sudo lg
 ```
 
 ## Usage
