@@ -219,18 +219,23 @@ restart_php_services() {
             for svc in php-fpm php8.2-fpm php8.1-fpm php8.0-fpm php7.4-fpm; do
                 systemctl is-active --quiet "$svc" 2>/dev/null \
                     && systemctl restart "$svc" 2>/dev/null \
-                    && { log_ok "Restarted: $svc"; return; }
+                    && { log_ok "Restarted: $svc"; return 0; }
             done
             log_warn "No active php-fpm service — restart manually"
             ;;
         cgi|mod_php)
+            local _restarted=0
             for svc in apache2 httpd nginx; do
-                systemctl is-active --quiet "$svc" 2>/dev/null \
-                    && systemctl restart "$svc" 2>/dev/null \
-                    && log_ok "Restarted: $svc"
+                if systemctl is-active --quiet "$svc" 2>/dev/null; then
+                    systemctl restart "$svc" 2>/dev/null \
+                        && { log_ok "Restarted: $svc"; _restarted=$((_restarted+1)); } \
+                        || log_warn "Failed to restart: $svc"
+                fi
             done
+            [ "$_restarted" -eq 0 ] && log_warn "No active web service found to restart"
             ;;
     esac
+    return 0
 }
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -977,7 +982,7 @@ EOF
     fi
 }
 
-setup_phpfpm_pools
+setup_phpfpm_pools || log_warn "Part 5.1: PHP-FPM pool setup encountered an issue — check log for details"
 
 log_ok "Part 5.1 complete"
 
@@ -1754,15 +1759,40 @@ setup_snuffleupagus() {
     fi
 
     # ── Locate snuffleupagus.so ───────────────────────────────────────────────
-    SNUFF_SO=$(find /usr/lib/php /usr/local/lib/php \
-        -name "snuffleupagus.so" 2>/dev/null | head -1)
-    [ -z "$SNUFF_SO" ] && \
-        SNUFF_SO="$(php -r "echo ini_get('extension_dir');" 2>/dev/null)/snuffleupagus.so"
+    SNUFF_SO=""
 
-    if [ ! -f "$SNUFF_SO" ]; then
-        log_warn "snuffleupagus.so not found at: $SNUFF_SO"
+    # Search common PHP extension directories
+    for _snuff_dir in \
+        /usr/lib/php /usr/local/lib/php \
+        /usr/lib64/php /usr/local/lib64/php \
+        /usr/lib/php7 /usr/lib/php8 \
+        /usr/local/cwp/php71/lib/php \
+        /usr/local/php/lib/php; do
+        [ -d "$_snuff_dir" ] || continue
+        _found=$(find "$_snuff_dir" -name "snuffleupagus.so" 2>/dev/null | head -1)
+        if [ -n "$_found" ]; then
+            SNUFF_SO="$_found"
+            break
+        fi
+    done
+
+    # Fallback: use PHP's own extension_dir
+    if [ -z "$SNUFF_SO" ]; then
+        _ext_dir=$(php -r "echo ini_get('extension_dir');" 2>/dev/null || true)
+        [ -n "$_ext_dir" ] && [ -f "${_ext_dir}/snuffleupagus.so" ] \
+            && SNUFF_SO="${_ext_dir}/snuffleupagus.so"
+    fi
+
+    # Last resort: full filesystem search
+    if [ -z "$SNUFF_SO" ]; then
+        log_info "Searching filesystem for snuffleupagus.so..."
+        SNUFF_SO=$(find_conf_deep "snuffleupagus.so") || true
+    fi
+
+    if [ -z "$SNUFF_SO" ] || [ ! -f "$SNUFF_SO" ]; then
+        log_warn "snuffleupagus.so not found — skipping Part B configuration"
         log_info "Try: find / -name snuffleupagus.so 2>/dev/null"
-        return 1
+        return 0
     fi
     log_ok "snuffleupagus.so: $SNUFF_SO"
 
@@ -1940,7 +1970,7 @@ EOF
     log_info "Edit rules: $SNUFF_RULES"
 }
 
-setup_snuffleupagus
+setup_snuffleupagus || log_warn "Part B: Snuffleupagus setup encountered an issue — check log for details"
 
 log_ok "Part B complete"
 
@@ -2288,7 +2318,7 @@ echo ""
 if [ "$DRY_RUN" = false ]; then
     echo -e "${BOLD}${YELLOW}"
     echo "════════════════════════════════════════════════════════════════════"
-    echo "  SERVER WILL REBOOT IN 10 SECONDS TO APPLY SELinux RELABEL"
+    echo "  ⚠  SERVER WILL REBOOT IN 10 SECONDS TO APPLY SELinux RELABEL"
     echo "  Press Ctrl+C to cancel"
     echo "════════════════════════════════════════════════════════════════════"
     echo -e "${NC}"
