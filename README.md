@@ -34,8 +34,8 @@ Linux Guardian auto-detects and fully supports all major control panels:
 | Panel | PHP Hardening | SELinux Contexts | Service Restart |
 |-------|--------------|-----------------|----------------|
 | **CWP** (CentOS Web Panel) | ✅ `/usr/local/cwp/` | ✅ | ✅ cwpsrv |
-| **cPanel / WHM** | ✅ `/opt/cpanel/` | ✅ | — |
-| **Plesk** | ✅ `/opt/plesk/` | ✅ | ✅ psa |
+| **cPanel / WHM** | ✅ `/usr/local/lib/php*` + `/opt/cpanel/` | ✅ | — |
+| **Plesk** | ✅ `/opt/plesk/` + `/usr/local/psa/` | ✅ | ✅ psa |
 | **DirectAdmin** | ✅ `/usr/local/php/` | ✅ | — |
 | **CyberPanel** | ✅ `/usr/local/lsws/` | ✅ | ✅ lsws |
 | **HestiaCP** | ✅ `/etc/php/` | ✅ | — |
@@ -210,17 +210,21 @@ If PHP-FPM is not installed, open_basedir falls back to php.ini directly.
 
 Control panels ship multiple PHP versions in non-standard paths that the standard `find` in Layer 5 does not reach. Layer 5.2 handles each panel's specific layout:
 
-| Panel | PHP paths hardened |
+| Panel | PHP paths searched |
 |-------|-------------------|
-| CWP | `/usr/local/cwp/phpXX/etc/php.ini` |
-| cPanel | `/usr/local/lib/phpXX/` + `/opt/cpanel/eaXXX/` |
-| Plesk | `/opt/plesk/php/XX/etc/` + `/usr/local/psa/` |
-| DirectAdmin | `/usr/local/php/XX/lib/` |
-| CyberPanel | `/usr/local/lsws/lsphpXX/etc/` |
-| HestiaCP / VestaCP | `/etc/php/XX/fpm/` |
-| aaPanel | `/www/server/php/XX/etc/` |
-| InterWorx | `/usr/local/interworx/php/XX/lib/` |
-| CentminMod | `/usr/local/lib/phpXX/` |
+| CWP | `/usr/local/cwp/**` |
+| cPanel | `/usr/local/lib/php*/**` + `/opt/cpanel/**` |
+| Plesk | `/opt/plesk/**` + `/usr/local/psa/**` |
+| DirectAdmin | `/usr/local/php/**` |
+| CyberPanel | `/usr/local/lsws/**` |
+| HestiaCP / VestaCP | `/etc/php/**` |
+| ISPConfig | `/etc/php/**` |
+| aaPanel | `/www/server/php/**` |
+| Webmin / Virtualmin | `/etc/php/**` |
+| InterWorx | `/usr/local/interworx/**` |
+| Froxlor | `/etc/php/**` |
+| RunCloud | `/etc/php/**` |
+| CentminMod | `/usr/local/lib/php*/**` |
 
 After hardening, the panel's web service is restarted automatically (cwpsrv, psa, lsws).
 

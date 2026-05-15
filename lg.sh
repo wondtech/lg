@@ -1700,85 +1700,121 @@ case "$MAC_SYSTEM" in
             fi
 
             # ── Fix SELinux contexts for all detected panels ───────────────────
+            # IMPORTANT: never apply a single type to the entire panel path —
+            # bin/sbin need httpd_exec_t, conf needs httpd_config_t,
+            # run needs var_run_t, log needs var_log_t.
+            # Using httpd_sys_content_t on everything breaks panel binaries.
             if [ "$DRY_RUN" = false ] && [ "$_PANEL" != "none" ]; then
                 log_info "Fixing SELinux contexts for panel: ${_PANEL}"
 
-                # Panel-specific paths
+                # Helper: register + apply one fcontext entry
+                _sel_fix() {
+                    local _type="$1" _path="$2"
+                    [ -e "$_path" ] || return 0
+                    command -v semanage &>/dev/null && {
+                        semanage fcontext -a -t "$_type" "${_path}(/.*)?" 2>/dev/null \
+                        || semanage fcontext -m -t "$_type" "${_path}(/.*)?" 2>/dev/null \
+                        || true
+                    }
+                    restorecon -RF "$_path" 2>/dev/null || true
+                    log_ok "SELinux: ${_path} → ${_type}"
+                }
+
                 case "$_PANEL" in
                     cwp)
-                        _SEL_PATHS=("/usr/local/cwpsrv" "/usr/local/cwp")
-                        _SEL_TYPE="httpd_sys_content_t"
+                        # cwpsrv — granular contexts per subdirectory
+                        _sel_fix httpd_exec_t       /usr/local/cwpsrv/bin
+                        _sel_fix var_run_t          /usr/local/cwpsrv/var/run
+                        _sel_fix var_log_t          /usr/local/cwpsrv/var/log
+                        _sel_fix httpd_config_t     /usr/local/cwpsrv/conf
+                        _sel_fix httpd_sys_content_t /usr/local/cwpsrv/htdocs
+                        _sel_fix httpd_sys_content_t /usr/local/cwpsrv/var/services
+                        # CWP PHP versions — bin/sbin must be httpd_exec_t
+                        for _phpver in /usr/local/cwp/php*/; do
+                            [ -d "$_phpver" ] || continue
+                            _sel_fix httpd_exec_t    "${_phpver}bin"
+                            _sel_fix httpd_exec_t    "${_phpver}sbin"
+                            _sel_fix httpd_config_t  "${_phpver}etc"
+                            _sel_fix var_log_t       "${_phpver}var/log"
+                            _sel_fix var_run_t       "${_phpver}var/run"
+                            _sel_fix httpd_sys_content_t "${_phpver}var/sockets"
+                            _sel_fix httpd_sys_content_t "${_phpver}lib"
+                            _sel_fix httpd_sys_content_t "${_phpver}share"
+                        done
                         systemctl restart cwpsrv 2>/dev/null \
-                            && log_ok "cwpsrv restarted (SELinux context update)" || true
+                            && log_ok "cwpsrv restarted" || true
                         ;;
                     cpanel)
-                        _SEL_PATHS=("/usr/local/cpanel" "/var/cpanel" "/home")
-                        _SEL_TYPE="httpd_sys_content_t"
+                        _sel_fix httpd_sys_content_t /usr/local/cpanel
+                        _sel_fix httpd_sys_content_t /var/cpanel
                         ;;
                     plesk)
-                        _SEL_PATHS=("/usr/local/psa" "/opt/psa" "/opt/plesk" "/var/www/vhosts")
-                        _SEL_TYPE="httpd_sys_content_t"
+                        for _phpver in /opt/plesk/php/*/; do
+                            [ -d "$_phpver" ] || continue
+                            _sel_fix httpd_exec_t   "${_phpver}bin"
+                            _sel_fix httpd_exec_t   "${_phpver}sbin"
+                            _sel_fix httpd_config_t "${_phpver}etc"
+                        done
+                        _sel_fix httpd_sys_content_t /usr/local/psa
                         systemctl restart psa 2>/dev/null || true
                         ;;
                     directadmin)
-                        _SEL_PATHS=("/usr/local/directadmin" "/home")
-                        _SEL_TYPE="httpd_sys_content_t"
+                        for _phpver in /usr/local/php/*/; do
+                            [ -d "$_phpver" ] || continue
+                            _sel_fix httpd_exec_t   "${_phpver}bin"
+                            _sel_fix httpd_exec_t   "${_phpver}sbin"
+                            _sel_fix httpd_config_t "${_phpver}etc"
+                        done
+                        _sel_fix httpd_sys_content_t /usr/local/directadmin
                         ;;
                     cyberpanel)
-                        _SEL_PATHS=("/usr/local/CyberPanel" "/usr/local/lsws" "/home")
-                        _SEL_TYPE="httpd_sys_content_t"
+                        for _phpver in /usr/local/lsws/lsphp*/; do
+                            [ -d "$_phpver" ] || continue
+                            _sel_fix httpd_exec_t   "${_phpver}bin"
+                            _sel_fix httpd_exec_t   "${_phpver}sbin"
+                            _sel_fix httpd_config_t "${_phpver}etc"
+                        done
+                        _sel_fix httpd_sys_content_t /usr/local/CyberPanel
                         systemctl restart lsws 2>/dev/null || true
                         ;;
                     hestia|vesta)
-                        _SEL_PATHS=("/usr/local/${_PANEL}" "/home")
-                        _SEL_TYPE="httpd_sys_content_t"
+                        _sel_fix httpd_sys_content_t "/usr/local/${_PANEL}"
                         ;;
                     ispconfig)
-                        _SEL_PATHS=("/usr/local/ispconfig" "/var/www")
-                        _SEL_TYPE="httpd_sys_content_t"
+                        _sel_fix httpd_sys_content_t /usr/local/ispconfig
                         ;;
                     aapanel)
-                        _SEL_PATHS=("/www/server/panel" "/www/server/php" "/www/wwwroot")
-                        _SEL_TYPE="httpd_sys_content_t"
+                        for _phpver in /www/server/php/*/; do
+                            [ -d "$_phpver" ] || continue
+                            _sel_fix httpd_exec_t   "${_phpver}bin"
+                            _sel_fix httpd_exec_t   "${_phpver}sbin"
+                            _sel_fix httpd_config_t "${_phpver}etc"
+                        done
+                        _sel_fix httpd_sys_content_t /www/server/panel
                         ;;
                     webmin)
-                        _SEL_PATHS=("/usr/share/webmin" "/etc/webmin")
-                        _SEL_TYPE="httpd_sys_content_t"
+                        _sel_fix httpd_sys_content_t /usr/share/webmin
+                        _sel_fix httpd_config_t      /etc/webmin
                         ;;
                     interworx)
-                        _SEL_PATHS=("/usr/local/interworx" "/var/www")
-                        _SEL_TYPE="httpd_sys_content_t"
+                        _sel_fix httpd_exec_t        /usr/local/interworx/bin
+                        _sel_fix httpd_exec_t        /usr/local/interworx/sbin
+                        _sel_fix httpd_sys_content_t /usr/local/interworx
                         ;;
                     froxlor)
-                        _SEL_PATHS=("/var/www/froxlor" "/usr/share/froxlor")
-                        _SEL_TYPE="httpd_sys_content_t"
+                        _sel_fix httpd_sys_content_t /var/www/froxlor
+                        _sel_fix httpd_sys_content_t /usr/share/froxlor
                         ;;
                     runcloud)
-                        _SEL_PATHS=("/etc/runcloud" "/var/www")
-                        _SEL_TYPE="httpd_sys_content_t"
+                        _sel_fix httpd_config_t      /etc/runcloud
+                        _sel_fix httpd_sys_content_t /var/www
                         ;;
                     centminmod)
-                        _SEL_PATHS=("/usr/local/nginx" "/home/nginx")
-                        _SEL_TYPE="httpd_sys_content_t"
-                        ;;
-                    *)
-                        _SEL_PATHS=()
-                        _SEL_TYPE="httpd_sys_content_t"
+                        _sel_fix httpd_exec_t        /usr/local/nginx/sbin
+                        _sel_fix httpd_sys_content_t /usr/local/nginx
+                        _sel_fix httpd_sys_content_t /home/nginx
                         ;;
                 esac
-
-                for _sp in "${_SEL_PATHS[@]}"; do
-                    [ -d "$_sp" ] || continue
-                    if command -v semanage &>/dev/null; then
-                        semanage fcontext -a -t "$_SEL_TYPE" \
-                            "${_sp}(/.*)?" 2>/dev/null \
-                            || semanage fcontext -m -t "$_SEL_TYPE" \
-                            "${_sp}(/.*)?" 2>/dev/null \
-                            || true
-                    fi
-                    restorecon -RF "$_sp" 2>/dev/null || true
-                    log_ok "SELinux context fixed: ${_sp} → ${_SEL_TYPE}"
-                done
             fi
 
             # ── Restart Dovecot after all context fixes ───────────────────────
