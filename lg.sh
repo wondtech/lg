@@ -14,7 +14,7 @@
 #   [8] Auditd                — Real-time monitoring and alerting
 #   [A] FTP + ClamAV          — Scan uploaded files for malware
 #   [B] Snuffleupagus         — PHP RASP
-#   [9] Podman Isolation      — Contain each site in an isolated namespace
+
 #
 # Usage:
 #   sudo lg                  Interactive (recommended first run)
@@ -179,6 +179,9 @@ restart_php_services() {
             ;;
     esac
 }
+
+# ══════════════════════════════════════════════════════════════════════════════
+# INITIALISATION
 # ══════════════════════════════════════════════════════════════════════════════
 
 print_banner
@@ -212,7 +215,6 @@ LOG_FILE="/var/log/lg-hardening.log"
 UNDO_MANIFEST="${BACKUP_DIR}/undo_manifest_${TIMESTAMP}.txt"
 MAC_SYSTEM="none"
 SNUFF_INSTALLED=false
-SNUFF_SKIP=false
 PHP_SKIP=false
 PHP_INI_FILES=()
 SELECTED_FILES=()
@@ -312,12 +314,15 @@ if [ "$UNDO_MODE" = true ]; then
                 ;;
             NSPAWN_SERVICE)
                 NSVC=$(echo "$line" | cut -d: -f2)
-                systemctl stop    "$NSVC" 2>/dev/null
-                systemctl disable "$NSVC" 2>/dev/null
+                # Handle container services
+                systemctl stop    "$NSVC" 2>/dev/null || true
+                systemctl disable "$NSVC" 2>/dev/null || true
                 rm -f "/etc/systemd/system/${NSVC}.service"
+                # nspawn cleanup
                 rm -f "/etc/systemd/nspawn/${NSVC##nspawn-}.nspawn"
+
                 systemctl daemon-reload
-                log_ok "Removed nspawn service: $NSVC"
+                log_ok "Removed: $NSVC"
                 ;;
         esac
     done < "$LATEST"
@@ -1318,7 +1323,6 @@ fi
 log_ok "Part A complete"
 
 # ══════════════════════════════════════════════════════════════════════════════
-# ══════════════════════════════════════════════════════════════════════════════
 # PART B — Snuffleupagus (PHP RASP)
 # Auto-detects PHP mode (FPM / CGI / mod_php)
 # One shared rules file for ALL sites
@@ -1435,37 +1439,38 @@ RULESEOF
     # ── Enable in PHP based on detected mode ──────────────────────────────────
     case "$PHP_MODE" in
 
+        # ── PHP-FPM: add to each site pool ───────────────────────────────────
         fpm)
-            # Add to every pool conf that doesn't have it yet
             POOL_DIR=$(find_pool_dir)
             if [ -z "$POOL_DIR" ]; then
                 log_warn "[FPM] Pool directory not found — falling back to php.ini"
-                PHP_MODE="mod_php"  # will fall through to php.ini block below
+                PHP_MODE="mod_php"
             else
                 ADDED_POOLS=0
                 for pool_conf in "${POOL_DIR}"/*.conf; do
                     [ -f "$pool_conf" ] || continue
-                    [[ "$(basename "$pool_conf")" == "www.conf" ]] && continue  # skip default
+                    # Skip default www.conf — we have site-specific pools
+                    [[ "$(basename "$pool_conf")" == "www.conf" ]] && continue
                     if ! grep -q "snuffleupagus" "$pool_conf" 2>/dev/null; then
                         backup_file "$pool_conf" "phpfpm_snuff"
                         cat >> "$pool_conf" << EOF
 
 ; ── Snuffleupagus (Linux Guardian) ───────────────────
+; Loaded per-pool so each site uses the shared rules
 php_admin_value[extension]                = ${SNUFF_SO}
 php_admin_value[snuffleupagus.rules_file] = ${SNUFF_RULES}
 EOF
-                        log_ok "[FPM] Enabled in pool: $(basename "$pool_conf")"
+                        log_ok "[FPM] Snuffleupagus → pool: $(basename "$pool_conf")"
                         ADDED_POOLS=$((ADDED_POOLS+1))
                     else
-                        log_info "[FPM] Already in pool: $(basename "$pool_conf")"
+                        log_info "[FPM] Already enabled: $(basename "$pool_conf")"
                     fi
                 done
 
-                # If no lg pools found — add to www.conf as fallback
+                # No site pools yet — add to www.conf as fallback
                 if [ "$ADDED_POOLS" -eq 0 ]; then
-                    log_info "[FPM] No site pools found — adding to www.conf"
                     WWW_CONF="${POOL_DIR}/www.conf"
-                    if [ -f "$WWW_CONF" ] && ! grep -q "snuffleupagus" "$WWW_CONF"; then
+                    if [ -f "$WWW_CONF" ] && ! grep -q "snuffleupagus" "$WWW_CONF" 2>/dev/null; then
                         backup_file "$WWW_CONF" "phpfpm_snuff"
                         cat >> "$WWW_CONF" << EOF
 
@@ -1473,42 +1478,79 @@ EOF
 php_admin_value[extension]                = ${SNUFF_SO}
 php_admin_value[snuffleupagus.rules_file] = ${SNUFF_RULES}
 EOF
-                        log_ok "[FPM] Enabled in www.conf"
+                        log_ok "[FPM] Snuffleupagus → www.conf (fallback)"
+                    else
+                        log_info "[FPM] No pools found and www.conf already configured"
                     fi
                 fi
             fi
             ;;
+
+        # ── PHP-CGI: add extension to php.ini ────────────────────────────────
+        # php-cgi reads php.ini on every request, so we load the extension
+        # there. The rules_file is the same shared lg.rules.
+        cgi)
+            INI_TARGETS=()
+            for f in "${SELECTED_FILES[@]:-}"; do
+                [ -f "$f" ] && [[ "$f" != *cli* ]] && INI_TARGETS+=("$f")
+            done
+            if [ ${#INI_TARGETS[@]} -eq 0 ]; then
+                while IFS= read -r f; do
+                    [[ "$f" == *cli* ]] && continue
+                    INI_TARGETS+=("$f")
+                done < <(find / -maxdepth 7 -type f -name "php.ini" \
+                    ! -path "*/cli/*" 2>/dev/null | sort -u)
+            fi
+
+            if [ ${#INI_TARGETS[@]} -eq 0 ]; then
+                log_warn "[CGI] No php.ini found — cannot enable Snuffleupagus"
+            fi
+
+            for inifile in "${INI_TARGETS[@]}"; do
+                [ -f "$inifile" ] || continue
+                if grep -q "snuffleupagus" "$inifile" 2>/dev/null; then
+                    log_info "[CGI] Already enabled: $inifile"
+                    continue
+                fi
+                backup_file "$inifile" "phpini_snuff"
+                printf '\n; Snuffleupagus (Linux Guardian)\nextension=%s\nsnuffleupagus.rules_file=%s\n' \
+                    "$SNUFF_SO" "$SNUFF_RULES" >> "$inifile"
+                log_ok "[CGI] Snuffleupagus → $inifile"
+            done
+            ;;
+
+        # ── mod_php: add extension to php.ini ────────────────────────────────
+        mod_php)
+            INI_TARGETS=()
+            for f in "${SELECTED_FILES[@]:-}"; do
+                [ -f "$f" ] && [[ "$f" != *cli* ]] && INI_TARGETS+=("$f")
+            done
+            if [ ${#INI_TARGETS[@]} -eq 0 ]; then
+                while IFS= read -r f; do
+                    [[ "$f" == *cli* ]] && continue
+                    INI_TARGETS+=("$f")
+                done < <(find / -maxdepth 7 -type f -name "php.ini" \
+                    ! -path "*/cli/*" 2>/dev/null | sort -u)
+            fi
+
+            for inifile in "${INI_TARGETS[@]}"; do
+                [ -f "$inifile" ] || continue
+                if grep -q "snuffleupagus" "$inifile" 2>/dev/null; then
+                    log_info "[MOD_PHP] Already enabled: $inifile"
+                    continue
+                fi
+                backup_file "$inifile" "phpini_snuff"
+                printf '\n; Snuffleupagus (Linux Guardian)\nextension=%s\nsnuffleupagus.rules_file=%s\n' \
+                    "$SNUFF_SO" "$SNUFF_RULES" >> "$inifile"
+                log_ok "[MOD_PHP] Snuffleupagus → $inifile"
+            done
+            ;;
     esac
 
-    # mod_php / cgi / fpm fallback → add to php.ini
-    if [[ "$PHP_MODE" == "cgi" || "$PHP_MODE" == "mod_php" ]]; then
-        INI_TARGETS=()
-
-        # Use files selected in LAYER 5 if available
-        for f in "${SELECTED_FILES[@]:-}"; do
-            [ -f "$f" ] && [[ "$f" != *cli* ]] && INI_TARGETS+=("$f")
-        done
-
-        # Fallback: search all php.ini files
-        if [ ${#INI_TARGETS[@]} -eq 0 ]; then
-            while IFS= read -r f; do
-                [[ "$f" == *cli* ]] && continue
-                INI_TARGETS+=("$f")
-            done < <(find / -maxdepth 7 -type f -name "php.ini" \
-                ! -path "*/cli/*" 2>/dev/null | sort -u)
-        fi
-
-        for inifile in "${INI_TARGETS[@]}"; do
-            [ -f "$inifile" ] || continue
-            if grep -q "snuffleupagus" "$inifile" 2>/dev/null; then
-                log_info "[${PHP_MODE^^}] Already in: $inifile"
-                continue
-            fi
-            backup_file "$inifile" "phpini_snuff"
-            printf '\n; Snuffleupagus (Linux Guardian)\nextension=%s\nsnuffleupagus.rules_file=%s\n' \
-                "$SNUFF_SO" "$SNUFF_RULES" >> "$inifile"
-            log_ok "[${PHP_MODE^^}] Enabled in: $inifile"
-        done
+    # FPM fallback (if PHP_MODE was changed from fpm to mod_php above)
+    if [[ "$PHP_MODE" == "mod_php" ]] && \
+       grep -rq "snuffleupagus" "${POOL_DIR:-/nonexistent}" 2>/dev/null; then
+        log_info "FPM fallback already handled above"
     fi
 
     # ── Restart ───────────────────────────────────────────────────────────────
@@ -1524,230 +1566,6 @@ EOF
 setup_snuffleupagus
 
 log_ok "Part B complete"
-
-# ══════════════════════════════════════════════════════════════════════════════
-# LAYER 9 — Container Isolation (Podman)
-# Contain blast radius: attacker who breaches site-A cannot reach site-B
-# ══════════════════════════════════════════════════════════════════════════════
-section "LAYER 9: Container Isolation (Podman)"
-
-setup_podman() {
-
-    # ── Auto-install Podman if missing ────────────────────────────────────────
-    if ! command -v podman &>/dev/null; then
-        log_warn "Podman not found — attempting installation..."
-        if [ "$DRY_RUN" = true ]; then
-            log_dry "Install podman"
-        else
-            if command -v dnf &>/dev/null; then
-                dnf install -y -q podman 2>/dev/null && log_ok "Podman installed (dnf)"
-            elif command -v yum &>/dev/null; then
-                yum install -y -q podman 2>/dev/null && log_ok "Podman installed (yum)"
-            elif command -v apt-get &>/dev/null; then
-                DEBIAN_FRONTEND=noninteractive apt-get install -y -qq podman 2>/dev/null \
-                    && log_ok "Podman installed (apt)"
-            elif command -v apk &>/dev/null; then
-                apk add -q podman 2>/dev/null && log_ok "Podman installed (apk)"
-            else
-                log_warn "No supported package manager — install podman manually"
-                return 1
-            fi
-        fi
-    fi
-
-    if ! command -v podman &>/dev/null && [ "$DRY_RUN" = false ]; then
-        log_warn "Podman still not available — skipping isolation"
-        return 1
-    fi
-
-    log_ok "Podman: $(podman --version 2>/dev/null)"
-
-    # ── resolve_site_path ─────────────────────────────────────────────────────
-    resolve_site_path() {
-        local name="$1"
-        [ -d "/var/www/${name}"            ] && echo "/var/www/${name}"            && return
-        [ -d "/home/${name}/public_html"   ] && echo "/home/${name}/public_html"   && return
-        for conf in \
-            /etc/apache2/sites-enabled/*.conf \
-            /etc/httpd/conf.d/*.conf \
-            /etc/nginx/sites-enabled/* \
-            /etc/nginx/conf.d/*.conf; do
-            [ -f "$conf" ] || continue
-            local docroot
-            docroot=$(grep -hEi '^\s*(DocumentRoot|root)\s+"?([^";\s]+)"?' "$conf" \
-                2>/dev/null | awk '{print $NF}' | tr -d '"' | grep -i "$name" | head -1)
-            [ -d "$docroot" ] && echo "$docroot" && return
-        done
-        echo ""
-    }
-
-    # ── Discover sites ────────────────────────────────────────────────────────
-    SITES=()
-    for d in /var/www/*/; do
-        [ -d "$d" ] && [[ "$d" != "/var/www/html/" ]] && SITES+=("${d%/}")
-    done
-    for d in /home/*/public_html/; do
-        [ -d "$d" ] && SITES+=("${d%/}")
-    done
-    [ ${#SITES[@]} -eq 0 ] && [ -d "/var/www/html" ] && SITES+=("/var/www/html")
-    mapfile -t SITES < <(printf '%s\n' "${SITES[@]}" | sort -u)
-
-    if [ ${#SITES[@]} -eq 0 ]; then
-        log_warn "No sites found"
-        return 1
-    fi
-
-    log_info "Found ${#SITES[@]} site(s):"
-    for s in "${SITES[@]}"; do echo "    → $s"; done
-    echo ""
-
-    if [ "$DRY_RUN" = true ]; then
-        for s in "${SITES[@]}"; do
-            SN=$(echo "$s" | sed 's|/var/www/||;s|/home/||;s|/public_html||' \
-                | tr -cd '[:alnum:]-_' | cut -c1-32)
-            log_dry "Create Podman container: lg-${SN}"
-        done
-        return 0
-    fi
-
-    # ── Stop existing lg containers ───────────────────────────────────────────
-    EXISTING=$(podman ps -a --format '{{.Names}}' 2>/dev/null | grep '^lg-' || true)
-    if [ -n "$EXISTING" ]; then
-        log_info "Stopping existing containers..."
-        while IFS= read -r cname; do
-            podman stop "$cname"   2>/dev/null || true
-            podman rm   "$cname"   2>/dev/null || true
-            log_ok "Removed: $cname"
-        done <<< "$EXISTING"
-    fi
-
-    # ── Detect PHP handler ────────────────────────────────────────────────────
-    PHP_HANDLER=""
-    PHP_BIN=""
-    for b in php-fpm php-cgi php; do
-        bp=$(command -v "$b" 2>/dev/null \
-            || { [ -x "/usr/local/bin/${b}" ] && echo "/usr/local/bin/${b}"; } \
-            || true)
-        bp=$(echo "$bp" | head -1)
-        if [ -n "$bp" ] && [ -x "$bp" ]; then
-            PHP_HANDLER="$b"
-            PHP_BIN="$bp"
-            break
-        fi
-    done
-    log_info "PHP handler: ${PHP_HANDLER:-none} (${PHP_BIN})"
-
-    case "$PHP_HANDLER" in
-        php-fpm) PHP_CMD="php-fpm --nodaemonize" ;;
-        php-cgi) PHP_CMD="php-cgi" ;;
-        php)     PHP_CMD="php" ;;
-        *)       PHP_CMD="" ;;
-    esac
-
-    # ── Create container per site ─────────────────────────────────────────────
-    for site in "${SITES[@]}"; do
-        SN=$(echo "$site" | sed 's|/var/www/||;s|/home/||;s|/public_html||' \
-            | tr -cd '[:alnum:]-_' | cut -c1-32)
-
-        # Resolve actual path
-        RESOLVED=""
-        [ -d "$site" ] && RESOLVED="$site"
-        [ -z "$RESOLVED" ] && RESOLVED=$(resolve_site_path "$SN")
-
-        if [ -z "$RESOLVED" ]; then
-            log_warn "Cannot resolve path for '${SN}' — skipping"
-            continue
-        fi
-
-        # Detect WorkingDirectory
-        if [[ "$RESOLVED" == /home/* ]]; then
-            SITE_USER=$(echo "$RESOLVED" | cut -d/ -f3)
-            WORK_DIR="$RESOLVED"
-        else
-            SITE_USER="www-data"
-            WORK_DIR="/var/www/html"
-        fi
-
-        # Resolve numeric UID for podman
-        SITE_UID=$(id -u "$SITE_USER" 2>/dev/null || echo "33")
-
-        echo "  ── Container: lg-${SN} ──"
-        log_info "Site path:  $RESOLVED"
-        log_info "User:       ${SITE_USER} (UID: ${SITE_UID})"
-
-        # Build podman run command
-        PODMAN_ARGS=(
-            "--detach"
-            "--name=lg-${SN}"
-            "--user=${SITE_UID}"
-            "--read-only"
-            "--tmpfs=/tmp:noexec,nosuid,nodev,size=32m"
-            "--volume=${RESOLVED}:${WORK_DIR}:ro"
-            "--workdir=${WORK_DIR}"
-            "--network=none"
-            "--security-opt=no-new-privileges"
-            "--cap-drop=ALL"
-            "--restart=always"
-            "--memory=256m"
-            "--cpus=0.5"
-        )
-
-        # Add PHP binary as volume if outside standard paths
-        if [ -n "$PHP_BIN" ]; then
-            PODMAN_ARGS+=("--volume=${PHP_BIN}:/${PHP_HANDLER}:ro")
-        fi
-
-        # Use base image with minimal shell
-        PODMAN_IMAGE="busybox:latest"
-
-        # Pull image if not available
-        if ! podman image exists "$PODMAN_IMAGE" 2>/dev/null; then
-            log_info "Pulling base image: $PODMAN_IMAGE"
-            podman pull "$PODMAN_IMAGE" 2>/dev/null \
-                || { log_warn "Could not pull image — skipping ${SN}"; continue; }
-        fi
-
-        # Determine CMD
-        if [ -n "$PHP_CMD" ]; then
-            RUN_CMD="/${PHP_HANDLER} ${PHP_CMD#* }"
-        else
-            RUN_CMD="sh"
-        fi
-
-        # Run container
-        if podman run "${PODMAN_ARGS[@]}" "$PODMAN_IMAGE" $RUN_CMD 2>/dev/null; then
-            log_ok "lg-${SN}  →  running"
-
-            # Create systemd service for auto-restart
-            podman generate systemd \
-                --name "lg-${SN}" \
-                --restart-policy=always \
-                --files \
-                --output-file="/etc/systemd/system/podman-lg-${SN}.service" \
-                2>/dev/null \
-            && systemctl daemon-reload \
-            && systemctl enable "podman-lg-${SN}.service" 2>/dev/null \
-            && log_ok "systemd service: podman-lg-${SN}.service"
-
-            echo "NSPAWN_SERVICE:podman-lg-${SN}" >> "$UNDO_MANIFEST"
-        else
-            log_warn "lg-${SN}  →  failed to start"
-            log_info "Debug: podman logs lg-${SN}"
-        fi
-        echo ""
-    done
-
-    log_info "Manage containers:"
-    echo "    podman ps                    — list running containers"
-    echo "    podman stats                 — resource usage"
-    echo "    podman logs lg-<name>        — container logs"
-    echo "    podman exec -it lg-<name> sh — shell inside container"
-    echo "    podman stop lg-<name>        — stop container"
-}
-
-setup_podman
-
-log_ok "Layer 9 complete"
 
 # ══════════════════════════════════════════════════════════════════════════════
 # PART C — Watch Mode (auto-isolate new sites)
@@ -1893,71 +1711,6 @@ watch_mode() {
         log_info "Site path resolved: ${RESOLVED_PATH}"
         NEW_PATH="$RESOLVED_PATH"
 
-        # ── Isolate with Podman ───────────────────────────────────────────────
-        # Detect site user and workdir
-        if [[ "$NEW_PATH" == /home/* ]]; then
-            SITE_USER=$(echo "$NEW_PATH" | cut -d/ -f3)
-            WORK_DIR="$NEW_PATH"
-        else
-            SITE_USER=$(stat -c '%U' "$NEW_PATH" 2>/dev/null || echo "www-data")
-            WORK_DIR="/var/www/html"
-        fi
-        id "$SITE_USER" &>/dev/null || SITE_USER="www-data"
-        SITE_UID=$(id -u "$SITE_USER" 2>/dev/null || echo "33")
-
-        # Detect PHP handler
-        W_PHP_HANDLER="" ; W_PHP_BIN=""
-        for b in php-fpm php-cgi php; do
-            bp=$(command -v "$b" 2>/dev/null                 || { [ -x "/usr/local/bin/${b}" ] && echo "/usr/local/bin/${b}"; }                 || true)
-            bp=$(echo "$bp" | head -1)
-            if [ -n "$bp" ] && [ -x "$bp" ]; then
-                W_PHP_HANDLER="$b"; W_PHP_BIN="$bp"; break
-            fi
-        done
-
-        case "$W_PHP_HANDLER" in
-            php-fpm) W_PHP_CMD="php-fpm --nodaemonize" ;;
-            php-cgi) W_PHP_CMD="php-cgi" ;;
-            php)     W_PHP_CMD="php" ;;
-            *)       W_PHP_CMD="sh" ;;
-        esac
-
-        # Pull base image if needed
-        PODMAN_IMAGE="busybox:latest"
-        podman image exists "$PODMAN_IMAGE" 2>/dev/null             || podman pull "$PODMAN_IMAGE" 2>/dev/null || true
-
-        # Stop existing container for this site if any
-        podman stop  "lg-${SN}" 2>/dev/null || true
-        podman rm    "lg-${SN}" 2>/dev/null || true
-
-        PODMAN_ARGS=(
-            "--detach"
-            "--name=lg-${SN}"
-            "--user=${SITE_UID}"
-            "--read-only"
-            "--tmpfs=/tmp:noexec,nosuid,nodev,size=32m"
-            "--volume=${NEW_PATH}:${WORK_DIR}:ro"
-            "--workdir=${WORK_DIR}"
-            "--network=none"
-            "--security-opt=no-new-privileges"
-            "--cap-drop=ALL"
-            "--restart=always"
-            "--memory=256m"
-            "--cpus=0.5"
-        )
-        [ -n "$W_PHP_BIN" ] && PODMAN_ARGS+=("--volume=${W_PHP_BIN}:/${W_PHP_HANDLER}:ro")
-
-        if podman run "${PODMAN_ARGS[@]}" "$PODMAN_IMAGE" $W_PHP_CMD 2>/dev/null; then
-            echo -e "  ${GREEN}[OK]${NC}      lg-${SN} isolated successfully"
-            echo "${TS} [WATCH] lg-${SN} isolated (Podman)" >> "$LOG_FILE"
-            echo "NSPAWN_SERVICE:podman-lg-${SN}" >> "$UNDO_MANIFEST"
-            # Generate systemd service
-            podman generate systemd --name "lg-${SN}" --restart-policy=always                 --output-file="/etc/systemd/system/podman-lg-${SN}.service" 2>/dev/null             && systemctl daemon-reload             && systemctl enable "podman-lg-${SN}.service" 2>/dev/null || true
-        else
-            echo -e "  ${YELLOW}[WARN]${NC}    lg-${SN} failed — podman logs lg-${SN}"
-            echo "${TS} [WATCH] lg-${SN} failed to start" >> "$LOG_FILE"
-        fi
-
         # ── noexec on the new site directory ─────────────────────────────────
         # Uses the same _apply_noexec_dir function from LAYER 6
         if mount 2>/dev/null | grep -qE " on ${NEW_PATH} .*noexec"; then
@@ -1975,35 +1728,37 @@ watch_mode() {
             fi
         fi
 
-        # ── Apply open_basedir for the new site in all php.ini files ─────────
+        # ── Apply open_basedir for new site ──────────────────────────────────
+        # FPM: handled via pool.conf below
+        # CGI/mod_php: must be set in php.ini
+        _W_PHP_MODE=$(detect_php_mode)
         NEW_BASEDIR="${NEW_PATH}:/tmp:/usr/share/php:/usr/share/pear"
         UPDATED_INI=0
-        while IFS= read -r inifile; do
-            [ -f "$inifile" ] || continue
-            [[ "$inifile" == *cli* ]] && continue
-            if grep -qE "^\s*open_basedir\s*=" "$inifile"; then
-                CURRENT=$(grep -E "^\s*open_basedir\s*=" "$inifile" | head -1)
-                if ! echo "$CURRENT" | grep -q "$NEW_PATH"; then
-                    sed -i "s|^\s*open_basedir\s*=.*|&:${NEW_PATH}|" "$inifile"
-                    echo "${TS} [WATCH] open_basedir updated for ${SN} in ${inifile}" >> "$LOG_FILE"
+
+        if [[ "$_W_PHP_MODE" == "cgi" || "$_W_PHP_MODE" == "mod_php" ]]; then
+            while IFS= read -r inifile; do
+                [ -f "$inifile" ] || continue
+                [[ "$inifile" == *cli* ]] && continue
+                if grep -qE "^\s*open_basedir\s*=" "$inifile"; then
+                    CURRENT=$(grep -E "^\s*open_basedir\s*=" "$inifile" | head -1)
+                    if ! echo "$CURRENT" | grep -q "$NEW_PATH"; then
+                        sed -i "s|^\s*open_basedir\s*=.*|&:${NEW_PATH}|" "$inifile"
+                        echo "${TS} [WATCH] open_basedir updated for ${SN} in ${inifile}" >> "$LOG_FILE"
+                        UPDATED_INI=$((UPDATED_INI + 1))
+                    fi
+                else
+                    echo "open_basedir = ${NEW_BASEDIR}" >> "$inifile"
+                    echo "${TS} [WATCH] open_basedir added for ${SN} in ${inifile}" >> "$LOG_FILE"
                     UPDATED_INI=$((UPDATED_INI + 1))
                 fi
-            else
-                echo "open_basedir = ${NEW_BASEDIR}" >> "$inifile"
-                echo "${TS} [WATCH] open_basedir added for ${SN} in ${inifile}" >> "$LOG_FILE"
-                UPDATED_INI=$((UPDATED_INI + 1))
-            fi
-        done < <(find / -maxdepth 7 -type f -name "php.ini" 2>/dev/null | sort -u)
+            done < <(find / -maxdepth 7 -type f -name "php.ini" 2>/dev/null | sort -u)
+        else
+            log_info "[WATCH] FPM mode — open_basedir handled via pool.conf"
+        fi
 
         # ── Create PHP-FPM pool for new site ──────────────────────────────────
-        W_POOL_DIR=""
-        for d in \
-            /etc/php-fpm.d \
-            /etc/php/8.2/fpm/pool.d /etc/php/8.1/fpm/pool.d \
-            /etc/php/8.0/fpm/pool.d /etc/php/7.4/fpm/pool.d \
-            /etc/php/fpm/pool.d /usr/local/etc/php-fpm.d; do
-            [ -d "$d" ] && W_POOL_DIR="$d" && break
-        done
+        # Use shared find_pool_dir helper
+        W_POOL_DIR=$(find_pool_dir)
 
         POOL_CREATED=0
         if [ -n "$W_POOL_DIR" ]; then
@@ -2059,17 +1814,13 @@ request_slowlog_timeout         = 5s
 POOLEOF
             chmod 640 "$W_POOL_CONF"
 
-            # Restart php-fpm
-            for svc in php-fpm php8.2-fpm php8.1-fpm php8.0-fpm php7.4-fpm; do
-                if systemctl is-active --quiet "$svc" 2>/dev/null; then
-                    systemctl restart "$svc" 2>/dev/null \
-                        && { echo -e "  ${GREEN}[OK]${NC}      PHP-FPM pool created + restarted: $svc"
-                             echo "${TS} [WATCH] PHP-FPM pool created: ${W_POOL_CONF}" >> "$LOG_FILE"
-                             POOL_CREATED=1; } \
-                        || true
-                    break
-                fi
-            done
+            # Restart php-fpm using shared helper
+            _W_MODE=$(detect_php_mode)
+            if restart_php_services "$_W_MODE" 2>/dev/null; then
+                echo -e "  ${GREEN}[OK]${NC}      PHP-FPM pool created + service restarted"
+                echo "${TS} [WATCH] PHP-FPM pool created: ${W_POOL_CONF}" >> "$LOG_FILE"
+                POOL_CREATED=1
+            fi
             [ "$POOL_CREATED" -eq 0 ] && {
                 echo -e "  ${GREEN}[OK]${NC}      PHP-FPM pool created: ${W_POOL_CONF}"
                 echo -e "  ${YELLOW}[WARN]${NC}    php-fpm service not running — restart manually"
@@ -2091,7 +1842,6 @@ POOLEOF
         # ── Summary for this site ─────────────────────────────────────────────
         echo ""
         echo -e "  ${BOLD}${SN} hardening summary:${NC}"
-        echo -e "    [9] Podman isolation  →  $(podman ps --format '{{.Names}}' 2>/dev/null | grep -q "^lg-${SN}$" && echo 'running' || echo 'failed')"
         mount 2>/dev/null | grep -qE " on ${NEW_PATH} .*noexec" \
             && echo -e "    [6] noexec            →  active" \
             || echo -e "    [6] noexec            →  failed"
@@ -2099,7 +1849,7 @@ POOLEOF
         [ "$POOL_CREATED" -eq 1 ] \
             && echo -e "    [5] PHP-FPM pool      →  created (${W_POOL_DIR}/${SN}.conf)" \
             || echo -e "    [5] PHP-FPM pool      →  $([ -n "$W_POOL_DIR" ] && echo 'created (fpm not running)' || echo 'skipped (fpm not installed)')"
-        echo "${TS} [WATCH] ${SN} complete: Podman + noexec + open_basedir + PHP-FPM pool" >> "$LOG_FILE"
+        echo "${TS} [WATCH] ${SN} complete: noexec + open_basedir + PHP-FPM pool" >> "$LOG_FILE"
 
         # Add to known sites so we don't process it again
         KNOWN_SITES+=("$SN")
@@ -2145,7 +1895,6 @@ if [ "$DRY_RUN" = false ]; then
     echo "  [8] Auditd                — monitoring active"
     echo "  [A] FTP + ClamAV          — upload scanning enabled"
     echo "  [B] Snuffleupagus         — PHP RASP layer"
-    echo "  [9] Podman Isolation      — per-site containers"
     echo ""
     echo -e "  ${CYAN}Backups:${NC}  $BACKUP_DIR"
     echo -e "  ${CYAN}Rollback:${NC} sudo $0 --undo"
