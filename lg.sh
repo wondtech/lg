@@ -14,7 +14,7 @@
 #   [8] Auditd                — Real-time monitoring and alerting
 #   [A] FTP + ClamAV          — Scan uploaded files for malware
 #   [B] Snuffleupagus         — PHP RASP
-#   [9] nspawn Isolation      — Contain each site in an isolated namespace
+#   [9] Podman Isolation      — Contain each site in an isolated namespace
 #
 # Usage:
 #   sudo lg                  Interactive (recommended first run)
@@ -1104,88 +1104,47 @@ fi
 log_ok "Part B complete"
 
 # ══════════════════════════════════════════════════════════════════════════════
-# LAYER 9 — Namespace Isolation (systemd-nspawn)
+# LAYER 9 — Container Isolation (Podman)
 # Contain blast radius: attacker who breaches site-A cannot reach site-B
 # ══════════════════════════════════════════════════════════════════════════════
-section "LAYER 9: Namespace Isolation (systemd-nspawn)"
+section "LAYER 9: Container Isolation (Podman)"
 
-setup_nspawn() {
-    # ── Auto-install systemd-nspawn if missing ────────────────────────────────
-    if ! command -v systemd-nspawn &>/dev/null; then
-        log_warn "systemd-nspawn not found — attempting automatic installation..."
+setup_podman() {
 
+    # ── Auto-install Podman if missing ────────────────────────────────────────
+    if ! command -v podman &>/dev/null; then
+        log_warn "Podman not found — attempting installation..."
         if [ "$DRY_RUN" = true ]; then
-            log_dry "Install systemd-container package"
+            log_dry "Install podman"
         else
-            NSPAWN_INSTALLED=false
-
-            if command -v apt-get &>/dev/null; then
-                log_info "Detected: apt — installing systemd-container..."
-                DEBIAN_FRONTEND=noninteractive apt-get install -y -qq systemd-container 2>/dev/null \
-                    && NSPAWN_INSTALLED=true
-
-            elif command -v dnf &>/dev/null; then
-                log_info "Detected: dnf — installing systemd-container..."
-                dnf install -y -q systemd-container 2>/dev/null \
-                    && NSPAWN_INSTALLED=true
-
+            if command -v dnf &>/dev/null; then
+                dnf install -y -q podman 2>/dev/null && log_ok "Podman installed (dnf)"
             elif command -v yum &>/dev/null; then
-                log_info "Detected: yum — installing systemd-container..."
-                yum install -y -q systemd-container 2>/dev/null \
-                    && NSPAWN_INSTALLED=true
-
+                yum install -y -q podman 2>/dev/null && log_ok "Podman installed (yum)"
+            elif command -v apt-get &>/dev/null; then
+                DEBIAN_FRONTEND=noninteractive apt-get install -y -qq podman 2>/dev/null \
+                    && log_ok "Podman installed (apt)"
             elif command -v apk &>/dev/null; then
-                log_info "Detected: apk — installing systemd-nspawn..."
-                apk add -q systemd 2>/dev/null \
-                    && NSPAWN_INSTALLED=true
-
-            elif command -v pacman &>/dev/null; then
-                log_info "Detected: pacman — systemd-nspawn is part of systemd..."
-                pacman -S --noconfirm -q systemd 2>/dev/null \
-                    && NSPAWN_INSTALLED=true
-
+                apk add -q podman 2>/dev/null && log_ok "Podman installed (apk)"
             else
-                log_warn "No supported package manager found"
-            fi
-
-            if [ "$NSPAWN_INSTALLED" = true ] && command -v systemd-nspawn &>/dev/null; then
-                log_ok "systemd-nspawn installed successfully"
-            else
-                log_warn "Could not install systemd-nspawn automatically"
-                log_info "Install manually then re-run:"
-                log_info "  Debian/Ubuntu : apt install systemd-container -y"
-                log_info "  CentOS/RHEL   : yum install systemd-container -y"
-                log_info "  Fedora        : dnf install systemd-container -y"
-                log_info "  Alpine        : apk add systemd"
+                log_warn "No supported package manager — install podman manually"
                 return 1
             fi
         fi
     fi
 
-    # ── Verify systemd-nspawn is available ────────────────────────────────────
-    if ! command -v systemd-nspawn &>/dev/null && [ "$DRY_RUN" = false ]; then
-        log_warn "systemd-nspawn still not available — skipping isolation"
+    if ! command -v podman &>/dev/null && [ "$DRY_RUN" = false ]; then
+        log_warn "Podman still not available — skipping isolation"
         return 1
     fi
 
-    log_ok "systemd-nspawn: $(systemd-nspawn --version 2>/dev/null | head -1)"
+    log_ok "Podman: $(podman --version 2>/dev/null)"
 
     # ── resolve_site_path ─────────────────────────────────────────────────────
-    # Given a site name (e.g. "wond"), find where it actually lives:
-    #   1. /var/www/wond
-    #   2. /home/wond/public_html
-    #   3. Apache/Nginx DocumentRoot in config files
-    # Returns the real path or empty string if not found.
     resolve_site_path() {
         local name="$1"
-
-        # 1. /var/www/<name>
-        [ -d "/var/www/${name}" ] && echo "/var/www/${name}" && return
-
-        # 2. /home/<name>/public_html
-        [ -d "/home/${name}/public_html" ] && echo "/home/${name}/public_html" && return
-
-        # 3. Search Apache/Nginx configs for DocumentRoot matching the name
+        [ -d "/var/www/${name}"            ] && echo "/var/www/${name}"            && return
+        [ -d "/home/${name}/public_html"   ] && echo "/home/${name}/public_html"   && return
         for conf in \
             /etc/apache2/sites-enabled/*.conf \
             /etc/httpd/conf.d/*.conf \
@@ -1194,288 +1153,177 @@ setup_nspawn() {
             [ -f "$conf" ] || continue
             local docroot
             docroot=$(grep -hEi '^\s*(DocumentRoot|root)\s+"?([^";\s]+)"?' "$conf" \
-                2>/dev/null | awk '{print $NF}' | tr -d '"' \
-                | grep -i "$name" | head -1)
+                2>/dev/null | awk '{print $NF}' | tr -d '"' | grep -i "$name" | head -1)
             [ -d "$docroot" ] && echo "$docroot" && return
         done
-
-        # Not found
         echo ""
     }
 
     # ── Discover sites ────────────────────────────────────────────────────────
     SITES=()
-
-    # /var/www/* subdirectories
     for d in /var/www/*/; do
         [ -d "$d" ] && [[ "$d" != "/var/www/html/" ]] && SITES+=("${d%/}")
     done
-
-    # /home/*/public_html
     for d in /home/*/public_html/; do
         [ -d "$d" ] && SITES+=("${d%/}")
     done
-
-    # Fallback: /var/www/html if nothing else found
     [ ${#SITES[@]} -eq 0 ] && [ -d "/var/www/html" ] && SITES+=("/var/www/html")
-
-    # Deduplicate
     mapfile -t SITES < <(printf '%s\n' "${SITES[@]}" | sort -u)
 
     if [ ${#SITES[@]} -eq 0 ]; then
-        log_warn "No sites found in /var/www/* or /home/*/public_html"
+        log_warn "No sites found"
         return 1
     fi
+
     log_info "Found ${#SITES[@]} site(s):"
     for s in "${SITES[@]}"; do echo "    → $s"; done
     echo ""
 
     if [ "$DRY_RUN" = true ]; then
         for s in "${SITES[@]}"; do
-            SN=$(echo "$s" | sed 's|/var/www/||;s|/home/||;s|/public_html||;s|/$||;s|/||g')
-            log_dry "Create isolated nspawn container: $SN"
+            SN=$(echo "$s" | sed 's|/var/www/||;s|/home/||;s|/public_html||' \
+                | tr -cd '[:alnum:]-_' | cut -c1-32)
+            log_dry "Create Podman container: lg-${SN}"
         done
         return 0
     fi
 
-    NSPAWN_BASE="/var/lib/lg-nspawn"
-    mkdir -p "$NSPAWN_BASE"
+    # ── Stop existing lg containers ───────────────────────────────────────────
+    EXISTING=$(podman ps -a --format '{{.Names}}' 2>/dev/null | grep '^lg-' || true)
+    if [ -n "$EXISTING" ]; then
+        log_info "Stopping existing containers..."
+        while IFS= read -r cname; do
+            podman stop "$cname"   2>/dev/null || true
+            podman rm   "$cname"   2>/dev/null || true
+            log_ok "Removed: $cname"
+        done <<< "$EXISTING"
+    fi
 
-    # Network bridge
-    if command -v ip &>/dev/null; then
-        if ! ip link show nspawn-br0 &>/dev/null; then
-            ip link add name nspawn-br0 type bridge
-            ip addr add 10.200.0.1/24 dev nspawn-br0
-            ip link set nspawn-br0 up
-            log_ok "Network bridge: nspawn-br0 (10.200.0.1/24)"
-        else
-            log_ok "Network bridge already exists: nspawn-br0"
+    # ── Detect PHP handler ────────────────────────────────────────────────────
+    PHP_HANDLER=""
+    PHP_BIN=""
+    for b in php-fpm php-cgi php; do
+        bp=$(command -v "$b" 2>/dev/null \
+            || { [ -x "/usr/local/bin/${b}" ] && echo "/usr/local/bin/${b}"; } \
+            || true)
+        bp=$(echo "$bp" | head -1)
+        if [ -n "$bp" ] && [ -x "$bp" ]; then
+            PHP_HANDLER="$b"
+            PHP_BIN="$bp"
+            break
         fi
-        iptables -t nat -C POSTROUTING -s 10.200.0.0/24 -j MASQUERADE 2>/dev/null \
-            || iptables -t nat -A POSTROUTING -s 10.200.0.0/24 -j MASQUERADE 2>/dev/null
-    fi
+    done
+    log_info "PHP handler: ${PHP_HANDLER:-none} (${PHP_BIN})"
 
-    # ── Detect systemd version for compatible flag selection ─────────────────
-    SYSTEMD_VER=$(systemd-nspawn --version 2>/dev/null | awk 'NR==1{print $2}')
-    log_info "systemd version: ${SYSTEMD_VER}"
+    case "$PHP_HANDLER" in
+        php-fpm) PHP_CMD="php-fpm --nodaemonize" ;;
+        php-cgi) PHP_CMD="php-cgi" ;;
+        php)     PHP_CMD="php" ;;
+        *)       PHP_CMD="" ;;
+    esac
 
-    # ── Stop all existing lg nspawn services before rebuilding ────────────────
-    EXISTING_SERVICES=$(systemctl list-units --type=service --all \
-        --no-legend 2>/dev/null | awk '{print $1}' | grep '^nspawn-')
-
-    if [ -n "$EXISTING_SERVICES" ]; then
-        log_info "Stopping existing nspawn containers..."
-        while IFS= read -r svc; do
-            systemctl stop    "$svc" 2>/dev/null
-            systemctl disable "$svc" 2>/dev/null
-            log_ok "Stopped: $svc"
-        done <<< "$EXISTING_SERVICES"
-        systemctl daemon-reload
-        echo ""
-    fi
-
-    SITE_IP_LAST=10
+    # ── Create container per site ─────────────────────────────────────────────
     for site in "${SITES[@]}"; do
-        SN=$(echo "$site" | sed 's|/var/www/||;s|/home/||;s|/public_html||;s|/$||;s|/||g')
-        SN=$(echo "$SN" | tr -cd '[:alnum:]-_' | cut -c1-32)
+        SN=$(echo "$site" | sed 's|/var/www/||;s|/home/||;s|/public_html||' \
+            | tr -cd '[:alnum:]-_' | cut -c1-32)
 
-        # ── Resolve actual site path ──────────────────────────────────────────
-        # Use discovered path, but verify it exists.
-        # If site dir is missing try alternate locations automatically.
-        RESOLVED_PATH=""
-        if [ -d "$site" ]; then
-            RESOLVED_PATH="$site"
-        else
-            RESOLVED_PATH=$(resolve_site_path "$SN")
-        fi
+        # Resolve actual path
+        RESOLVED=""
+        [ -d "$site" ] && RESOLVED="$site"
+        [ -z "$RESOLVED" ] && RESOLVED=$(resolve_site_path "$SN")
 
-        if [ -z "$RESOLVED_PATH" ]; then
-            log_warn "Cannot find site directory for '${SN}'"
-            log_info "  Tried: /var/www/${SN}"
-            log_info "  Tried: /home/${SN}/public_html"
-            log_info "  Tried: Apache/Nginx config files"
-            log_warn "  Skipping ${SN}"
+        if [ -z "$RESOLVED" ]; then
+            log_warn "Cannot resolve path for '${SN}' — skipping"
             continue
         fi
 
-        log_info "Site '${SN}' resolved to: ${RESOLVED_PATH}"
-        site="$RESOLVED_PATH"
-        SITE_DIR="${NSPAWN_BASE}/${SN}"
-        SITE_IP="10.200.0.${SITE_IP_LAST}"
-        SITE_IP_LAST=$((SITE_IP_LAST + 1))
-
-        echo "  ── Container: ${SN} ──"
-
-        # Stop and clean up any existing container for this site
-        if systemctl is-active --quiet "nspawn-${SN}.service" 2>/dev/null || \
-           systemctl is-failed --quiet "nspawn-${SN}.service" 2>/dev/null; then
-            log_info "Stopping existing container: nspawn-${SN}"
-            systemctl stop    "nspawn-${SN}.service" 2>/dev/null
-            systemctl disable "nspawn-${SN}.service" 2>/dev/null
-            log_ok "Stopped: nspawn-${SN}"
+        # Detect WorkingDirectory
+        if [[ "$RESOLVED" == /home/* ]]; then
+            SITE_USER=$(echo "$RESOLVED" | cut -d/ -f3)
+            WORK_DIR="$RESOLVED"
+        else
+            SITE_USER="www-data"
+            WORK_DIR="/var/www/html"
         fi
 
-        # Minimal root filesystem
-        mkdir -p "${SITE_DIR}"/{bin,lib,lib64,usr/lib,etc,tmp,var/www,proc,sys,dev,run}
+        # Resolve numeric UID for podman
+        SITE_UID=$(id -u "$SITE_USER" 2>/dev/null || echo "33")
 
-        # Copy required binaries — auto-detect php handler
-        # Search standard paths + /usr/local/bin explicitly
-        PHP_HANDLER=""
-        for b in php-fpm php-cgi php; do
-            bp=$(command -v "$b" 2>/dev/null \
-                || [ -x "/usr/local/bin/${b}" ] && echo "/usr/local/bin/${b}" \
-                || [ -x "/usr/bin/${b}"        ] && echo "/usr/bin/${b}"       \
-                || true)
-            bp=$(echo "$bp" | head -1)
-            if [ -n "$bp" ] && [ -x "$bp" ]; then
-                cp "$bp" "${SITE_DIR}/bin/${b}" 2>/dev/null \
-                    && log_info "Binary: $b  ($bp)"
-                [ -z "$PHP_HANDLER" ] && PHP_HANDLER="$b"
-            fi
-        done
+        echo "  ── Container: lg-${SN} ──"
+        log_info "Site path:  $RESOLVED"
+        log_info "User:       ${SITE_USER} (UID: ${SITE_UID})"
 
-        # Also copy sh
-        SH_PATH=$(command -v sh 2>/dev/null || echo "/bin/sh")
-        [ -x "$SH_PATH" ] && cp "$SH_PATH" "${SITE_DIR}/bin/sh" 2>/dev/null
+        # Build podman run command
+        PODMAN_ARGS=(
+            "--detach"
+            "--name=lg-${SN}"
+            "--user=${SITE_UID}"
+            "--read-only"
+            "--tmpfs=/tmp:noexec,nosuid,nodev,size=32m"
+            "--volume=${RESOLVED}:${WORK_DIR}:ro"
+            "--workdir=${WORK_DIR}"
+            "--network=none"
+            "--security-opt=no-new-privileges"
+            "--cap-drop=ALL"
+            "--restart=always"
+            "--memory=256m"
+            "--cpus=0.5"
+        )
 
-        log_info "PHP handler: ${PHP_HANDLER:-none}"
-
-        # Build PHP command
-        case "$PHP_HANDLER" in
-            php-fpm) PHP_CMD="/bin/php-fpm --nodaemonize" ;;
-            php-cgi) PHP_CMD="/bin/php-cgi" ;;
-            php)     PHP_CMD="/bin/php" ;;
-            *)
-                log_warn "No PHP handler found in container"
-                PHP_CMD="/bin/sh"
-                ;;
-        esac
-
-        # Copy shared libraries
-        for bp in "${SITE_DIR}"/bin/*; do
-            [ -f "$bp" ] || continue
-            ldd "$bp" 2>/dev/null | grep -Eo '/[^ ]+\.so[^ ]*' | while read -r lib; do
-                [ -f "$lib" ] && cp --parents "$lib" "${SITE_DIR}/" 2>/dev/null || true
-            done
-        done
-
-        # Minimal /etc
-        cp /etc/resolv.conf "${SITE_DIR}/etc/"        2>/dev/null || true
-        cp /etc/localtime   "${SITE_DIR}/etc/"        2>/dev/null || true
-        getent passwd www-data apache 2>/dev/null | head -1 > "${SITE_DIR}/etc/passwd"
-        getent group  www-data apache 2>/dev/null | head -1 > "${SITE_DIR}/etc/group"
-
-        # Detect site owner and working directory
-        # /var/www/sitename      → WorkingDirectory=/var/www
-        # /home/user/public_html → WorkingDirectory=/home/user/public_html
-        if [[ "$site" == /home/* ]]; then
-            SITE_OWNER=$(echo "$site" | cut -d/ -f3)
-            WORK_DIR="/home/${SITE_OWNER}/public_html"
-            CONTAINER_WORKDIR="/home/${SITE_OWNER}/public_html"
-            # Create home path inside container
-            mkdir -p "${SITE_DIR}/home/${SITE_OWNER}/public_html"
-            BIND_TARGET="${SITE_DIR}/home/${SITE_OWNER}/public_html"
-        else
-            SITE_OWNER="www-data"
-            WORK_DIR="/var/www"
-            CONTAINER_WORKDIR="/var/www"
-            BIND_TARGET="${SITE_DIR}/var/www"
+        # Add PHP binary as volume if outside standard paths
+        if [ -n "$PHP_BIN" ]; then
+            PODMAN_ARGS+=("--volume=${PHP_BIN}:/${PHP_HANDLER}:ro")
         fi
 
-        # Determine site user (prefer actual owner over www-data)
-        SITE_USER=$(stat -c '%U' "$site" 2>/dev/null || echo "www-data")
-        # Fall back to www-data if user doesn't exist inside container
-        id "$SITE_USER" &>/dev/null || SITE_USER="www-data"
+        # Use base image with minimal shell
+        PODMAN_IMAGE="busybox:latest"
 
-        # Bind site files read-only
-        if mount --bind "$site" "$BIND_TARGET" 2>/dev/null; then
-            mount -o remount,ro,bind "$BIND_TARGET" 2>/dev/null || true
-            log_ok "Site bound read-only: $site → $BIND_TARGET"
-        else
-            log_warn "Could not bind: $site"
+        # Pull image if not available
+        if ! podman image exists "$PODMAN_IMAGE" 2>/dev/null; then
+            log_info "Pulling base image: $PODMAN_IMAGE"
+            podman pull "$PODMAN_IMAGE" 2>/dev/null \
+                || { log_warn "Could not pull image — skipping ${SN}"; continue; }
         fi
 
-        # noexec /tmp inside container
-        mount -t tmpfs -o size=32M,noexec,nosuid,nodev \
-            tmpfs "${SITE_DIR}/tmp" 2>/dev/null \
-            && log_ok "/tmp inside container: noexec (32M)"
-
-        # nspawn config
-        mkdir -p /etc/systemd/nspawn
-        cat > "/etc/systemd/nspawn/${SN}.nspawn" << EOF
-[Exec]
-User=${SITE_USER}
-WorkingDirectory=${CONTAINER_WORKDIR}
-
-[Files]
-TemporaryFileSystem=/tmp:noexec,nosuid,nodev,size=32M
-
-[Network]
-VirtualEthernet=yes
-Bridge=nspawn-br0
-EOF
-
-        # systemd service — built with version-compatible flags
-        NSPAWN_FLAGS="/usr/bin/systemd-nspawn"
-        NSPAWN_FLAGS+=" --machine=${SN}"
-        NSPAWN_FLAGS+=" --directory=${SITE_DIR}"
-        NSPAWN_FLAGS+=" --user=${SITE_USER}"
-        NSPAWN_FLAGS+=" --network-bridge=nspawn-br0"
-        NSPAWN_FLAGS+=" --tmpfs=/tmp:noexec,nosuid,nodev,size=32M"
-        NSPAWN_FLAGS+=" --read-only"
-
-        if [ "${SYSTEMD_VER:-0}" -ge 242 ] 2>/dev/null; then
-            NSPAWN_FLAGS+=" --private-users=pick"
-            NSPAWN_FLAGS+=" --drop-capability=CAP_SYS_ADMIN"
-            NSPAWN_FLAGS+=" --drop-capability=CAP_NET_ADMIN"
-            NSPAWN_FLAGS+=" --drop-capability=CAP_SYS_PTRACE"
+        # Determine CMD
+        if [ -n "$PHP_CMD" ]; then
+            RUN_CMD="/${PHP_HANDLER} ${PHP_CMD#* }"
         else
-            # systemd < 242: --capability=none drops all caps safely
-            NSPAWN_FLAGS+=" --capability=none"
+            RUN_CMD="sh"
         fi
 
-        NSPAWN_FLAGS+=" ${PHP_CMD}"
+        # Run container
+        if podman run "${PODMAN_ARGS[@]}" "$PODMAN_IMAGE" $RUN_CMD 2>/dev/null; then
+            log_ok "lg-${SN}  →  running"
 
-        cat > "/etc/systemd/system/nspawn-${SN}.service" << EOF
-[Unit]
-Description=Linux Guardian — Isolated site: ${SN}
-After=network.target
+            # Create systemd service for auto-restart
+            podman generate systemd \
+                --name "lg-${SN}" \
+                --restart-policy=always \
+                --files \
+                --output-file="/etc/systemd/system/podman-lg-${SN}.service" \
+                2>/dev/null \
+            && systemctl daemon-reload \
+            && systemctl enable "podman-lg-${SN}.service" 2>/dev/null \
+            && log_ok "systemd service: podman-lg-${SN}.service"
 
-[Service]
-Type=notify
-ExecStart=${NSPAWN_FLAGS}
-Restart=on-failure
-RestartSec=5
-NoNewPrivileges=yes
-ProtectSystem=strict
-ProtectHome=yes
-PrivateTmp=yes
-
-[Install]
-WantedBy=multi-user.target
-EOF
-        echo "NSPAWN_SERVICE:nspawn-${SN}" >> "$UNDO_MANIFEST"
-
-        systemctl daemon-reload
-        systemctl enable "nspawn-${SN}.service" 2>/dev/null
-        systemctl start  "nspawn-${SN}.service" 2>/dev/null
-
-        if systemctl is-active --quiet "nspawn-${SN}.service" 2>/dev/null; then
-            log_ok "${SN}  →  running  (IP: ${SITE_IP})"
+            echo "NSPAWN_SERVICE:podman-lg-${SN}" >> "$UNDO_MANIFEST"
         else
-            log_warn "${SN}  →  not active — journalctl -u nspawn-${SN}"
+            log_warn "lg-${SN}  →  failed to start"
+            log_info "Debug: podman logs lg-${SN}"
         fi
         echo ""
     done
 
     log_info "Manage containers:"
-    echo "    machinectl list              — list running containers"
-    echo "    machinectl status <name>     — container details"
-    echo "    machinectl login  <name>     — shell inside container"
-    echo "    journalctl -u nspawn-<name>  — container logs"
+    echo "    podman ps                    — list running containers"
+    echo "    podman stats                 — resource usage"
+    echo "    podman logs lg-<name>        — container logs"
+    echo "    podman exec -it lg-<name> sh — shell inside container"
+    echo "    podman stop lg-<name>        — stop container"
 }
 
-setup_nspawn
+setup_podman
 
 log_ok "Layer 9 complete"
 
@@ -1623,144 +1471,69 @@ watch_mode() {
         log_info "Site path resolved: ${RESOLVED_PATH}"
         NEW_PATH="$RESOLVED_PATH"
 
-        # ── Isolate in nspawn container ───────────────────────────────────────
-        NSPAWN_BASE="/var/lib/lg-nspawn"
-        SITE_DIR="${NSPAWN_BASE}/${SN}"
+        # ── Isolate with Podman ───────────────────────────────────────────────
+        # Detect site user and workdir
+        if [[ "$NEW_PATH" == /home/* ]]; then
+            SITE_USER=$(echo "$NEW_PATH" | cut -d/ -f3)
+            WORK_DIR="$NEW_PATH"
+        else
+            SITE_USER=$(stat -c '%U' "$NEW_PATH" 2>/dev/null || echo "www-data")
+            WORK_DIR="/var/www/html"
+        fi
+        id "$SITE_USER" &>/dev/null || SITE_USER="www-data"
+        SITE_UID=$(id -u "$SITE_USER" 2>/dev/null || echo "33")
 
-        mkdir -p "${SITE_DIR}"/{bin,lib,lib64,usr/lib,etc,tmp,var/www,proc,sys,dev,run}
-
-        # Copy required binaries — auto-detect php handler
-        PHP_HANDLER=""
+        # Detect PHP handler
+        W_PHP_HANDLER="" ; W_PHP_BIN=""
         for b in php-fpm php-cgi php; do
-            bp=$(command -v "$b" 2>/dev/null \
-                || { [ -x "/usr/local/bin/${b}" ] && echo "/usr/local/bin/${b}"; } \
-                || { [ -x "/usr/bin/${b}"        ] && echo "/usr/bin/${b}"; }       \
-                || true)
+            bp=$(command -v "$b" 2>/dev/null                 || { [ -x "/usr/local/bin/${b}" ] && echo "/usr/local/bin/${b}"; }                 || true)
             bp=$(echo "$bp" | head -1)
             if [ -n "$bp" ] && [ -x "$bp" ]; then
-                cp "$bp" "${SITE_DIR}/bin/${b}" 2>/dev/null || true
-                [ -z "$PHP_HANDLER" ] && PHP_HANDLER="$b"
+                W_PHP_HANDLER="$b"; W_PHP_BIN="$bp"; break
             fi
         done
-        SH_PATH=$(command -v sh 2>/dev/null || echo "/bin/sh")
-        [ -x "$SH_PATH" ] && cp "$SH_PATH" "${SITE_DIR}/bin/sh" 2>/dev/null || true
 
-        case "$PHP_HANDLER" in
-            php-fpm) W_PHP_CMD="/bin/php-fpm --nodaemonize" ;;
-            php-cgi) W_PHP_CMD="/bin/php-cgi" ;;
-            php)     W_PHP_CMD="/bin/php" ;;
-            *)       W_PHP_CMD="/bin/sh" ;;
+        case "$W_PHP_HANDLER" in
+            php-fpm) W_PHP_CMD="php-fpm --nodaemonize" ;;
+            php-cgi) W_PHP_CMD="php-cgi" ;;
+            php)     W_PHP_CMD="php" ;;
+            *)       W_PHP_CMD="sh" ;;
         esac
 
-        # Copy shared libraries
-        for bp in "${SITE_DIR}"/bin/*; do
-            [ -f "$bp" ] || continue
-            ldd "$bp" 2>/dev/null | grep -Eo '/[^ ]+\.so[^ ]*' | while read -r lib; do
-                [ -f "$lib" ] && cp --parents "$lib" "${SITE_DIR}/" 2>/dev/null || true
-            done
-        done
+        # Pull base image if needed
+        PODMAN_IMAGE="busybox:latest"
+        podman image exists "$PODMAN_IMAGE" 2>/dev/null             || podman pull "$PODMAN_IMAGE" 2>/dev/null || true
 
-        # Minimal /etc
-        cp /etc/resolv.conf "${SITE_DIR}/etc/" 2>/dev/null || true
-        cp /etc/localtime   "${SITE_DIR}/etc/" 2>/dev/null || true
-        getent passwd www-data apache 2>/dev/null | head -1 \
-            > "${SITE_DIR}/etc/passwd"
-        getent group www-data apache 2>/dev/null | head -1 \
-            > "${SITE_DIR}/etc/group"
+        # Stop existing container for this site if any
+        podman stop  "lg-${SN}" 2>/dev/null || true
+        podman rm    "lg-${SN}" 2>/dev/null || true
 
-        # Detect site owner and working directory
-        if [[ "$NEW_PATH" == /home/* ]]; then
-            SITE_OWNER=$(echo "$NEW_PATH" | cut -d/ -f3)
-            CONTAINER_WORKDIR="/home/${SITE_OWNER}/public_html"
-            mkdir -p "${SITE_DIR}/home/${SITE_OWNER}/public_html"
-            BIND_TARGET="${SITE_DIR}/home/${SITE_OWNER}/public_html"
+        PODMAN_ARGS=(
+            "--detach"
+            "--name=lg-${SN}"
+            "--user=${SITE_UID}"
+            "--read-only"
+            "--tmpfs=/tmp:noexec,nosuid,nodev,size=32m"
+            "--volume=${NEW_PATH}:${WORK_DIR}:ro"
+            "--workdir=${WORK_DIR}"
+            "--network=none"
+            "--security-opt=no-new-privileges"
+            "--cap-drop=ALL"
+            "--restart=always"
+            "--memory=256m"
+            "--cpus=0.5"
+        )
+        [ -n "$W_PHP_BIN" ] && PODMAN_ARGS+=("--volume=${W_PHP_BIN}:/${W_PHP_HANDLER}:ro")
+
+        if podman run "${PODMAN_ARGS[@]}" "$PODMAN_IMAGE" $W_PHP_CMD 2>/dev/null; then
+            echo -e "  ${GREEN}[OK]${NC}      lg-${SN} isolated successfully"
+            echo "${TS} [WATCH] lg-${SN} isolated (Podman)" >> "$LOG_FILE"
+            echo "NSPAWN_SERVICE:podman-lg-${SN}" >> "$UNDO_MANIFEST"
+            # Generate systemd service
+            podman generate systemd --name "lg-${SN}" --restart-policy=always                 --output-file="/etc/systemd/system/podman-lg-${SN}.service" 2>/dev/null             && systemctl daemon-reload             && systemctl enable "podman-lg-${SN}.service" 2>/dev/null || true
         else
-            SITE_OWNER="www-data"
-            CONTAINER_WORKDIR="/var/www"
-            BIND_TARGET="${SITE_DIR}/var/www"
-        fi
-
-        SITE_USER=$(stat -c '%U' "$NEW_PATH" 2>/dev/null || echo "www-data")
-        id "$SITE_USER" &>/dev/null || SITE_USER="www-data"
-
-        # Bind site files read-only
-        if mount --bind "$NEW_PATH" "$BIND_TARGET" 2>/dev/null; then
-            mount -o remount,ro,bind "$BIND_TARGET" 2>/dev/null || true
-        fi
-
-        # noexec /tmp inside container
-        mount -t tmpfs -o size=32M,noexec,nosuid,nodev \
-            tmpfs "${SITE_DIR}/tmp" 2>/dev/null || true
-
-        # Assign IP from pool
-        SITE_IP_LAST=$(( 10 + $(ls /var/lib/lg-nspawn/ 2>/dev/null | wc -l) ))
-        SITE_IP="10.200.0.${SITE_IP_LAST}"
-
-        # nspawn config
-        mkdir -p /etc/systemd/nspawn
-        cat > "/etc/systemd/nspawn/${SN}.nspawn" << EOF
-[Exec]
-User=${SITE_USER}
-WorkingDirectory=${CONTAINER_WORKDIR}
-
-[Files]
-TemporaryFileSystem=/tmp:noexec,nosuid,nodev,size=32M
-
-[Network]
-VirtualEthernet=yes
-Bridge=nspawn-br0
-EOF
-
-        # systemd service — version-compatible flags
-        W_SYSTEMD_VER=$(systemd-nspawn --version 2>/dev/null | awk 'NR==1{print $2}')
-        W_NSPAWN_FLAGS="/usr/bin/systemd-nspawn"
-        W_NSPAWN_FLAGS+=" --machine=${SN}"
-        W_NSPAWN_FLAGS+=" --directory=${SITE_DIR}"
-        W_NSPAWN_FLAGS+=" --user=${SITE_USER}"
-        W_NSPAWN_FLAGS+=" --network-bridge=nspawn-br0"
-        W_NSPAWN_FLAGS+=" --tmpfs=/tmp:noexec,nosuid,nodev,size=32M"
-        W_NSPAWN_FLAGS+=" --read-only"
-
-        if [ "${W_SYSTEMD_VER:-0}" -ge 242 ] 2>/dev/null; then
-            W_NSPAWN_FLAGS+=" --private-users=pick"
-            W_NSPAWN_FLAGS+=" --drop-capability=CAP_SYS_ADMIN"
-            W_NSPAWN_FLAGS+=" --drop-capability=CAP_NET_ADMIN"
-            W_NSPAWN_FLAGS+=" --drop-capability=CAP_SYS_PTRACE"
-        else
-            W_NSPAWN_FLAGS+=" --capability=none"
-        fi
-
-        W_NSPAWN_FLAGS+=" ${W_PHP_CMD}"
-
-        cat > "/etc/systemd/system/nspawn-${SN}.service" << EOF
-[Unit]
-Description=Linux Guardian — Isolated site: ${SN}
-After=network.target
-
-[Service]
-Type=notify
-ExecStart=${W_NSPAWN_FLAGS}
-Restart=on-failure
-RestartSec=5
-NoNewPrivileges=yes
-ProtectSystem=strict
-ProtectHome=yes
-PrivateTmp=yes
-
-[Install]
-WantedBy=multi-user.target
-EOF
-
-        systemctl daemon-reload
-        systemctl enable "nspawn-${SN}.service" 2>/dev/null
-        systemctl start  "nspawn-${SN}.service" 2>/dev/null
-
-        if systemctl is-active --quiet "nspawn-${SN}.service" 2>/dev/null; then
-            echo -e "  ${GREEN}[OK]${NC}      ${SN} isolated successfully  (IP: ${SITE_IP})"
-            echo "${TS} [WATCH] ${SN} isolated successfully (IP: ${SITE_IP})" >> "$LOG_FILE"
-        else
-            echo -e "  ${YELLOW}[WARN]${NC}    ${SN} container not active — check: journalctl -u nspawn-${SN}"
-            echo "${TS} [WATCH] ${SN} container failed to start" >> "$LOG_FILE"
+            echo -e "  ${YELLOW}[WARN]${NC}    lg-${SN} failed — podman logs lg-${SN}"
+            echo "${TS} [WATCH] lg-${SN} failed to start" >> "$LOG_FILE"
         fi
 
         # ── noexec on the new site directory ─────────────────────────────────
@@ -1818,12 +1591,12 @@ EOF
         # ── Summary for this site ─────────────────────────────────────────────
         echo ""
         echo -e "  ${BOLD}${SN} hardening summary:${NC}"
-        echo -e "    [9] nspawn isolation  →  $(systemctl is-active "nspawn-${SN}.service" 2>/dev/null || echo 'failed')"
+        echo -e "    [9] Podman isolation  →  $(systemctl is-active "nspawn-${SN}.service" 2>/dev/null || echo 'failed')"
         mount 2>/dev/null | grep -qE " on ${NEW_PATH} .*noexec" \
             && echo -e "    [6] noexec            →  active" \
             || echo -e "    [6] noexec            →  failed"
         echo -e "    [5] open_basedir      →  updated in ${UPDATED_INI} file(s)"
-        echo "${TS} [WATCH] ${SN} complete: nspawn + noexec + open_basedir" >> "$LOG_FILE"
+        echo "${TS} [WATCH] ${SN} complete: Podman + noexec + open_basedir" >> "$LOG_FILE"
 
         # Add to known sites so we don't process it again
         KNOWN_SITES+=("$SN")
@@ -1869,7 +1642,7 @@ if [ "$DRY_RUN" = false ]; then
     echo "  [8] Auditd                — monitoring active"
     echo "  [A] FTP + ClamAV          — upload scanning enabled"
     echo "  [B] Snuffleupagus         — PHP RASP layer"
-    echo "  [9] nspawn Isolation      — per-site containers"
+    echo "  [9] Podman Isolation      — per-site containers"
     echo ""
     echo -e "  ${CYAN}Backups:${NC}  $BACKUP_DIR"
     echo -e "  ${CYAN}Rollback:${NC} sudo $0 --undo"
