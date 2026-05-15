@@ -156,9 +156,9 @@ find_conf() {
 # Prints first match; used as fallback when find_conf fails
 find_conf_deep() {
     local name="$1" depth="${2:-8}"
-    find / -maxdepth "$depth" -type f -name "$name" \
+    { find / -maxdepth "$depth" -type f -name "$name" \
         ! -path "*/proc/*" ! -path "*/sys/*" ! -path "*/dev/*" \
-        2>/dev/null | head -1
+        2>/dev/null || true; } | head -1
 }
 
 # ─── install_pkg: cross-distro package install ───────────────────────────────
@@ -272,8 +272,8 @@ BACKUP_DIR="/root/lg/backups"
 LOG_FILE="/var/log/lg-hardening.log"
 UNDO_MANIFEST="${BACKUP_DIR}/undo_manifest_${TIMESTAMP}.txt"
 MAC_SYSTEM="none"
-SNUFF_INSTALLED=false
 PHP_SKIP=false
+PHPFPM_SKIP=false        # set to true when Part 5.1 is skipped — respected by Part B FPM mode
 PHP_INI_FILES=()
 SELECTED_FILES=()
 ALERT_EMAIL="root"
@@ -320,67 +320,61 @@ if [ "$UNDO_MODE" = true ]; then
 
     while IFS= read -r line; do
         [ -z "$line" ] && continue
-        T=$(echo "$line" | cut -d: -f1)
+        T="${line%%:*}"
+        REST="${line#*:}"
         case "$T" in
             FILE)
-                ORIG=$(echo "$line" | cut -d: -f2)
-                BKUP=$(echo "$line" | cut -d: -f3)
+                ORIG="${REST%%:*}"
+                BKUP="${REST#*:}"
                 [ -f "$BKUP" ] \
                     && cp "$BKUP" "$ORIG" && log_ok "Restored: $ORIG" \
                     || log_warn "Backup missing: $BKUP"
                 ;;
             PERM)
-                P=$(echo "$line" | cut -d: -f2)
-                M=$(echo "$line" | cut -d: -f3)
-                O=$(echo "$line" | cut -d: -f4)
-                if [ -e "$P" ]; then
-                    chmod "$M" "$P" 2>/dev/null
-                    chown "$O" "$P" 2>/dev/null
-                    log_ok "Restored perms: $P ($M $O)"
+                # Format: PERM:path:mode:owner — owner may contain ':'
+                _perm_path=$(echo "$REST" | cut -d: -f1)
+                _perm_mode=$(echo "$REST" | cut -d: -f2)
+                _perm_owner=$(echo "$REST" | cut -d: -f3-)
+                if [ -e "$_perm_path" ]; then
+                    chmod "$_perm_mode"  "$_perm_path" 2>/dev/null || true
+                    chown "$_perm_owner" "$_perm_path" 2>/dev/null || true
+                    log_ok "Restored perms: $_perm_path ($_perm_mode $_perm_owner)"
                 fi
                 ;;
             MOUNT_NOEXEC)
-                MNT=$(echo "$line" | cut -d: -f2)
+                MNT="$REST"
                 mount -o remount,exec "$MNT" 2>/dev/null \
                     && log_ok "Re-enabled exec: $MNT" \
                     || log_warn "Could not remount: $MNT"
                 ;;
             FSTAB_TMP)
-                sed -i '/Linux Guardian: noexec/d'    /etc/fstab 2>/dev/null
-                sed -i '/tmpfs.*noexec.*nosuid/d'     /etc/fstab 2>/dev/null
+                sed -i '/Linux Guardian: noexec/d'    /etc/fstab 2>/dev/null || true
+                sed -i '/tmpfs.*noexec.*nosuid/d'     /etc/fstab 2>/dev/null || true
                 log_ok "Removed noexec entries from /etc/fstab"
                 ;;
             MODPROBE)
-                CONF=$(echo "$line" | cut -d: -f2)
-                rm -f "$CONF" && log_ok "Removed modprobe conf: $CONF"
+                rm -f "$REST" && log_ok "Removed modprobe conf: $REST"
                 ;;
             SYSCTL)
-                CONF=$(echo "$line" | cut -d: -f2)
-                rm -f "$CONF"
-                sysctl --system &>/dev/null
-                log_ok "Removed sysctl conf: $CONF"
+                rm -f "$REST" || true
+                sysctl --system &>/dev/null || true
+                log_ok "Removed sysctl conf: $REST"
                 ;;
             APPARMOR_PROFILE)
-                PROF=$(echo "$line" | cut -d: -f2)
-                aa-complain "$PROF" 2>/dev/null && log_ok "AppArmor complain: $PROF"
+                aa-complain "$REST" 2>/dev/null && log_ok "AppArmor complain: $REST" || true
                 ;;
             AUDITD_RULE)
-                RFILE=$(echo "$line" | cut -d: -f2)
-                rm -f "$RFILE"
-                systemctl restart auditd 2>/dev/null
-                log_ok "Removed audit rules: $RFILE"
+                rm -f "$REST" || true
+                systemctl restart auditd 2>/dev/null || service auditd restart 2>/dev/null || true
+                log_ok "Removed audit rules: $REST"
                 ;;
             NSPAWN_SERVICE)
-                NSVC=$(echo "$line" | cut -d: -f2)
-                # Handle container services
-                systemctl stop    "$NSVC" 2>/dev/null || true
-                systemctl disable "$NSVC" 2>/dev/null || true
-                rm -f "/etc/systemd/system/${NSVC}.service"
-                # nspawn cleanup
-                rm -f "/etc/systemd/nspawn/${NSVC##nspawn-}.nspawn"
-
-                systemctl daemon-reload
-                log_ok "Removed: $NSVC"
+                systemctl stop    "$REST" 2>/dev/null || true
+                systemctl disable "$REST" 2>/dev/null || true
+                rm -f "/etc/systemd/system/${REST}.service"
+                rm -f "/etc/systemd/nspawn/${REST##nspawn-}.nspawn"
+                systemctl daemon-reload 2>/dev/null || true
+                log_ok "Removed: $REST"
                 ;;
         esac
     done < "$LATEST"
@@ -447,10 +441,10 @@ done
 log_info "Scanning for Python interpreters..."
 while IFS= read -r pybin; do
     secure_binary "$pybin"
-done < <(find /usr/bin /usr/sbin /usr/local/bin /usr/libexec \
+done < <({ find /usr/bin /usr/sbin /usr/local/bin /usr/libexec \
     -maxdepth 2 -type f \
     \( -name "python" -o -name "python[0-9]*" -o -name "platform-python*" \) \
-    ! -type l 2>/dev/null)
+    ! -type l 2>/dev/null || true; })
 
 log_ok "Layer 1 complete"
 
@@ -524,7 +518,8 @@ fs.protected_symlinks  = 1
 EOF
     chmod 644 "$SYSCTL_CONF"
     echo "SYSCTL:${SYSCTL_CONF}" >> "$UNDO_MANIFEST"
-    sysctl -p "$SYSCTL_CONF" 2>/dev/null && log_ok "sysctl parameters applied" \
+    sysctl -p "$SYSCTL_CONF" &>/dev/null \
+        && log_ok "sysctl parameters applied" \
         || log_warn "Some sysctl parameters failed — normal in containers/OpenVZ"
 fi
 
@@ -636,8 +631,11 @@ log_ok "Layer 4 complete"
 # ══════════════════════════════════════════════════════════════════════════════
 section "LAYER 5: PHP Security Hardening (disable_functions)"
 
+# find exits non-zero when it hits unreadable dirs — isolate with subshell
+# to prevent pipefail from killing the script
 TMPF=$(mktemp)
-find / -maxdepth 7 -type f -name "php.ini" 2>/dev/null | sort -u > "$TMPF"
+{ find / -maxdepth 7 -type f -name "php.ini" 2>/dev/null || true; } \
+    | sort -u > "$TMPF"
 while IFS= read -r line; do PHP_INI_FILES+=("$line"); done < "$TMPF"
 rm -f "$TMPF"
 
@@ -704,6 +702,29 @@ socket_connect,socket_bind,socket_listen,socket_accept,phpinfo,show_source,\
 highlight_file,symlink,link,dl,assert,create_function,parse_ini_file,\
 opcache_get_status,opcache_reset,putenv,apache_setenv"
 
+    # Declared once outside loop — avoids redeclaration and state leakage
+    declare -A PHPSEC=(
+        ["allow_url_fopen"]="Off"
+        ["allow_url_include"]="Off"
+        ["expose_php"]="Off"
+        ["display_errors"]="Off"
+        ["log_errors"]="On"
+        ["disable_classes"]="Imagick,gs"
+        ["file_uploads"]="On"
+        ["upload_tmp_dir"]="/tmp"
+        ["upload_max_filesize"]="2M"
+        ["session.cookie_httponly"]="1"
+        ["session.cookie_secure"]="1"
+        ["session.use_strict_mode"]="1"
+        ["session.use_only_cookies"]="1"
+        ["session.cookie_samesite"]="Strict"
+        ["enable_dl"]="Off"
+        ["max_execution_time"]="30"
+        ["max_input_time"]="30"
+        ["memory_limit"]="128M"
+        ["post_max_size"]="8M"
+    )
+
     for inifile in "${SELECTED_FILES[@]}"; do
         log_info "Processing: $inifile"
         backup_file "$inifile" "phpini"
@@ -730,27 +751,6 @@ opcache_get_status,opcache_reset,putenv,apache_setenv"
         # ── Global security settings ──────────────────────────────────────────
         # open_basedir is intentionally excluded here —
         # it is set per-site in PART 5.1 (PHP-FPM pool) or via .htaccess
-        declare -A PHPSEC=(
-            ["allow_url_fopen"]="Off"
-            ["allow_url_include"]="Off"
-            ["expose_php"]="Off"
-            ["display_errors"]="Off"
-            ["log_errors"]="On"
-            ["disable_classes"]="Imagick,gs"
-            ["file_uploads"]="On"
-            ["upload_tmp_dir"]="/tmp"
-            ["upload_max_filesize"]="2M"
-            ["session.cookie_httponly"]="1"
-            ["session.cookie_secure"]="1"
-            ["session.use_strict_mode"]="1"
-            ["session.use_only_cookies"]="1"
-            ["session.cookie_samesite"]="Strict"
-            ["enable_dl"]="Off"
-            ["max_execution_time"]="30"
-            ["max_input_time"]="30"
-            ["memory_limit"]="128M"
-            ["post_max_size"]="8M"
-        )
         for key in "${!PHPSEC[@]}"; do
             val="${PHPSEC[$key]}"
             if grep -qE "^\s*${key}\s*=" "$inifile"; then
@@ -761,9 +761,9 @@ opcache_get_status,opcache_reset,putenv,apache_setenv"
                 echo "${key} = ${val}" >> "$inifile"
             fi
         done
-        unset PHPSEC
         log_ok "Global security settings applied: $inifile"
     done
+    unset PHPSEC
 
     # Restart services based on PHP mode
     if [ "$DRY_RUN" = false ]; then
@@ -804,6 +804,7 @@ setup_phpfpm_pools() {
         log_skip "php-fpm not found — skipping pool configuration"
         log_info "Install: dnf install php-fpm -y  (CentOS/RHEL)"
         log_info "Install: apt install php-fpm -y  (Ubuntu/Debian)"
+        PHPFPM_SKIP=true
         return 0
     fi
     log_ok "php-fpm found: $PHPFPM_BIN"
@@ -827,6 +828,7 @@ setup_phpfpm_pools() {
             | grep -oP 'include=\K[^*]+' | head -1 | xargs dirname 2>/dev/null || true)
         [ -d "$POOL_DIR" ] || {
             log_warn "Cannot detect pool directory — skipping"
+            PHPFPM_SKIP=true
             return 0
         }
     fi
@@ -849,10 +851,14 @@ setup_phpfpm_pools() {
         [ -d "$d" ] && SITES+=("${d%/}")
     done
     [ ${#SITES[@]} -eq 0 ] && [ -d "/var/www/html" ] && SITES+=("/var/www/html")
-    mapfile -t SITES < <(printf '%s\n' "${SITES[@]}" | sort -u)
+
+    if [ ${#SITES[@]} -gt 0 ]; then
+        mapfile -t SITES < <(printf '%s\n' "${SITES[@]}" | sort -u)
+    fi
 
     if [ ${#SITES[@]} -eq 0 ]; then
         log_warn "No sites found — skipping pool creation"
+        PHPFPM_SKIP=true
         return 0
     fi
 
@@ -1054,11 +1060,18 @@ _apply_noexec_dir() {
         if [ "$DRY_RUN" = true ]; then
             log_dry "bind-mount ${mnt} noexec,nosuid,nodev"
         else
-            mount --bind "$mnt" "$mnt" 2>/dev/null
-            mount -o remount,noexec,nosuid,nodev,bind "$mnt" 2>/dev/null \
-                && log_ok "${mnt}  →  bind-mounted noexec" \
-                || log_warn "${mnt}  →  bind-mount failed"
-            echo "MOUNT_NOEXEC:${mnt}" >> "$UNDO_MANIFEST"
+            if mount --bind "$mnt" "$mnt" 2>/dev/null; then
+                if mount -o remount,noexec,nosuid,nodev,bind "$mnt" 2>/dev/null; then
+                    log_ok "${mnt}  →  bind-mounted noexec"
+                    echo "MOUNT_NOEXEC:${mnt}" >> "$UNDO_MANIFEST"
+                else
+                    log_warn "${mnt}  →  remount after bind failed"
+                    # Undo the bind since remount failed
+                    umount "$mnt" 2>/dev/null || true
+                fi
+            else
+                log_warn "${mnt}  →  bind-mount failed"
+            fi
         fi
     fi
 }
@@ -1184,11 +1197,11 @@ enable_apparmor_boot() {
 
 # ── Helper: detect distro family ─────────────────────────────────────────────
 detect_distro_family() {
-    local ID="" ID_LIKE=""
+    local _id _id_like
     if [ -f /etc/os-release ]; then
-        # shellcheck source=/dev/null
-        . /etc/os-release
-        case "${ID:-}${ID_LIKE:-}" in
+        _id=$(grep "^ID=" /etc/os-release | cut -d= -f2 | tr -d '"' || true)
+        _id_like=$(grep "^ID_LIKE=" /etc/os-release | cut -d= -f2 | tr -d '"' || true)
+        case "${_id}${_id_like}" in
             *rhel*|*centos*|*fedora*|*rocky*|*alma*) echo "rhel" ;;
             *debian*|*ubuntu*)                        echo "debian" ;;
             *alpine*)                                 echo "alpine" ;;
@@ -1256,9 +1269,13 @@ case "$MAC_SYSTEM" in
                 log_dry "fixfiles -F onboot — schedule full filesystem relabel on next boot"
             else
                 if command -v fixfiles &>/dev/null; then
-                    fixfiles -F onboot 2>/dev/null \
-                        && log_ok "SELinux: full filesystem relabel scheduled on next boot" \
-                        || log_warn "fixfiles -F onboot failed — run manually if needed"
+                    if [ -f /.autorelabel ]; then
+                        log_ok "SELinux: filesystem relabel already scheduled (/.autorelabel exists)"
+                    else
+                        fixfiles -F onboot 2>/dev/null \
+                            && log_ok "SELinux: full filesystem relabel scheduled on next boot" \
+                            || log_warn "fixfiles -F onboot failed — run manually if needed"
+                    fi
                 else
                     log_skip "fixfiles not found — install policycoreutils"
                 fi
@@ -1279,6 +1296,12 @@ case "$MAC_SYSTEM" in
                     # Pre-check — some policy versions do not support all booleans
                     if ! getsebool "$b" &>/dev/null; then
                         log_info "SELinux bool not supported on this policy version: $b (skipped)"
+                        continue
+                    fi
+                    # Skip if already set to desired value — setsebool -P is slow
+                    _current=$(getsebool "$b" 2>/dev/null | awk '{print $3}')
+                    if [ "$_current" = "${SEBOOLS[$b]}" ]; then
+                        log_ok "SELinux bool: $b = ${SEBOOLS[$b]} (already set)"
                         continue
                     fi
                     setsebool -P "$b" "${SEBOOLS[$b]}" 2>/dev/null \
@@ -1599,15 +1622,18 @@ CRONEOF
             log_ok "Auditd restarted (systemctl)"
         elif service auditd restart 2>/dev/null; then
             log_ok "Auditd restarted (service)"
-        elif kill -HUP "$(cat /var/run/auditd.pid 2>/dev/null)" 2>/dev/null; then
-            log_ok "Auditd reloaded (HUP signal)"
         else
-            log_warn "Could not restart auditd — rules will apply after next reboot"
-            log_info "Manual restart: service auditd restart"
+            _auditd_pid=$(cat /var/run/auditd.pid 2>/dev/null || true)
+            if [ -n "$_auditd_pid" ] && kill -HUP "$_auditd_pid" 2>/dev/null; then
+                log_ok "Auditd reloaded (HUP signal)"
+            else
+                log_warn "Could not restart auditd — rules will apply after next reboot"
+                log_info "Manual restart: service auditd restart"
+            fi
         fi
 
-        augenrules --load 2>/dev/null \
-            || auditctl -R "$AUDIT_RULES" 2>/dev/null \
+        augenrules --load &>/dev/null \
+            || auditctl -R "$AUDIT_RULES" &>/dev/null \
             || log_warn "Could not load rules live (will apply after reboot)"
 
         log_ok "Audit rules: $AUDIT_RULES"
@@ -1719,43 +1745,41 @@ setup_snuffleupagus() {
     log_info "PHP mode: ${PHP_MODE}"
 
     # ── Check / install ───────────────────────────────────────────────────────
-    if php -m 2>/dev/null | grep -qi "snuffleupagus"; then
-        log_ok "Snuffleupagus already installed"
-        SNUFF_INSTALLED=true
+    # If already installed and loaded — nothing to do, skip entirely
+    if { php -m 2>/dev/null || true; } | grep -qi "snuffleupagus"; then
+        log_ok "Snuffleupagus already installed and active — skipping"
+        return 0
+    fi
+    # ── Not installed — prompt or auto-skip ──────────────────────────────────
+    if [ "$DRY_RUN" = true ]; then
+        log_dry "Install Snuffleupagus via PECL (mode: ${PHP_MODE})"
+        log_dry "Create /etc/snuffleupagus/lg.rules (shared, all sites)"
+        return 0
+    elif [[ "$RUN_MODE" == "interactive" ]]; then
+        read -r -p "  Install Snuffleupagus PHP RASP? [y/N]: " -n 1
+        echo ""
+        [[ $REPLY =~ ^[Yy]$ ]] || { log_skip "Snuffleupagus skipped"; return 0; }
+    else
+        log_skip "Snuffleupagus — run interactively to install"
+        return 0
     fi
 
-    if [ "$SNUFF_INSTALLED" = false ]; then
-        if [ "$DRY_RUN" = true ]; then
-            log_dry "Install Snuffleupagus via PECL (mode: ${PHP_MODE})"
-            log_dry "Create /etc/snuffleupagus/lg.rules (shared, all sites)"
-            return 0
-        elif [[ "$RUN_MODE" == "interactive" ]]; then
-            read -r -p "  Install Snuffleupagus PHP RASP? [y/N]: " -n 1
-            echo ""
-            [[ $REPLY =~ ^[Yy]$ ]] || { log_skip "Snuffleupagus skipped"; return 0; }
-        else
-            log_skip "Snuffleupagus — run interactively to install"
-            return 0
-        fi
+    log_info "Installing build dependencies..."
+    if command -v apt-get &>/dev/null; then
+        install_pkg php-dev
+        install_pkg autoconf
+        install_pkg build-essential
+    elif command -v yum &>/dev/null || command -v dnf &>/dev/null; then
+        install_pkg php-devel
+        install_pkg autoconf
+        install_pkg gcc
+    fi
 
-        log_info "Installing build dependencies..."
-        if command -v apt-get &>/dev/null; then
-            install_pkg php-dev
-            install_pkg autoconf
-            install_pkg build-essential
-        elif command -v yum &>/dev/null || command -v dnf &>/dev/null; then
-            install_pkg php-devel
-            install_pkg autoconf
-            install_pkg gcc
-        fi
-
-        if pecl install snuffleupagus 2>&1 | tail -15; then
-            log_ok "Snuffleupagus installed via PECL"
-            SNUFF_INSTALLED=true
-        else
-            log_warn "PECL install failed — see output above"
-            return 1
-        fi
+    if pecl install snuffleupagus 2>&1 | tail -15; then
+        log_ok "Snuffleupagus installed via PECL"
+    else
+        log_warn "PECL install failed — see output above"
+        return 0
     fi
 
     # ── Locate snuffleupagus.so ───────────────────────────────────────────────
@@ -1848,6 +1872,11 @@ RULESEOF
 
         # ── PHP-FPM: add to each site pool ───────────────────────────────────
         fpm)
+            # Honour Part 5.1 skip — if pools were skipped, skip here too
+            if [ "$PHPFPM_SKIP" = true ]; then
+                log_skip "[FPM] Part 5.1 was skipped — skipping Snuffleupagus FPM injection"
+                log_info "[FPM] Install php-fpm and re-run to enable Snuffleupagus"
+            else
             POOL_DIR=$(find_pool_dir)
             if [ -z "$POOL_DIR" ]; then
                 log_warn "[FPM] Pool directory not found — falling back to php.ini"
@@ -1891,66 +1920,59 @@ EOF
                     fi
                 fi
             fi
+            fi  # end PHPFPM_SKIP check
             ;;
 
         # ── PHP-CGI: add extension to php.ini ────────────────────────────────
         # php-cgi reads php.ini on every request, so we load the extension
         # there. The rules_file is the same shared lg.rules.
         cgi)
-            INI_TARGETS=()
-            for f in "${SELECTED_FILES[@]:-}"; do
-                [ -f "$f" ] && [[ "$f" != *cli* ]] && INI_TARGETS+=("$f")
-            done
-            if [ ${#INI_TARGETS[@]} -eq 0 ]; then
-                while IFS= read -r f; do
-                    [[ "$f" == *cli* ]] && continue
-                    INI_TARGETS+=("$f")
-                done < <(find / -maxdepth 7 -type f -name "php.ini" \
-                    ! -path "*/cli/*" 2>/dev/null | sort -u)
+            # Honour the same php.ini selection made in Layer 5
+            if [ "$PHP_SKIP" = true ] || [ ${#SELECTED_FILES[@]} -eq 0 ]; then
+                log_skip "[CGI] php.ini selection was skipped in Layer 5 — skipping Snuffleupagus injection"
+                log_info "[CGI] Re-run and select php.ini files in Layer 5 to enable Snuffleupagus"
+            else
+                INI_TARGETS=()
+                for f in "${SELECTED_FILES[@]}"; do
+                    [ -f "$f" ] && [[ "$f" != *cli* ]] && INI_TARGETS+=("$f")
+                done
+                for inifile in "${INI_TARGETS[@]:-}"; do
+                    [ -f "$inifile" ] || continue
+                    if grep -q "snuffleupagus" "$inifile" 2>/dev/null; then
+                        log_info "[CGI] Already enabled: $inifile"
+                        continue
+                    fi
+                    backup_file "$inifile" "phpini_snuff"
+                    printf '\n; Snuffleupagus (Linux Guardian)\nextension=%s\nsnuffleupagus.rules_file=%s\n' \
+                        "$SNUFF_SO" "$SNUFF_RULES" >> "$inifile"
+                    log_ok "[CGI] Snuffleupagus → $inifile"
+                done
             fi
-
-            if [ ${#INI_TARGETS[@]} -eq 0 ]; then
-                log_warn "[CGI] No php.ini found — cannot enable Snuffleupagus"
-            fi
-
-            for inifile in "${INI_TARGETS[@]}"; do
-                [ -f "$inifile" ] || continue
-                if grep -q "snuffleupagus" "$inifile" 2>/dev/null; then
-                    log_info "[CGI] Already enabled: $inifile"
-                    continue
-                fi
-                backup_file "$inifile" "phpini_snuff"
-                printf '\n; Snuffleupagus (Linux Guardian)\nextension=%s\nsnuffleupagus.rules_file=%s\n' \
-                    "$SNUFF_SO" "$SNUFF_RULES" >> "$inifile"
-                log_ok "[CGI] Snuffleupagus → $inifile"
-            done
             ;;
 
         # ── mod_php: add extension to php.ini ────────────────────────────────
         mod_php)
-            INI_TARGETS=()
-            for f in "${SELECTED_FILES[@]:-}"; do
-                [ -f "$f" ] && [[ "$f" != *cli* ]] && INI_TARGETS+=("$f")
-            done
-            if [ ${#INI_TARGETS[@]} -eq 0 ]; then
-                while IFS= read -r f; do
-                    [[ "$f" == *cli* ]] && continue
-                    INI_TARGETS+=("$f")
-                done < <(find / -maxdepth 7 -type f -name "php.ini" \
-                    ! -path "*/cli/*" 2>/dev/null | sort -u)
+            # Honour the same php.ini selection made in Layer 5
+            if [ "$PHP_SKIP" = true ] || [ ${#SELECTED_FILES[@]} -eq 0 ]; then
+                log_skip "[MOD_PHP] php.ini selection was skipped in Layer 5 — skipping Snuffleupagus injection"
+                log_info "[MOD_PHP] Re-run and select php.ini files in Layer 5 to enable Snuffleupagus"
+            else
+                INI_TARGETS=()
+                for f in "${SELECTED_FILES[@]}"; do
+                    [ -f "$f" ] && [[ "$f" != *cli* ]] && INI_TARGETS+=("$f")
+                done
+                for inifile in "${INI_TARGETS[@]:-}"; do
+                    [ -f "$inifile" ] || continue
+                    if grep -q "snuffleupagus" "$inifile" 2>/dev/null; then
+                        log_info "[MOD_PHP] Already enabled: $inifile"
+                        continue
+                    fi
+                    backup_file "$inifile" "phpini_snuff"
+                    printf '\n; Snuffleupagus (Linux Guardian)\nextension=%s\nsnuffleupagus.rules_file=%s\n' \
+                        "$SNUFF_SO" "$SNUFF_RULES" >> "$inifile"
+                    log_ok "[MOD_PHP] Snuffleupagus → $inifile"
+                done
             fi
-
-            for inifile in "${INI_TARGETS[@]}"; do
-                [ -f "$inifile" ] || continue
-                if grep -q "snuffleupagus" "$inifile" 2>/dev/null; then
-                    log_info "[MOD_PHP] Already enabled: $inifile"
-                    continue
-                fi
-                backup_file "$inifile" "phpini_snuff"
-                printf '\n; Snuffleupagus (Linux Guardian)\nextension=%s\nsnuffleupagus.rules_file=%s\n' \
-                    "$SNUFF_SO" "$SNUFF_RULES" >> "$inifile"
-                log_ok "[MOD_PHP] Snuffleupagus → $inifile"
-            done
             ;;
     esac
 
@@ -2005,7 +2027,7 @@ watch_mode() {
             log_info "  CentOS/RHEL   : yum install inotify-tools -y"
             log_info "  Fedora        : dnf install inotify-tools -y"
             log_info "  Alpine        : apk add inotify-tools"
-            exit 1
+            return 1
         fi
         log_ok "inotify-tools installed"
     fi
@@ -2023,6 +2045,8 @@ watch_mode() {
     echo ""
 
     # ── Watch loop ────────────────────────────────────────────────────────────
+    # Disable pipefail for the inotifywait pipe — it exits non-zero on Ctrl+C
+    set +e
     inotifywait \
         --monitor \
         --quiet \
@@ -2032,6 +2056,7 @@ watch_mode() {
         /var/www \
         /home \
         2>/dev/null | while IFS= read -r NEW_PATH; do
+    set -e
 
         # Only care about directories
         [ -d "$NEW_PATH" ] || continue
@@ -2158,7 +2183,7 @@ watch_mode() {
                     echo "${TS} [WATCH] open_basedir added for ${SN} in ${inifile}" >> "$LOG_FILE"
                     UPDATED_INI=$((UPDATED_INI + 1))
                 fi
-            done < <(find / -maxdepth 7 -type f -name "php.ini" 2>/dev/null | sort -u)
+            done < <({ find / -maxdepth 7 -type f -name "php.ini" 2>/dev/null || true; } | sort -u)
         else
             log_info "[WATCH] FPM mode — open_basedir handled via pool.conf"
         fi
