@@ -126,8 +126,59 @@ install_pkg() {
     fi
 }
 
-# ══════════════════════════════════════════════════════════════════════════════
-# INITIALISATION
+# ── detect_php_mode: returns fpm / cgi / mod_php ─────────────────────────────
+detect_php_mode() {
+    for b in php-fpm php-fpm8.2 php-fpm8.1 php-fpm8.0 php-fpm7.4; do
+        if command -v "$b" &>/dev/null \
+           || [ -x "/usr/sbin/${b}" ] \
+           || [ -x "/usr/local/sbin/${b}" ]; then
+            echo "fpm"; return
+        fi
+    done
+    if command -v php-cgi &>/dev/null \
+       || [ -x "/usr/local/bin/php-cgi" ]; then
+        echo "cgi"; return
+    fi
+    if httpd   -M 2>/dev/null | grep -qi "php" \
+    || apache2 -M 2>/dev/null | grep -qi "php"; then
+        echo "mod_php"; return
+    fi
+    echo "mod_php"
+}
+
+# ── find_pool_dir: locate PHP-FPM pool directory ─────────────────────────────
+find_pool_dir() {
+    for d in \
+        /etc/php-fpm.d \
+        /etc/php/8.2/fpm/pool.d /etc/php/8.1/fpm/pool.d \
+        /etc/php/8.0/fpm/pool.d /etc/php/7.4/fpm/pool.d \
+        /etc/php/fpm/pool.d /usr/local/etc/php-fpm.d; do
+        [ -d "$d" ] && echo "$d" && return
+    done
+    echo ""
+}
+
+# ── restart_php_services: restart web/php services by mode ───────────────────
+restart_php_services() {
+    local mode="$1"
+    case "$mode" in
+        fpm)
+            for svc in php-fpm php8.2-fpm php8.1-fpm php8.0-fpm php7.4-fpm; do
+                systemctl is-active --quiet "$svc" 2>/dev/null \
+                    && systemctl restart "$svc" 2>/dev/null \
+                    && { log_ok "Restarted: $svc"; return; }
+            done
+            log_warn "No active php-fpm service — restart manually"
+            ;;
+        cgi|mod_php)
+            for svc in apache2 httpd nginx; do
+                systemctl is-active --quiet "$svc" 2>/dev/null \
+                    && systemctl restart "$svc" 2>/dev/null \
+                    && log_ok "Restarted: $svc"
+            done
+            ;;
+    esac
+}
 # ══════════════════════════════════════════════════════════════════════════════
 
 print_banner
@@ -560,20 +611,19 @@ socket_connect,socket_bind,socket_listen,socket_accept,phpinfo,show_source,\
 highlight_file,symlink,link,dl,assert,create_function,parse_ini_file,\
 opcache_get_status,opcache_reset,putenv,apache_setenv"
 
-    PUBLIC_HTML_PATHS=$(find /home -maxdepth 3 -type d \
-        -name "public_html" 2>/dev/null | tr '\n' ':')
-    OPEN_BASEDIR="${PUBLIC_HTML_PATHS:-/home:}/tmp:/usr/share/php:/usr/share/pear"
-
     for inifile in "${SELECTED_FILES[@]}"; do
         log_info "Processing: $inifile"
         backup_file "$inifile" "phpini"
 
         if [ "$DRY_RUN" = true ]; then
-            log_dry "Apply disable_functions + security settings → $inifile"
+            log_dry "Apply global security settings → $inifile"
+            log_dry "  disable_functions (global)"
+            log_dry "  session, error, limits (global)"
+            log_dry "  open_basedir → set per-site in PART 5.1"
             continue
         fi
 
-        # Apply disable_functions
+        # ── disable_functions (global — all sites) ────────────────────────────
         if grep -q "^disable_functions" "$inifile"; then
             sed -i "s|^disable_functions.*|disable_functions = ${DISABLE_FUNCTIONS}|" "$inifile"
         elif grep -q "^;disable_functions" "$inifile"; then
@@ -582,16 +632,17 @@ opcache_get_status,opcache_reset,putenv,apache_setenv"
             printf '\n; Linux Guardian %s\ndisable_functions = %s\n' \
                 "$TIMESTAMP" "$DISABLE_FUNCTIONS" >> "$inifile"
         fi
-        log_ok "disable_functions applied"
+        log_ok "disable_functions applied (global)"
 
-        # Apply security settings (bash 4+ associative array)
+        # ── Global security settings ──────────────────────────────────────────
+        # open_basedir is intentionally excluded here —
+        # it is set per-site in PART 5.1 (PHP-FPM pool) or via .htaccess
         declare -A PHPSEC=(
             ["allow_url_fopen"]="Off"
             ["allow_url_include"]="Off"
             ["expose_php"]="Off"
             ["display_errors"]="Off"
             ["log_errors"]="On"
-            ["open_basedir"]="${OPEN_BASEDIR}"
             ["disable_classes"]="Imagick,gs"
             ["file_uploads"]="On"
             ["upload_tmp_dir"]="/tmp"
@@ -618,27 +669,230 @@ opcache_get_status,opcache_reset,putenv,apache_setenv"
             fi
         done
         unset PHPSEC
-        log_ok "Security settings applied: $inifile"
+        log_ok "Global security settings applied: $inifile"
     done
 
-    # Restart web server(s)
-    for svc in apache2 httpd nginx php-fpm; do
-        if systemctl is-active --quiet "$svc" 2>/dev/null; then
-            if [ "$DRY_RUN" = false ]; then
-                systemctl restart "$svc" 2>/dev/null \
-                    && log_ok "Restarted: $svc" \
-                    || log_warn "Could not restart $svc — check config manually"
-            else
-                log_dry "Restart $svc"
-            fi
-        fi
-    done
+    # Restart services based on PHP mode
+    if [ "$DRY_RUN" = false ]; then
+        _L5_MODE=$(detect_php_mode 2>/dev/null || echo "mod_php")
+        restart_php_services "$_L5_MODE"
+    else
+        log_dry "Restart PHP/web services"
+    fi
 fi
 
 log_ok "Layer 5 complete"
 
 # ══════════════════════════════════════════════════════════════════════════════
-# LAYER 6 — noexec on writable directories
+# PART 5.1 — PHP-FPM Pool per Site
+# Auto-detects PHP-FPM config directory and creates isolated pool for each site
+# Each site gets: own user, open_basedir, disable_functions, session, error_log
+# ══════════════════════════════════════════════════════════════════════════════
+section "PART 5.1: PHP-FPM Pool per Site (auto-detect)"
+
+setup_phpfpm_pools() {
+
+    # ── Detect php-fpm binary ─────────────────────────────────────────────────
+    PHPFPM_BIN=""
+    for b in php-fpm php-fpm8.2 php-fpm8.1 php-fpm8.0 php-fpm7.4 php-fpm74; do
+        bp=$(command -v "$b" 2>/dev/null \
+            || { [ -x "/usr/sbin/${b}"       ] && echo "/usr/sbin/${b}"; }       \
+            || { [ -x "/usr/local/sbin/${b}" ] && echo "/usr/local/sbin/${b}"; } \
+            || { [ -x "/usr/local/bin/${b}"  ] && echo "/usr/local/bin/${b}"; }  \
+            || true)
+        bp=$(echo "$bp" | head -1)
+        if [ -n "$bp" ] && [ -x "$bp" ]; then
+            PHPFPM_BIN="$bp"
+            break
+        fi
+    done
+
+    if [ -z "$PHPFPM_BIN" ]; then
+        log_skip "php-fpm not found — skipping pool configuration"
+        log_info "Install: dnf install php-fpm -y  (CentOS/RHEL)"
+        log_info "Install: apt install php-fpm -y  (Ubuntu/Debian)"
+        return 0
+    fi
+    log_ok "php-fpm found: $PHPFPM_BIN"
+
+    # ── Detect PHP-FPM pool directory ─────────────────────────────────────────
+    POOL_DIR=""
+    for d in \
+        /etc/php-fpm.d \
+        /etc/php/8.2/fpm/pool.d \
+        /etc/php/8.1/fpm/pool.d \
+        /etc/php/8.0/fpm/pool.d \
+        /etc/php/7.4/fpm/pool.d \
+        /etc/php/fpm/pool.d \
+        /usr/local/etc/php-fpm.d; do
+        [ -d "$d" ] && POOL_DIR="$d" && break
+    done
+
+    if [ -z "$POOL_DIR" ]; then
+        log_warn "PHP-FPM pool directory not found — trying to locate..."
+        POOL_DIR=$($PHPFPM_BIN --test 2>&1 \
+            | grep -oP 'include=\K[^*]+' | head -1 | xargs dirname 2>/dev/null || true)
+        [ -d "$POOL_DIR" ] || {
+            log_warn "Cannot detect pool directory — skipping"
+            return 0
+        }
+    fi
+    log_ok "PHP-FPM pool dir: $POOL_DIR"
+
+    # ── Detect PHP-FPM service name ───────────────────────────────────────────
+    PHPFPM_SVC=""
+    for svc in php-fpm php8.2-fpm php8.1-fpm php8.0-fpm php7.4-fpm; do
+        systemctl list-units --type=service --all 2>/dev/null \
+            | grep -q "${svc}.service" && PHPFPM_SVC="$svc" && break
+    done
+    [ -z "$PHPFPM_SVC" ] && log_warn "php-fpm service not detected — will skip restart"
+
+    # ── Detect sites ──────────────────────────────────────────────────────────
+    SITES=()
+    for d in /var/www/*/; do
+        [ -d "$d" ] && [[ "$d" != "/var/www/html/" ]] && SITES+=("${d%/}")
+    done
+    for d in /home/*/public_html/; do
+        [ -d "$d" ] && SITES+=("${d%/}")
+    done
+    [ ${#SITES[@]} -eq 0 ] && [ -d "/var/www/html" ] && SITES+=("/var/www/html")
+    mapfile -t SITES < <(printf '%s\n' "${SITES[@]}" | sort -u)
+
+    if [ ${#SITES[@]} -eq 0 ]; then
+        log_warn "No sites found — skipping pool creation"
+        return 0
+    fi
+
+    log_info "Creating pools for ${#SITES[@]} site(s):"
+    for s in "${SITES[@]}"; do echo "    → $s"; done
+    echo ""
+
+    # ── Create pool per site ──────────────────────────────────────────────────
+    SESSION_BASE="/var/lib/php/sessions"
+    LOG_BASE="/var/log/php-fpm"
+    [ "$DRY_RUN" = false ] && mkdir -p "$SESSION_BASE" "$LOG_BASE"
+
+    for site in "${SITES[@]}"; do
+        # Derive site name and user
+        if [[ "$site" == /home/* ]]; then
+            SITE_NAME=$(echo "$site" | cut -d/ -f3)
+            SITE_USER="$SITE_NAME"
+            SITE_ROOT="$site"
+        else
+            SITE_NAME=$(basename "$site")
+            SITE_USER=$(stat -c '%U' "$site" 2>/dev/null || echo "www-data")
+            SITE_ROOT="$site"
+        fi
+
+        # Fallback user if system user doesn't exist
+        id "$SITE_USER" &>/dev/null || SITE_USER="www-data"
+        SITE_GROUP=$(id -gn "$SITE_USER" 2>/dev/null || echo "www-data")
+
+        # Detect web server socket owner
+        SOCK_OWNER="apache"
+        systemctl is-active --quiet nginx  2>/dev/null && SOCK_OWNER="nginx"
+        systemctl is-active --quiet apache2 2>/dev/null && SOCK_OWNER="www-data"
+
+        POOL_CONF="${POOL_DIR}/${SITE_NAME}.conf"
+        SOCK_PATH="/run/php-fpm/${SITE_NAME}.sock"
+        SESSION_PATH="${SESSION_BASE}/${SITE_NAME}"
+        ERROR_LOG="${LOG_BASE}/${SITE_NAME}-error.log"
+        OPEN_BASEDIR="${SITE_ROOT}:/tmp:/usr/share/php:/usr/share/pear"
+
+        log_info "Pool: ${SITE_NAME}  user=${SITE_USER}  root=${SITE_ROOT}"
+
+        if [ "$DRY_RUN" = true ]; then
+            log_dry "Create ${POOL_CONF}"
+            log_dry "  user=${SITE_USER}  open_basedir=${OPEN_BASEDIR}"
+            continue
+        fi
+
+        mkdir -p "$SESSION_PATH" 2>/dev/null
+        chown "${SITE_USER}:${SITE_GROUP}" "$SESSION_PATH" 2>/dev/null
+        chmod 700 "$SESSION_PATH" 2>/dev/null
+        backup_file "$POOL_CONF" "phpfpm_pool"
+
+        cat > "$POOL_CONF" << EOF
+; ══════════════════════════════════════════════════════
+; Linux Guardian — PHP-FPM Pool: ${SITE_NAME}
+; Generated: ${TIMESTAMP}
+;
+; Global settings (disable_functions, session security,
+; limits) are inherited from php.ini
+; Per-site: open_basedir + session path + logging
+; ══════════════════════════════════════════════════════
+
+[${SITE_NAME}]
+
+; ── Process user ───────────────────────────────────────
+user  = ${SITE_USER}
+group = ${SITE_GROUP}
+
+; ── Socket ─────────────────────────────────────────────
+listen       = ${SOCK_PATH}
+listen.owner = ${SOCK_OWNER}
+listen.group = ${SOCK_OWNER}
+listen.mode  = 0660
+
+; ── Process management ─────────────────────────────────
+pm                   = dynamic
+pm.max_children      = 10
+pm.start_servers     = 2
+pm.min_spare_servers = 1
+pm.max_spare_servers = 3
+pm.max_requests      = 500
+
+; ── Per-site: open_basedir ─────────────────────────────
+; Restricts file access to this site's directory only
+php_admin_value[open_basedir] = ${OPEN_BASEDIR}
+
+; ── Per-site: session isolation ────────────────────────
+; Each site stores sessions in its own directory
+php_value[session.save_handler] = files
+php_value[session.save_path]    = ${SESSION_PATH}
+
+; ── Per-site: logging ──────────────────────────────────
+php_admin_value[error_log] = ${ERROR_LOG}
+access.log                 = ${LOG_BASE}/${SITE_NAME}-access.log
+slowlog                    = ${LOG_BASE}/${SITE_NAME}-slow.log
+request_slowlog_timeout    = 5s
+EOF
+
+        chmod 640 "$POOL_CONF"
+        echo "FILE:${POOL_CONF}:${BACKUP_DIR}/phpfpm_pool_${SITE_NAME}.${TIMESTAMP}" \
+            >> "$UNDO_MANIFEST"
+        log_ok "Pool created: $POOL_CONF"
+    done
+
+    # ── Validate and restart php-fpm ──────────────────────────────────────────
+    if [ "$DRY_RUN" = false ]; then
+        echo ""
+        if $PHPFPM_BIN --test 2>/dev/null; then
+            log_ok "PHP-FPM config test passed"
+        else
+            log_warn "PHP-FPM config test failed — check pool files"
+            $PHPFPM_BIN --test 2>&1 | tail -10
+        fi
+
+        if [ -n "$PHPFPM_SVC" ]; then
+            systemctl enable "$PHPFPM_SVC" 2>/dev/null
+            systemctl restart "$PHPFPM_SVC" 2>/dev/null \
+                && log_ok "PHP-FPM restarted: $PHPFPM_SVC" \
+                || log_warn "Could not restart $PHPFPM_SVC — restart manually"
+
+            echo ""
+            log_info "Verify pools:"
+            echo "    systemctl status ${PHPFPM_SVC}"
+            echo "    ls ${POOL_DIR}/"
+            echo "    ls /run/php-fpm/"
+        fi
+    fi
+}
+
+setup_phpfpm_pools
+
+log_ok "Part 5.1 complete"
+
 # Auto-detects site roots and applies noexec to prevent binary execution
 # ══════════════════════════════════════════════════════════════════════════════
 section "LAYER 6: noexec on writable directories (auto-detect)"
@@ -1064,42 +1318,210 @@ fi
 log_ok "Part A complete"
 
 # ══════════════════════════════════════════════════════════════════════════════
+# ══════════════════════════════════════════════════════════════════════════════
 # PART B — Snuffleupagus (PHP RASP)
-# Additional PHP protection layer on top of disable_functions
+# Auto-detects PHP mode (FPM / CGI / mod_php)
+# One shared rules file for ALL sites
 # ══════════════════════════════════════════════════════════════════════════════
 section "PART B: Snuffleupagus — PHP RASP"
 
-if php -m 2>/dev/null | grep -qi "snuffleupagus"; then
-    log_ok "Snuffleupagus already installed and active"
-    SNUFF_INSTALLED=true
-    SNUFF_SKIP=false
-elif [ "$DRY_RUN" = true ]; then
-    log_dry "Install Snuffleupagus PHP extension via PECL"
-    SNUFF_SKIP=true
-elif [[ "$RUN_MODE" == "interactive" ]]; then
-    read -r -p "  Install Snuffleupagus PHP RASP? [y/N]: " -n 1
-    echo ""
-    [[ $REPLY =~ ^[Yy]$ ]] && SNUFF_SKIP=false || SNUFF_SKIP=true
-else
-    SNUFF_SKIP=true
-    log_skip "Snuffleupagus — run interactively to install"
-fi
+# ── Main setup function ───────────────────────────────────────────────────────
+setup_snuffleupagus() {
 
-if [ "$SNUFF_SKIP" = false ] && [ "$SNUFF_INSTALLED" = false ]; then
-    if command -v apt-get &>/dev/null; then
-        install_pkg php-dev; install_pkg autoconf; install_pkg build-essential
-    elif command -v yum &>/dev/null || command -v dnf &>/dev/null; then
-        install_pkg php-devel; install_pkg autoconf
+    PHP_MODE=$(detect_php_mode)
+    log_info "PHP mode: ${PHP_MODE}"
+
+    # ── Check / install ───────────────────────────────────────────────────────
+    if php -m 2>/dev/null | grep -qi "snuffleupagus"; then
+        log_ok "Snuffleupagus already installed"
+        SNUFF_INSTALLED=true
     fi
-    pecl install snuffleupagus 2>&1 | tail -15
-    if [ $? -eq 0 ]; then
-        log_ok "Snuffleupagus installed"
-        log_info "Add to php.ini: extension=snuffleupagus.so"
-        log_info "Config sample:  /usr/local/etc/php/snuffleupagus.rules"
-    else
-        log_warn "PECL install failed — see output above"
+
+    if [ "$SNUFF_INSTALLED" = false ]; then
+        if [ "$DRY_RUN" = true ]; then
+            log_dry "Install Snuffleupagus via PECL (mode: ${PHP_MODE})"
+            log_dry "Create /etc/snuffleupagus/lg.rules (shared, all sites)"
+            return 0
+        elif [[ "$RUN_MODE" == "interactive" ]]; then
+            read -r -p "  Install Snuffleupagus PHP RASP? [y/N]: " -n 1
+            echo ""
+            [[ $REPLY =~ ^[Yy]$ ]] || { log_skip "Snuffleupagus skipped"; return 0; }
+        else
+            log_skip "Snuffleupagus — run interactively to install"
+            return 0
+        fi
+
+        log_info "Installing build dependencies..."
+        if command -v apt-get &>/dev/null; then
+            install_pkg php-dev
+            install_pkg autoconf
+            install_pkg build-essential
+        elif command -v yum &>/dev/null || command -v dnf &>/dev/null; then
+            install_pkg php-devel
+            install_pkg autoconf
+            install_pkg gcc
+        fi
+
+        pecl install snuffleupagus 2>&1 | tail -15
+        if [ $? -eq 0 ]; then
+            log_ok "Snuffleupagus installed via PECL"
+            SNUFF_INSTALLED=true
+        else
+            log_warn "PECL install failed — see output above"
+            return 1
+        fi
     fi
-fi
+
+    # ── Locate snuffleupagus.so ───────────────────────────────────────────────
+    SNUFF_SO=$(find /usr/lib/php /usr/local/lib/php \
+        -name "snuffleupagus.so" 2>/dev/null | head -1)
+    [ -z "$SNUFF_SO" ] && \
+        SNUFF_SO="$(php -r "echo ini_get('extension_dir');" 2>/dev/null)/snuffleupagus.so"
+
+    if [ ! -f "$SNUFF_SO" ]; then
+        log_warn "snuffleupagus.so not found at: $SNUFF_SO"
+        log_info "Try: find / -name snuffleupagus.so 2>/dev/null"
+        return 1
+    fi
+    log_ok "snuffleupagus.so: $SNUFF_SO"
+
+    # ── One shared rules file for ALL sites ───────────────────────────────────
+    SNUFF_DIR="/etc/snuffleupagus"
+    SNUFF_RULES="${SNUFF_DIR}/lg.rules"
+    mkdir -p "$SNUFF_DIR"
+    chmod 755 "$SNUFF_DIR"
+
+    cat > "$SNUFF_RULES" << 'RULESEOF'
+# ══════════════════════════════════════════════════════════════════════════════
+# Linux Guardian — Snuffleupagus Rules (shared — all sites)
+# ══════════════════════════════════════════════════════════════════════════════
+
+# ── Disable dangerous execution functions ─────────────────────────────────────
+sp.disable_function.function("system").drop();
+sp.disable_function.function("exec").drop();
+sp.disable_function.function("shell_exec").drop();
+sp.disable_function.function("passthru").drop();
+sp.disable_function.function("popen").drop();
+sp.disable_function.function("proc_open").drop();
+sp.disable_function.function("pcntl_exec").drop();
+sp.disable_function.function("pcntl_fork").drop();
+sp.disable_function.function("posix_setuid").drop();
+sp.disable_function.function("posix_setgid").drop();
+sp.disable_function.function("posix_seteuid").drop();
+sp.disable_function.function("posix_setegid").drop();
+
+# ── Eval — log first, switch to .drop() when confident ───────────────────────
+sp.disable_function.function("eval").log();
+
+# ── Cookie protection ─────────────────────────────────────────────────────────
+sp.cookie.name("*").encrypt().samesite("Strict").readonly();
+
+# ── Block dangerous upload extensions ────────────────────────────────────────
+sp.upload.disable_upload.extensions("php,phtml,phar,php7,php8,pht").drop();
+
+# ── XXE protection ────────────────────────────────────────────────────────────
+sp.xxe_protection.enable();
+
+# ── Unserialize HMAC — prevent object injection ───────────────────────────────
+sp.unserialize_hmac.enable();
+
+# ── Global strict mode ────────────────────────────────────────────────────────
+sp.global_strict.enable();
+RULESEOF
+
+    chmod 640 "$SNUFF_RULES"
+    log_ok "Shared rules: $SNUFF_RULES"
+
+    # ── Enable in PHP based on detected mode ──────────────────────────────────
+    case "$PHP_MODE" in
+
+        fpm)
+            # Add to every pool conf that doesn't have it yet
+            POOL_DIR=$(find_pool_dir)
+            if [ -z "$POOL_DIR" ]; then
+                log_warn "[FPM] Pool directory not found — falling back to php.ini"
+                PHP_MODE="mod_php"  # will fall through to php.ini block below
+            else
+                ADDED_POOLS=0
+                for pool_conf in "${POOL_DIR}"/*.conf; do
+                    [ -f "$pool_conf" ] || continue
+                    [[ "$(basename "$pool_conf")" == "www.conf" ]] && continue  # skip default
+                    if ! grep -q "snuffleupagus" "$pool_conf" 2>/dev/null; then
+                        backup_file "$pool_conf" "phpfpm_snuff"
+                        cat >> "$pool_conf" << EOF
+
+; ── Snuffleupagus (Linux Guardian) ───────────────────
+php_admin_value[extension]                = ${SNUFF_SO}
+php_admin_value[snuffleupagus.rules_file] = ${SNUFF_RULES}
+EOF
+                        log_ok "[FPM] Enabled in pool: $(basename "$pool_conf")"
+                        ADDED_POOLS=$((ADDED_POOLS+1))
+                    else
+                        log_info "[FPM] Already in pool: $(basename "$pool_conf")"
+                    fi
+                done
+
+                # If no lg pools found — add to www.conf as fallback
+                if [ "$ADDED_POOLS" -eq 0 ]; then
+                    log_info "[FPM] No site pools found — adding to www.conf"
+                    WWW_CONF="${POOL_DIR}/www.conf"
+                    if [ -f "$WWW_CONF" ] && ! grep -q "snuffleupagus" "$WWW_CONF"; then
+                        backup_file "$WWW_CONF" "phpfpm_snuff"
+                        cat >> "$WWW_CONF" << EOF
+
+; ── Snuffleupagus (Linux Guardian) ───────────────────
+php_admin_value[extension]                = ${SNUFF_SO}
+php_admin_value[snuffleupagus.rules_file] = ${SNUFF_RULES}
+EOF
+                        log_ok "[FPM] Enabled in www.conf"
+                    fi
+                fi
+            fi
+            ;;
+    esac
+
+    # mod_php / cgi / fpm fallback → add to php.ini
+    if [[ "$PHP_MODE" == "cgi" || "$PHP_MODE" == "mod_php" ]]; then
+        INI_TARGETS=()
+
+        # Use files selected in LAYER 5 if available
+        for f in "${SELECTED_FILES[@]:-}"; do
+            [ -f "$f" ] && [[ "$f" != *cli* ]] && INI_TARGETS+=("$f")
+        done
+
+        # Fallback: search all php.ini files
+        if [ ${#INI_TARGETS[@]} -eq 0 ]; then
+            while IFS= read -r f; do
+                [[ "$f" == *cli* ]] && continue
+                INI_TARGETS+=("$f")
+            done < <(find / -maxdepth 7 -type f -name "php.ini" \
+                ! -path "*/cli/*" 2>/dev/null | sort -u)
+        fi
+
+        for inifile in "${INI_TARGETS[@]}"; do
+            [ -f "$inifile" ] || continue
+            if grep -q "snuffleupagus" "$inifile" 2>/dev/null; then
+                log_info "[${PHP_MODE^^}] Already in: $inifile"
+                continue
+            fi
+            backup_file "$inifile" "phpini_snuff"
+            printf '\n; Snuffleupagus (Linux Guardian)\nextension=%s\nsnuffleupagus.rules_file=%s\n' \
+                "$SNUFF_SO" "$SNUFF_RULES" >> "$inifile"
+            log_ok "[${PHP_MODE^^}] Enabled in: $inifile"
+        done
+    fi
+
+    # ── Restart ───────────────────────────────────────────────────────────────
+    echo ""
+    restart_php_services "$PHP_MODE"
+
+    echo ""
+    log_ok "Rules file:  $SNUFF_RULES"
+    log_info "Verify:    php -m | grep -i snuffleupagus"
+    log_info "Edit rules: $SNUFF_RULES"
+}
+
+setup_snuffleupagus
 
 log_ok "Part B complete"
 
@@ -1558,11 +1980,8 @@ watch_mode() {
         UPDATED_INI=0
         while IFS= read -r inifile; do
             [ -f "$inifile" ] || continue
-            # Skip CLI php.ini — open_basedir not needed there
             [[ "$inifile" == *cli* ]] && continue
-
             if grep -qE "^\s*open_basedir\s*=" "$inifile"; then
-                # Append new path if not already present
                 CURRENT=$(grep -E "^\s*open_basedir\s*=" "$inifile" | head -1)
                 if ! echo "$CURRENT" | grep -q "$NEW_PATH"; then
                     sed -i "s|^\s*open_basedir\s*=.*|&:${NEW_PATH}|" "$inifile"
@@ -1576,11 +1995,92 @@ watch_mode() {
             fi
         done < <(find / -maxdepth 7 -type f -name "php.ini" 2>/dev/null | sort -u)
 
+        # ── Create PHP-FPM pool for new site ──────────────────────────────────
+        W_POOL_DIR=""
+        for d in \
+            /etc/php-fpm.d \
+            /etc/php/8.2/fpm/pool.d /etc/php/8.1/fpm/pool.d \
+            /etc/php/8.0/fpm/pool.d /etc/php/7.4/fpm/pool.d \
+            /etc/php/fpm/pool.d /usr/local/etc/php-fpm.d; do
+            [ -d "$d" ] && W_POOL_DIR="$d" && break
+        done
+
+        POOL_CREATED=0
+        if [ -n "$W_POOL_DIR" ]; then
+            W_SITE_USER=$(stat -c '%U' "$NEW_PATH" 2>/dev/null || echo "www-data")
+            id "$W_SITE_USER" &>/dev/null || W_SITE_USER="www-data"
+            W_SITE_GROUP=$(id -gn "$W_SITE_USER" 2>/dev/null || echo "www-data")
+            W_SOCK_OWNER="apache"
+            systemctl is-active --quiet nginx   2>/dev/null && W_SOCK_OWNER="nginx"
+            systemctl is-active --quiet apache2 2>/dev/null && W_SOCK_OWNER="www-data"
+
+            W_POOL_CONF="${W_POOL_DIR}/${SN}.conf"
+            W_SESSION_PATH="/var/lib/php/sessions/${SN}"
+            W_OPEN_BASEDIR="${NEW_PATH}:/tmp:/usr/share/php:/usr/share/pear"
+
+            mkdir -p "$W_SESSION_PATH" 2>/dev/null
+            chown "${W_SITE_USER}:${W_SITE_GROUP}" "$W_SESSION_PATH" 2>/dev/null
+            chmod 700 "$W_SESSION_PATH" 2>/dev/null
+
+            cat > "$W_POOL_CONF" << POOLEOF
+; Linux Guardian — PHP-FPM Pool: ${SN}
+; Generated: ${TS}
+; Global settings inherited from php.ini
+; Per-site: open_basedir + session + logging
+
+[${SN}]
+user  = ${W_SITE_USER}
+group = ${W_SITE_GROUP}
+
+listen       = /run/php-fpm/${SN}.sock
+listen.owner = ${W_SOCK_OWNER}
+listen.group = ${W_SOCK_OWNER}
+listen.mode  = 0660
+
+pm                   = dynamic
+pm.max_children      = 10
+pm.start_servers     = 2
+pm.min_spare_servers = 1
+pm.max_spare_servers = 3
+pm.max_requests      = 500
+
+; Per-site: open_basedir only
+php_admin_value[open_basedir]   = ${W_OPEN_BASEDIR}
+
+; Per-site: session isolation
+php_value[session.save_handler] = files
+php_value[session.save_path]    = ${W_SESSION_PATH}
+
+; Per-site: logging
+php_admin_value[error_log]      = /var/log/php-fpm/${SN}-error.log
+access.log                      = /var/log/php-fpm/${SN}-access.log
+slowlog                         = /var/log/php-fpm/${SN}-slow.log
+request_slowlog_timeout         = 5s
+POOLEOF
+            chmod 640 "$W_POOL_CONF"
+
+            # Restart php-fpm
+            for svc in php-fpm php8.2-fpm php8.1-fpm php8.0-fpm php7.4-fpm; do
+                if systemctl is-active --quiet "$svc" 2>/dev/null; then
+                    systemctl restart "$svc" 2>/dev/null \
+                        && { echo -e "  ${GREEN}[OK]${NC}      PHP-FPM pool created + restarted: $svc"
+                             echo "${TS} [WATCH] PHP-FPM pool created: ${W_POOL_CONF}" >> "$LOG_FILE"
+                             POOL_CREATED=1; } \
+                        || true
+                    break
+                fi
+            done
+            [ "$POOL_CREATED" -eq 0 ] && {
+                echo -e "  ${GREEN}[OK]${NC}      PHP-FPM pool created: ${W_POOL_CONF}"
+                echo -e "  ${YELLOW}[WARN]${NC}    php-fpm service not running — restart manually"
+                echo "${TS} [WATCH] PHP-FPM pool created (fpm not running): ${W_POOL_CONF}" >> "$LOG_FILE"
+            }
+        fi
+
         if [ "$UPDATED_INI" -gt 0 ]; then
             echo -e "  ${GREEN}[OK]${NC}      open_basedir updated in ${UPDATED_INI} php.ini file(s)"
             echo "${TS} [WATCH] open_basedir updated in ${UPDATED_INI} php.ini(s) for ${SN}" >> "$LOG_FILE"
-            # Restart web server to apply changes
-            for svc in apache2 httpd nginx php-fpm; do
+            for svc in apache2 httpd nginx; do
                 systemctl is-active --quiet "$svc" 2>/dev/null \
                     && systemctl restart "$svc" 2>/dev/null \
                     && echo -e "  ${GREEN}[OK]${NC}      Restarted: ${svc}" \
@@ -1591,12 +2091,15 @@ watch_mode() {
         # ── Summary for this site ─────────────────────────────────────────────
         echo ""
         echo -e "  ${BOLD}${SN} hardening summary:${NC}"
-        echo -e "    [9] Podman isolation  →  $(systemctl is-active "nspawn-${SN}.service" 2>/dev/null || echo 'failed')"
+        echo -e "    [9] Podman isolation  →  $(podman ps --format '{{.Names}}' 2>/dev/null | grep -q "^lg-${SN}$" && echo 'running' || echo 'failed')"
         mount 2>/dev/null | grep -qE " on ${NEW_PATH} .*noexec" \
             && echo -e "    [6] noexec            →  active" \
             || echo -e "    [6] noexec            →  failed"
-        echo -e "    [5] open_basedir      →  updated in ${UPDATED_INI} file(s)"
-        echo "${TS} [WATCH] ${SN} complete: Podman + noexec + open_basedir" >> "$LOG_FILE"
+        echo -e "    [5] open_basedir      →  updated in ${UPDATED_INI} php.ini file(s)"
+        [ "$POOL_CREATED" -eq 1 ] \
+            && echo -e "    [5] PHP-FPM pool      →  created (${W_POOL_DIR}/${SN}.conf)" \
+            || echo -e "    [5] PHP-FPM pool      →  $([ -n "$W_POOL_DIR" ] && echo 'created (fpm not running)' || echo 'skipped (fpm not installed)')"
+        echo "${TS} [WATCH] ${SN} complete: Podman + noexec + open_basedir + PHP-FPM pool" >> "$LOG_FILE"
 
         # Add to known sites so we don't process it again
         KNOWN_SITES+=("$SN")
