@@ -26,6 +26,14 @@
 
 set -euo pipefail
 
+# ─── Colours ────────────────────────────────────────────────────────────────
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+CYAN='\033[0;36m'
+BOLD='\033[1m'
+NC='\033[0m'
+
 # ─── Trap: clean exit on error ───────────────────────────────────────────────
 _lg_exit() {
     local code=$?
@@ -34,14 +42,6 @@ _lg_exit() {
     echo -e "  ${YELLOW}[WARN]${NC}    Some layers may be incomplete — review log: ${LOG_FILE:-/var/log/lg-hardening.log}" >&2
 }
 trap '_lg_exit' EXIT
-
-# ─── Colours ────────────────────────────────────────────────────────────────
-RED='\033[0;31m'
-GREEN='\033[0;32m'
-YELLOW='\033[1;33m'
-CYAN='\033[0;36m'
-BOLD='\033[1m'
-NC='\033[0m'
 
 # ─── Banner ──────────────────────────────────────────────────────────────────
 print_banner() {
@@ -114,6 +114,51 @@ secure_binary() {
     else
         log_skip "$bin"
     fi
+}
+
+# ─── svc_running: check if a service is active ───────────────────────────────
+svc_running() {
+    local svc
+    for svc in "$@"; do
+        systemctl is-active --quiet "$svc" 2>/dev/null && return 0
+        service "$svc" status &>/dev/null 2>&1         && return 0
+        pgrep -x "$svc" &>/dev/null                    && return 0
+    done
+    return 1
+}
+
+# ─── svc_installed: check if binary exists ───────────────────────────────────
+svc_installed() {
+    local bin
+    for bin in "$@"; do
+        command -v "$bin" &>/dev/null               && return 0
+        [ -x "/usr/sbin/${bin}"       ]             && return 0
+        [ -x "/usr/bin/${bin}"        ]             && return 0
+        [ -x "/usr/local/sbin/${bin}" ]             && return 0
+        [ -x "/usr/local/bin/${bin}"  ]             && return 0
+    done
+    return 1
+}
+
+# ─── find_conf: locate a config file from a list of candidate paths ──────────
+# Usage: find_conf /etc/my.cnf /etc/mysql/my.cnf ...
+# Prints the first found path; returns 1 if none found
+find_conf() {
+    local f
+    for f in "$@"; do
+        [ -f "$f" ] && echo "$f" && return 0
+    done
+    return 1
+}
+
+# ─── find_conf_deep: full filesystem search for a config file ────────────────
+# Usage: find_conf_deep "my.cnf" [maxdepth]
+# Prints first match; used as fallback when find_conf fails
+find_conf_deep() {
+    local name="$1" depth="${2:-8}"
+    find / -maxdepth "$depth" -type f -name "$name" \
+        ! -path "*/proc/*" ! -path "*/sys/*" ! -path "*/dev/*" \
+        2>/dev/null | head -1
 }
 
 # ─── install_pkg: cross-distro package install ───────────────────────────────
@@ -346,17 +391,17 @@ fi
 if [ "$DRY_RUN" = false ]; then
     section "Pre-flight: Updating System Packages"
     if command -v apt-get &>/dev/null; then
-        DEBIAN_FRONTEND=noninteractive apt-get update -qq   2>&1 | tail -2
-        DEBIAN_FRONTEND=noninteractive apt-get upgrade -y -qq 2>&1 | tail -2
+        DEBIAN_FRONTEND=noninteractive apt-get update -qq   2>&1 | tail -2 || true
+        DEBIAN_FRONTEND=noninteractive apt-get upgrade -y -qq 2>&1 | tail -2 || true
         log_ok "Packages updated (apt)"
     elif command -v dnf &>/dev/null; then
-        dnf update -y -q 2>&1 | tail -3 && log_ok "Packages updated (dnf)"
+        dnf update -y -q 2>&1 | tail -3 && log_ok "Packages updated (dnf)" || log_warn "dnf update failed — continuing"
     elif command -v yum &>/dev/null; then
-        yum update -y -q 2>&1 | tail -3 && log_ok "Packages updated (yum)"
+        yum update -y -q 2>&1 | tail -3 && log_ok "Packages updated (yum)" || log_warn "yum update failed — continuing"
     elif command -v apk &>/dev/null; then
-        apk update -q && apk upgrade -q && log_ok "Packages updated (apk)"
+        apk update -q && apk upgrade -q && log_ok "Packages updated (apk)" || log_warn "apk update failed — continuing"
     elif command -v pacman &>/dev/null; then
-        pacman -Syu --noconfirm -q 2>&1 | tail -3 && log_ok "Packages updated (pacman)"
+        pacman -Syu --noconfirm -q 2>&1 | tail -3 && log_ok "Packages updated (pacman)" || log_warn "pacman update failed — continuing"
     else
         log_warn "No supported package manager found"
     fi
@@ -434,8 +479,8 @@ EOF
 fi
 
 for mod in dccp sctp rds tipc rxrpc esp4 esp6; do
-    if lsmod 2>/dev/null | grep -q "^${mod} "; then
-        run_cmd rmmod "$mod" 2>/dev/null && log_ok "Unloaded: $mod"
+    if lsmod 2>/dev/null | grep -q "^${mod} " 2>/dev/null; then
+        run_cmd rmmod "$mod" 2>/dev/null && log_ok "Unloaded: $mod" || true
     else
         log_skip "Not loaded: $mod"
     fi
@@ -474,7 +519,8 @@ fs.protected_symlinks  = 1
 EOF
     chmod 644 "$SYSCTL_CONF"
     echo "SYSCTL:${SYSCTL_CONF}" >> "$UNDO_MANIFEST"
-    sysctl -p "$SYSCTL_CONF" &>/dev/null && log_ok "sysctl parameters applied"
+    sysctl -p "$SYSCTL_CONF" 2>/dev/null && log_ok "sysctl parameters applied" \
+        || log_warn "Some sysctl parameters failed — normal in containers/OpenVZ"
 fi
 
 log_ok "Layer 2 complete"
@@ -521,30 +567,60 @@ log_ok "Layer 3 complete"
 # ══════════════════════════════════════════════════════════════════════════════
 section "LAYER 4: MySQL / MariaDB Hardening"
 
-MY_CNF=""
-for f in /etc/my.cnf /etc/mysql/my.cnf \
-         /etc/my.cnf.d/server.cnf /etc/my.cnf.d/mariadb-server.cnf; do
-    [ -f "$f" ] && MY_CNF="$f" && break
-done
-
-if [ -n "$MY_CNF" ]; then
-    log_info "Config: $MY_CNF"
-    backup_file "$MY_CNF" "mysql"
-    if [ "$DRY_RUN" = true ]; then
-        log_dry "Set bind-address = 127.0.0.1 in $MY_CNF"
-    else
-        if grep -q "^bind-address" "$MY_CNF" 2>/dev/null; then
-            sed -i 's/^bind-address.*/bind-address = 127.0.0.1/' "$MY_CNF"
-        else
-            printf '\n# Linux Guardian\nbind-address = 127.0.0.1\n' >> "$MY_CNF"
-        fi
-        log_ok "bind-address = 127.0.0.1"
-        systemctl restart mariadb 2>/dev/null \
-            || systemctl restart mysqld 2>/dev/null \
-            || log_warn "Could not restart DB — restart manually"
-    fi
+# ── Step 1: Check if service is installed ────────────────────────────────────
+if ! svc_installed mysqld mariadbd mysql mariadb; then
+    log_skip "MySQL/MariaDB not installed — skipping"
 else
-    log_skip "MySQL/MariaDB config not found"
+    log_info "MySQL/MariaDB detected"
+
+    # ── Step 2: Locate config file ───────────────────────────────────────────
+    MY_CNF=$(find_conf \
+        /etc/my.cnf \
+        /etc/mysql/my.cnf \
+        /etc/my.cnf.d/server.cnf \
+        /etc/my.cnf.d/mariadb-server.cnf \
+        /etc/mysql/mariadb.conf.d/50-server.cnf \
+        /usr/local/etc/my.cnf) || true
+
+    # fallback: deep filesystem search
+    if [ -z "$MY_CNF" ]; then
+        log_info "Searching filesystem for my.cnf..."
+        MY_CNF=$(find_conf_deep "my.cnf") || true
+    fi
+
+    if [ -z "$MY_CNF" ]; then
+        log_warn "MySQL/MariaDB installed but config file not found — skipping"
+    else
+        log_info "Config: $MY_CNF"
+        backup_file "$MY_CNF" "mysql"
+
+        if [ "$DRY_RUN" = true ]; then
+            log_dry "Set bind-address = 127.0.0.1 in $MY_CNF"
+        else
+            # ── Step 3: Apply change ─────────────────────────────────────────
+            if grep -q "^bind-address" "$MY_CNF" 2>/dev/null; then
+                sed -i 's/^bind-address.*/bind-address = 127.0.0.1/' "$MY_CNF"
+            else
+                printf '\n# Linux Guardian\nbind-address = 127.0.0.1\n' >> "$MY_CNF"
+            fi
+            log_ok "bind-address = 127.0.0.1"
+
+            # ── Step 4: Restart service ──────────────────────────────────────
+            if systemctl restart mariadb 2>/dev/null; then
+                log_ok "MariaDB restarted"
+            elif systemctl restart mysqld 2>/dev/null; then
+                log_ok "MySQL restarted"
+            elif systemctl restart mysql 2>/dev/null; then
+                log_ok "MySQL restarted"
+            elif service mariadb restart 2>/dev/null; then
+                log_ok "MariaDB restarted (service)"
+            elif service mysqld restart 2>/dev/null; then
+                log_ok "MySQL restarted (service)"
+            else
+                log_warn "Could not restart DB — restart manually"
+            fi
+        fi
+    fi
 fi
 
 log_ok "Layer 4 complete"
@@ -556,10 +632,9 @@ log_ok "Layer 4 complete"
 section "LAYER 5: PHP Security Hardening (disable_functions)"
 
 TMPF=$(mktemp)
-trap 'rm -f "$TMPF"' EXIT INT TERM
 find / -maxdepth 7 -type f -name "php.ini" 2>/dev/null | sort -u > "$TMPF"
 while IFS= read -r line; do PHP_INI_FILES+=("$line"); done < "$TMPF"
-rm -f "$TMPF"; trap - EXIT INT TERM
+rm -f "$TMPF"
 
 if [ ${#PHP_INI_FILES[@]} -eq 0 ]; then
     log_warn "No php.ini found — skipping PHP hardening"
@@ -826,49 +901,49 @@ setup_phpfpm_pools() {
         backup_file "$POOL_CONF" "phpfpm_pool"
 
         cat > "$POOL_CONF" << EOF
-        ; ══════════════════════════════════════════════════════
-        ; Linux Guardian — PHP-FPM Pool: ${SITE_NAME}
-        ; Generated: ${TIMESTAMP}
-        ;
-        ; Global settings (disable_functions, session security,
-        ; limits) are inherited from php.ini
-        ; Per-site: open_basedir + session path + logging
-        ; ══════════════════════════════════════════════════════
+; ══════════════════════════════════════════════════════
+; Linux Guardian — PHP-FPM Pool: ${SITE_NAME}
+; Generated: ${TIMESTAMP}
+;
+; Global settings (disable_functions, session security,
+; limits) are inherited from php.ini
+; Per-site: open_basedir + session path + logging
+; ══════════════════════════════════════════════════════
 
-        [${SITE_NAME}]
+[${SITE_NAME}]
 
-        ; ── Process user ───────────────────────────────────────
-        user  = ${SITE_USER}
-        group = ${SITE_GROUP}
+; ── Process user ───────────────────────────────────────
+user  = ${SITE_USER}
+group = ${SITE_GROUP}
 
-        ; ── Socket ─────────────────────────────────────────────
-        listen       = ${SOCK_PATH}
-        listen.owner = ${SOCK_OWNER}
-        listen.group = ${SOCK_OWNER}
-        listen.mode  = 0660
+; ── Socket ─────────────────────────────────────────────
+listen       = ${SOCK_PATH}
+listen.owner = ${SOCK_OWNER}
+listen.group = ${SOCK_OWNER}
+listen.mode  = 0660
 
-        ; ── Process management ─────────────────────────────────
-        pm                   = dynamic
-        pm.max_children      = 10
-        pm.start_servers     = 2
-        pm.min_spare_servers = 1
-        pm.max_spare_servers = 3
-        pm.max_requests      = 500
+; ── Process management ─────────────────────────────────
+pm                   = dynamic
+pm.max_children      = 10
+pm.start_servers     = 2
+pm.min_spare_servers = 1
+pm.max_spare_servers = 3
+pm.max_requests      = 500
 
-        ; ── Per-site: open_basedir ─────────────────────────────
-        ; Restricts file access to this site's directory only
-        php_admin_value[open_basedir] = ${OPEN_BASEDIR}
+; ── Per-site: open_basedir ─────────────────────────────
+; Restricts file access to this site's directory only
+php_admin_value[open_basedir] = ${OPEN_BASEDIR}
 
-        ; ── Per-site: session isolation ────────────────────────
-        ; Each site stores sessions in its own directory
-        php_value[session.save_handler] = files
-        php_value[session.save_path]    = ${SESSION_PATH}
+; ── Per-site: session isolation ────────────────────────
+; Each site stores sessions in its own directory
+php_value[session.save_handler] = files
+php_value[session.save_path]    = ${SESSION_PATH}
 
-        ; ── Per-site: logging ──────────────────────────────────
-        php_admin_value[error_log] = ${ERROR_LOG}
-        access.log                 = ${LOG_BASE}/${SITE_NAME}-access.log
-        slowlog                    = ${LOG_BASE}/${SITE_NAME}-slow.log
-        request_slowlog_timeout    = 5s
+; ── Per-site: logging ──────────────────────────────────
+php_admin_value[error_log] = ${ERROR_LOG}
+access.log                 = ${LOG_BASE}/${SITE_NAME}-access.log
+slowlog                    = ${LOG_BASE}/${SITE_NAME}-slow.log
+request_slowlog_timeout    = 5s
 EOF
 
         chmod 640 "$POOL_CONF"
@@ -1013,8 +1088,10 @@ detect_site_roots() {
             | awk '{print $NF}' | tr -d '"')
     done
 
-    # Deduplicate
-    printf '%s\n' "${roots[@]}" | sort -u
+    # Deduplicate — only print if roots has entries
+    if [ ${#roots[@]} -gt 0 ]; then
+        printf '%s\n' "${roots[@]}" | sort -u
+    fi
 }
 
 # ── Apply noexec to /tmp and /var/tmp ─────────────────────────────────────────
@@ -1194,9 +1271,14 @@ case "$MAC_SYSTEM" in
                     ["httpd_can_network_relay"]="off"
                 )
                 for b in "${!SEBOOLS[@]}"; do
+                    # Pre-check — some policy versions do not support all booleans
+                    if ! getsebool "$b" &>/dev/null; then
+                        log_info "SELinux bool not supported on this policy version: $b (skipped)"
+                        continue
+                    fi
                     setsebool -P "$b" "${SEBOOLS[$b]}" 2>/dev/null \
                         && log_ok "SELinux bool: $b = ${SEBOOLS[$b]}" \
-                        || log_skip "Bool not available: $b"
+                        || log_warn "Failed to set bool: $b"
                 done
                 unset SEBOOLS
             fi
@@ -1385,16 +1467,19 @@ section "LAYER 8: Auditd — Monitoring & Alerts"
 
 AUDIT_RULES="/etc/audit/rules.d/99-lg-hardening.rules"
 
-if ! command -v auditctl &>/dev/null; then
+# ── Step 1: Check if auditd is installed, install if missing ──────────────
+if ! svc_installed auditctl auditd; then
     if [ "$DRY_RUN" = true ]; then
         log_dry "Install auditd package"
     else
-        log_info "Installing auditd..."
+        log_info "auditd not found — installing..."
         install_pkg "auditd" || install_pkg "audit" || true
     fi
 fi
 
-if command -v auditctl &>/dev/null || [ "$DRY_RUN" = true ]; then
+if ! svc_installed auditctl auditd && [ "$DRY_RUN" = false ]; then
+    log_warn "auditd not available and could not be installed — skipping Layer 8"
+else
     if [ "$DRY_RUN" = true ]; then
         log_dry "Create $AUDIT_RULES monitoring:"
         echo "    • exec in /tmp /var/tmp       (webshell)"
@@ -1503,10 +1588,18 @@ CRONEOF
             log_ok "Fallback cron alert installed: ${AUDIT_CRON}"
         fi
 
-        systemctl enable auditd 2>/dev/null
-        systemctl restart auditd 2>/dev/null \
-            && log_ok "Auditd restarted" \
-            || log_warn "Could not restart auditd"
+        systemctl enable auditd 2>/dev/null || true
+        # Try multiple restart methods (CWP / OpenVZ may block systemctl)
+        if systemctl restart auditd 2>/dev/null; then
+            log_ok "Auditd restarted (systemctl)"
+        elif service auditd restart 2>/dev/null; then
+            log_ok "Auditd restarted (service)"
+        elif kill -HUP "$(cat /var/run/auditd.pid 2>/dev/null)" 2>/dev/null; then
+            log_ok "Auditd reloaded (HUP signal)"
+        else
+            log_warn "Could not restart auditd — rules will apply after next reboot"
+            log_info "Manual restart: service auditd restart"
+        fi
 
         augenrules --load 2>/dev/null \
             || auditctl -R "$AUDIT_RULES" 2>/dev/null \
@@ -1517,9 +1610,7 @@ CRONEOF
         log_info "Search:   ausearch -k webshell -ts recent"
         log_info "Report:   aureport --start today"
     fi
-else
-    log_warn "auditd not available and could not be installed"
-fi
+fi  # end auditd installed check
 
 log_ok "Layer 8 complete"
 
@@ -1529,25 +1620,49 @@ log_ok "Layer 8 complete"
 # ══════════════════════════════════════════════════════════════════════════════
 section "PART A: FTP Security (Pure-FTPd + ClamAV)"
 
-if [ -f /etc/pure-ftpd.conf ]; then
-    backup_file "/etc/pure-ftpd.conf" "pureftpd"
-    if [ "$DRY_RUN" = true ]; then
-        log_dry "Enable CallUploadScript in /etc/pure-ftpd.conf"
-    else
-        if grep -q "^CallUploadScript" /etc/pure-ftpd.conf; then
-            sed -i 's/^CallUploadScript.*/CallUploadScript yes/' /etc/pure-ftpd.conf
-        else
-            echo "CallUploadScript yes" >> /etc/pure-ftpd.conf
-        fi
-        log_ok "CallUploadScript enabled"
-    fi
+# ── Step 1: Check if Pure-FTPd is installed ─────────────────────────────────
+if ! svc_installed pure-ftpd pure-ftpd-mysql pure-ftpd-postgresql; then
+    log_skip "Pure-FTPd not installed — skipping FTP + ClamAV"
 else
-    log_skip "Pure-FTPd not installed"
-fi
+    log_info "Pure-FTPd detected"
 
-if [ -d /etc/pure-ftpd ] && [ "$DRY_RUN" = false ]; then
-    log_info "ClamAV alert email: ${ALERT_EMAIL}"
-    cat > /etc/pure-ftpd/clamav_check.sh << CLAMAVEOF
+    # ── Step 2: Locate config file ───────────────────────────────────────────
+    PUREFTPD_CONF=$(find_conf \
+        /etc/pure-ftpd.conf \
+        /etc/pure-ftpd/pure-ftpd.conf \
+        /usr/local/etc/pure-ftpd.conf \
+        /usr/local/etc/pure-ftpd/pure-ftpd.conf) || true
+
+    # fallback: deep filesystem search
+    if [ -z "$PUREFTPD_CONF" ]; then
+        log_info "Searching filesystem for pure-ftpd.conf..."
+        PUREFTPD_CONF=$(find_conf_deep "pure-ftpd.conf") || true
+    fi
+
+    if [ -z "$PUREFTPD_CONF" ]; then
+        log_warn "Pure-FTPd installed but config not found — CallUploadScript not set"
+    else
+        log_info "Config: $PUREFTPD_CONF"
+        backup_file "$PUREFTPD_CONF" "pureftpd"
+
+        if [ "$DRY_RUN" = true ]; then
+            log_dry "Enable CallUploadScript in $PUREFTPD_CONF"
+        else
+            # ── Step 3: Apply change ─────────────────────────────────────────
+            if grep -q "^CallUploadScript" "$PUREFTPD_CONF"; then
+                sed -i 's/^CallUploadScript.*/CallUploadScript yes/' "$PUREFTPD_CONF"
+            else
+                echo "CallUploadScript yes" >> "$PUREFTPD_CONF"
+            fi
+            log_ok "CallUploadScript enabled in $PUREFTPD_CONF"
+        fi
+    fi
+
+    # ── Step 4: Create ClamAV scanner ────────────────────────────────────────
+    if [ "$DRY_RUN" = false ]; then
+        mkdir -p /etc/pure-ftpd
+        log_info "ClamAV alert email: ${ALERT_EMAIL}"
+        cat > /etc/pure-ftpd/clamav_check.sh << CLAMAVEOF
 #!/bin/bash
 # Linux Guardian — ClamAV upload scanner
 MAXSIZE=10485760
@@ -1562,12 +1677,25 @@ if [ "\${UPLOAD_SIZE:-0}" -le "\$MAXSIZE" ] && command -v clamdscan &>/dev/null;
     fi
 fi
 CLAMAVEOF
-    chmod 750 /etc/pure-ftpd/clamav_check.sh
-    log_ok "ClamAV scanner created: /etc/pure-ftpd/clamav_check.sh"
-    pkill -f pure-uploadscript 2>/dev/null || true
-    /usr/sbin/pure-uploadscript -B -r /etc/pure-ftpd/clamav_check.sh 2>/dev/null \
-        && log_ok "pure-uploadscript started" \
-        || log_warn "pure-uploadscript failed (ensure Pure-FTPd is running)"
+        chmod 750 /etc/pure-ftpd/clamav_check.sh
+        log_ok "ClamAV scanner: /etc/pure-ftpd/clamav_check.sh"
+
+        pkill -f pure-uploadscript 2>/dev/null || true
+        /usr/sbin/pure-uploadscript -B -r /etc/pure-ftpd/clamav_check.sh 2>/dev/null \
+            && log_ok "pure-uploadscript started" \
+            || log_warn "pure-uploadscript failed — ensure Pure-FTPd is running"
+
+        # ── Step 5: Restart Pure-FTPd to activate CallUploadScript ─────────────
+        if systemctl restart pure-ftpd 2>/dev/null; then
+            log_ok "Pure-FTPd restarted"
+        elif systemctl restart pure-ftpd-mysql 2>/dev/null; then
+            log_ok "Pure-FTPd (mysql) restarted"
+        elif service pure-ftpd restart 2>/dev/null; then
+            log_ok "Pure-FTPd restarted (service)"
+        else
+            log_warn "Could not restart Pure-FTPd — restart manually: systemctl restart pure-ftpd"
+        fi
+    fi
 fi
 
 log_ok "Part A complete"
@@ -1616,8 +1744,7 @@ setup_snuffleupagus() {
             install_pkg gcc
         fi
 
-        pecl install snuffleupagus 2>&1 | tail -15
-        if [ $? -eq 0 ]; then
+        if pecl install snuffleupagus 2>&1 | tail -15; then
             log_ok "Snuffleupagus installed via PECL"
             SNUFF_INSTALLED=true
         else
@@ -1646,41 +1773,41 @@ setup_snuffleupagus() {
     chmod 755 "$SNUFF_DIR"
 
     cat > "$SNUFF_RULES" << 'RULESEOF'
-    # ══════════════════════════════════════════════════════════════════════════════
-    # Linux Guardian — Snuffleupagus Rules (shared — all sites)
-    # ══════════════════════════════════════════════════════════════════════════════
+# ══════════════════════════════════════════════════════════════════════════════
+# Linux Guardian — Snuffleupagus Rules (shared — all sites)
+# ══════════════════════════════════════════════════════════════════════════════
 
-    # ── Disable dangerous execution functions ─────────────────────────────────────
-    sp.disable_function.function("system").drop();
-    sp.disable_function.function("exec").drop();
-    sp.disable_function.function("shell_exec").drop();
-    sp.disable_function.function("passthru").drop();
-    sp.disable_function.function("popen").drop();
-    sp.disable_function.function("proc_open").drop();
-    sp.disable_function.function("pcntl_exec").drop();
-    sp.disable_function.function("pcntl_fork").drop();
-    sp.disable_function.function("posix_setuid").drop();
-    sp.disable_function.function("posix_setgid").drop();
-    sp.disable_function.function("posix_seteuid").drop();
-    sp.disable_function.function("posix_setegid").drop();
+# ── Disable dangerous execution functions ─────────────────────────────────────
+sp.disable_function.function("system").drop();
+sp.disable_function.function("exec").drop();
+sp.disable_function.function("shell_exec").drop();
+sp.disable_function.function("passthru").drop();
+sp.disable_function.function("popen").drop();
+sp.disable_function.function("proc_open").drop();
+sp.disable_function.function("pcntl_exec").drop();
+sp.disable_function.function("pcntl_fork").drop();
+sp.disable_function.function("posix_setuid").drop();
+sp.disable_function.function("posix_setgid").drop();
+sp.disable_function.function("posix_seteuid").drop();
+sp.disable_function.function("posix_setegid").drop();
 
-    # ── Eval — log first, switch to .drop() when confident ───────────────────────
-    sp.disable_function.function("eval").log();
+# ── Eval — log first, switch to .drop() when confident ───────────────────────
+sp.disable_function.function("eval").log();
 
-    # ── Cookie protection ─────────────────────────────────────────────────────────
-    sp.cookie.name("*").encrypt().samesite("Strict").readonly();
+# ── Cookie protection ─────────────────────────────────────────────────────────
+sp.cookie.name("*").encrypt().samesite("Strict").readonly();
 
-    # ── Block dangerous upload extensions ────────────────────────────────────────
-    sp.upload.disable_upload.extensions("php,phtml,phar,php7,php8,pht").drop();
+# ── Block dangerous upload extensions ────────────────────────────────────────
+sp.upload.disable_upload.extensions("php,phtml,phar,php7,php8,pht").drop();
 
-    # ── XXE protection ────────────────────────────────────────────────────────────
-    sp.xxe_protection.enable();
+# ── XXE protection ────────────────────────────────────────────────────────────
+sp.xxe_protection.enable();
 
-    # ── Unserialize HMAC — prevent object injection ───────────────────────────────
-    sp.unserialize_hmac.enable();
+# ── Unserialize HMAC — prevent object injection ───────────────────────────────
+sp.unserialize_hmac.enable();
 
-    # ── Global strict mode ────────────────────────────────────────────────────────
-    sp.global_strict.enable();
+# ── Global strict mode ────────────────────────────────────────────────────────
+sp.global_strict.enable();
 RULESEOF
 
     chmod 640 "$SNUFF_RULES"
@@ -1705,10 +1832,10 @@ RULESEOF
                         backup_file "$pool_conf" "phpfpm_snuff"
                         cat >> "$pool_conf" << EOF
 
-                        ; ── Snuffleupagus (Linux Guardian) ───────────────────
-                        ; Loaded per-pool so each site uses the shared rules
-                        php_admin_value[extension]                = ${SNUFF_SO}
-                        php_admin_value[snuffleupagus.rules_file] = ${SNUFF_RULES}
+; ── Snuffleupagus (Linux Guardian) ───────────────────
+; Loaded per-pool so each site uses the shared rules
+php_admin_value[extension]                = ${SNUFF_SO}
+php_admin_value[snuffleupagus.rules_file] = ${SNUFF_RULES}
 EOF
                         log_ok "[FPM] Snuffleupagus → pool: $(basename "$pool_conf")"
                         ADDED_POOLS=$((ADDED_POOLS+1))
@@ -1724,9 +1851,9 @@ EOF
                         backup_file "$WWW_CONF" "phpfpm_snuff"
                         cat >> "$WWW_CONF" << EOF
 
-                        ; ── Snuffleupagus (Linux Guardian) ───────────────────
-                        php_admin_value[extension]                = ${SNUFF_SO}
-                        php_admin_value[snuffleupagus.rules_file] = ${SNUFF_RULES}
+; ── Snuffleupagus (Linux Guardian) ───────────────────
+php_admin_value[extension]                = ${SNUFF_SO}
+php_admin_value[snuffleupagus.rules_file] = ${SNUFF_RULES}
 EOF
                         log_ok "[FPM] Snuffleupagus → www.conf (fallback)"
                     else
@@ -2028,39 +2155,39 @@ watch_mode() {
             chmod 700 "$W_SESSION_PATH" 2>/dev/null
 
             cat > "$W_POOL_CONF" << POOLEOF
-            ; Linux Guardian — PHP-FPM Pool: ${SN}
-            ; Generated: ${TS}
-            ; Global settings inherited from php.ini
-            ; Per-site: open_basedir + session + logging
+; Linux Guardian — PHP-FPM Pool: ${SN}
+; Generated: ${TS}
+; Global settings inherited from php.ini
+; Per-site: open_basedir + session + logging
 
-            [${SN}]
-            user  = ${W_SITE_USER}
-            group = ${W_SITE_GROUP}
+[${SN}]
+user  = ${W_SITE_USER}
+group = ${W_SITE_GROUP}
 
-            listen       = /run/php-fpm/${SN}.sock
-            listen.owner = ${W_SOCK_OWNER}
-            listen.group = ${W_SOCK_OWNER}
-            listen.mode  = 0660
+listen       = /run/php-fpm/${SN}.sock
+listen.owner = ${W_SOCK_OWNER}
+listen.group = ${W_SOCK_OWNER}
+listen.mode  = 0660
 
-            pm                   = dynamic
-            pm.max_children      = 10
-            pm.start_servers     = 2
-            pm.min_spare_servers = 1
-            pm.max_spare_servers = 3
-            pm.max_requests      = 500
+pm                   = dynamic
+pm.max_children      = 10
+pm.start_servers     = 2
+pm.min_spare_servers = 1
+pm.max_spare_servers = 3
+pm.max_requests      = 500
 
-            ; Per-site: open_basedir only
-            php_admin_value[open_basedir]   = ${W_OPEN_BASEDIR}
+; Per-site: open_basedir only
+php_admin_value[open_basedir]   = ${W_OPEN_BASEDIR}
 
-            ; Per-site: session isolation
-            php_value[session.save_handler] = files
-            php_value[session.save_path]    = ${W_SESSION_PATH}
+; Per-site: session isolation
+php_value[session.save_handler] = files
+php_value[session.save_path]    = ${W_SESSION_PATH}
 
-            ; Per-site: logging
-            php_admin_value[error_log]      = /var/log/php-fpm/${SN}-error.log
-            access.log                      = /var/log/php-fpm/${SN}-access.log
-            slowlog                         = /var/log/php-fpm/${SN}-slow.log
-            request_slowlog_timeout         = 5s
+; Per-site: logging
+php_admin_value[error_log]      = /var/log/php-fpm/${SN}-error.log
+access.log                      = /var/log/php-fpm/${SN}-access.log
+slowlog                         = /var/log/php-fpm/${SN}-slow.log
+request_slowlog_timeout         = 5s
 POOLEOF
             chmod 640 "$W_POOL_CONF"
 
@@ -2109,10 +2236,6 @@ POOLEOF
 
 # ── Entry point for --watch ───────────────────────────────────────────────────
 if [[ "${1:-}" == "--watch" ]]; then
-    if [ "$(id -u)" -ne 0 ]; then
-        log_error "Watch mode must be run as root"
-        exit 1
-    fi
     watch_mode
     exit 0
 fi
@@ -2165,7 +2288,7 @@ echo ""
 if [ "$DRY_RUN" = false ]; then
     echo -e "${BOLD}${YELLOW}"
     echo "════════════════════════════════════════════════════════════════════"
-    echo "  ⚠  SERVER WILL REBOOT IN 10 SECONDS TO APPLY SELinux RELABEL"
+    echo "  SERVER WILL REBOOT IN 10 SECONDS TO APPLY SELinux RELABEL"
     echo "  Press Ctrl+C to cancel"
     echo "════════════════════════════════════════════════════════════════════"
     echo -e "${NC}"
