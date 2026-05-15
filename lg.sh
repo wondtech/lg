@@ -2343,7 +2343,7 @@ echo ""
 if [ "$DRY_RUN" = false ]; then
     echo -e "${BOLD}${YELLOW}"
     echo "════════════════════════════════════════════════════════════════════"
-    echo "  ⚠  SERVER WILL REBOOT IN 10 SECONDS TO APPLY SELinux RELABEL"
+    echo "  SERVER WILL REBOOT IN 10 SECONDS TO APPLY SELinux RELABEL"
     echo "  Press Ctrl+C to cancel"
     echo "════════════════════════════════════════════════════════════════════"
     echo -e "${NC}"
