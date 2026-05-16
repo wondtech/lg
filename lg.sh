@@ -803,6 +803,7 @@ _lg_auto_analyze() {
 # FUNCTION: _lg_status — Security status dashboard
 # ══════════════════════════════════════════════════════════════════════════════
 _lg_status() {
+    set +e
     local LAST_RUN="unknown"
     [ -f "$LG_STATE_FILE" ] && LAST_RUN=$(cat "$LG_STATE_FILE" 2>/dev/null || echo "unknown")
 
@@ -844,24 +845,22 @@ _lg_status() {
     fi
 
     # [5] PHP
-    local _dfuncs=0
+    local _dfuncs
     _dfuncs=$(php -r 'echo ini_get("disable_functions");' 2>/dev/null \
         | tr ',' '\n' \
         | sed '/^\s*$/d' \
-        | wc -l || echo 0) || _dfuncs=0
-    _dfuncs=$(echo "$_dfuncs" | tr -d '[:space:]')
-    case "$_dfuncs" in ''|*[!0-9]*) _dfuncs=0 ;; esac
+        | wc -l)
     [ "$_dfuncs" -gt 5 ] && _PHP=0 || _PHP=1
     _st "$_PHP" "[5] PHP disable_functions — $( [ $_PHP -eq 0 ] && echo "active (${_dfuncs} functions)" || echo 'not applied')"
 
     # [5.1] PHP-FPM Pools
     echo ""
-    echo "  ${BOLD}[PHP-FPM]${NC} Status check"
+    echo -e "  ${BOLD}[PHP-FPM]${NC} Status check"
 
     if systemctl is-active --quiet php-fpm 2>/dev/null; then
-        echo "  ${GREEN}✓${NC} PHP-FPM service — running"
+        echo -e "  ${GREEN}✓${NC} PHP-FPM service — running"
     else
-        echo "  ${RED}✗${NC} PHP-FPM service — not running"
+        echo -e "  ${RED}✗${NC} PHP-FPM service — not running"
     fi
 
     _pools=$(ps aux 2>/dev/null \
@@ -872,7 +871,7 @@ _lg_status() {
     _pools=$(echo "$_pools" | tr -d '[:space:]')
     case "$_pools" in ''|*[!0-9]*) _pools=0 ;; esac
 
-    echo "  ${CYAN}i${NC} Active pools  — $_pools"
+    echo -e "  ${CYAN}i${NC} Active pools  — $_pools"
 
     _users=$(ps aux 2>/dev/null \
         | grep "php-fpm: pool" \
@@ -884,7 +883,7 @@ _lg_status() {
     _users=$(echo "$_users" | tr -d '[:space:]')
     case "$_users" in ''|*[!0-9]*) _users=0 ;; esac
 
-    echo "  ${CYAN}i${NC} Pool users    — $_users"
+    echo -e "  ${CYAN}i${NC} Pool users    — $_users"
 
     # [5.2] Panel
     local _panel="none"
@@ -987,6 +986,7 @@ _lg_status() {
     echo -e "  ${CYAN}Run 'sudo lg --undo'      to rollback${NC}"
     echo "────────────────────────────────────────────────────────────────────────"
     echo ""
+    set -e
 }
 
 # ══════════════════════════════════════════════════════════════════════════════
