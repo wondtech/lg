@@ -2,7 +2,7 @@
 
 <img src="https://lg.wondtech.com/logo.png" alt="Linux Guardian" width="200">
 
-**Linux Guardian v1.1** — Production-Ready Linux Server Security Hardening
+**[Linux Guardian v1.1](https://lg.wondtech.com/)** — Production-Ready Linux Server Security Hardening https://lg.wondtech.com/
 
 ## Overview
 
