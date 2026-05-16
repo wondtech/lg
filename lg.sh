@@ -856,12 +856,12 @@ _lg_status() {
 
     # [5.1] PHP-FPM Pools
     echo ""
-    echo -e "  ${BOLD}[PHP-FPM]${NC} Status check"
+    echo "  ${BOLD}[PHP-FPM]${NC} Status check"
 
     if systemctl is-active --quiet php-fpm 2>/dev/null; then
-        echo -e "  ${GREEN}✓${NC} PHP-FPM service — running"
+        echo "  ${GREEN}✓${NC} PHP-FPM service — running"
     else
-        echo -e "  ${RED}✗${NC} PHP-FPM service — not running"
+        echo "  ${RED}✗${NC} PHP-FPM service — not running"
     fi
 
     _pools=$(ps aux 2>/dev/null \
@@ -872,7 +872,7 @@ _lg_status() {
     _pools=$(echo "$_pools" | tr -d '[:space:]')
     case "$_pools" in ''|*[!0-9]*) _pools=0 ;; esac
 
-    echo -e "  ${CYAN}i${NC} Active pools  — $_pools"
+    echo "  ${CYAN}i${NC} Active pools  — $_pools"
 
     _users=$(ps aux 2>/dev/null \
         | grep "php-fpm: pool" \
@@ -884,7 +884,7 @@ _lg_status() {
     _users=$(echo "$_users" | tr -d '[:space:]')
     case "$_users" in ''|*[!0-9]*) _users=0 ;; esac
 
-    echo -e "  ${CYAN}i${NC} Pool users    — $_users"
+    echo "  ${CYAN}i${NC} Pool users    — $_users"
 
     # [5.2] Panel
     local _panel="none"
