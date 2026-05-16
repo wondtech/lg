@@ -192,7 +192,7 @@ Database: `/root/lg/integrity.db`
 sudo lg --update
 ```
 
-Downloads latest version from `http://lg.wondtech.com/lg.sh`, verifies syntax with `bash -n`, backs up current version, installs if newer.
+Downloads latest version from `https://lg.wondtech.com/lg.sh`, verifies syntax with `bash -n`, backs up current version, installs if newer.
 
 ## Interactive Prompts (first run)
 
