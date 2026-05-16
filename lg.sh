@@ -890,7 +890,7 @@ _lg_status() {
             _vmail_ctx=$(stat -c '%C' "$_vmail_dir" 2>/dev/null \
                 | grep -oE '[a-z_]+_t' \
                 | head -1)
-            if echo "$_vmail_ctx" | grep -E "mail_spool_t|dovecot_var_t"; then
+            if echo "$_vmail_ctx" | grep -qE "mail_spool_t|dovecot_var_t"; then
                 echo -e "  ${GREEN}✓${NC} vmail context            — ${_vmail_ctx}"
             else
                 echo -e "  ${RED}✗${NC} vmail context            — ${_vmail_ctx} (run: sudo lg --fixmail)"
