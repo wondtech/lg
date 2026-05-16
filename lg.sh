@@ -971,7 +971,7 @@ _lg_status() {
 # FUNCTION: _lg_update — Download and install latest version
 # ══════════════════════════════════════════════════════════════════════════════
 _lg_update() {
-    local UPDATE_URL="http://lg.wondtech.com/lg.sh"
+    local UPDATE_URL="https://lg.wondtech.com/lg.sh"
     local INSTALL_PATH
     INSTALL_PATH=$(readlink -f "$0" 2>/dev/null || echo "/usr/local/bin/lg")
     local TMP_FILE
