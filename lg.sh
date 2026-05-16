@@ -844,11 +844,13 @@ _lg_status() {
     fi
 
     # [5] PHP
-    local _dfuncs
+    local _dfuncs=0
     _dfuncs=$(php -r 'echo ini_get("disable_functions");' 2>/dev/null \
         | tr ',' '\n' \
         | sed '/^\s*$/d' \
-        | wc -l)
+        | wc -l || echo 0) || _dfuncs=0
+    _dfuncs=$(echo "$_dfuncs" | tr -d '[:space:]')
+    case "$_dfuncs" in ''|*[!0-9]*) _dfuncs=0 ;; esac
     [ "$_dfuncs" -gt 5 ] && _PHP=0 || _PHP=1
     _st "$_PHP" "[5] PHP disable_functions — $( [ $_PHP -eq 0 ] && echo "active (${_dfuncs} functions)" || echo 'not applied')"
 
@@ -856,25 +858,10 @@ _lg_status() {
     echo ""
     echo -e "  ${BOLD}[PHP-FPM]${NC} Status check"
 
-    # Detect PHP-FPM service — varies by distro and panel
-    _FPMSERVICE=""
-    for _svc in php-fpm php8.2-fpm php8.1-fpm php8.0-fpm php7.4-fpm \
-                php7.3-fpm php7.2-fpm php7.1-fpm php7.0-fpm \
-                php56-php-fpm php-fpm74 php-fpm80 php-fpm81 php-fpm82; do
-        systemctl is-active --quiet "$_svc" 2>/dev/null \
-            && _FPMSERVICE="$_svc" && break
-    done
-    # CWP manages PHP-FPM internally via cwpsrv — check process directly
-    if [ -z "$_FPMSERVICE" ]; then
-        pgrep -x php-fpm &>/dev/null \
-            && _FPMSERVICE="php-fpm (process)" || true
-    fi
-
-    if [ -n "$_FPMSERVICE" ]; then
-        echo -e "  ${GREEN}✓${NC} PHP-FPM service — running (${_FPMSERVICE})"
+    if systemctl is-active --quiet php-fpm 2>/dev/null; then
+        echo -e "  ${GREEN}✓${NC} PHP-FPM service — running"
     else
-        echo -e "  ${YELLOW}!${NC} PHP-FPM service — not running as standalone"
-        echo -e "    ${CYAN}(panel may handle PHP-FPM internally)${NC}"
+        echo -e "  ${RED}✗${NC} PHP-FPM service — not running"
     fi
 
     _pools=$(ps aux 2>/dev/null \
