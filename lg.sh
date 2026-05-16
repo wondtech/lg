@@ -1474,7 +1474,34 @@ else
     # Protect hardlinks and symlinks (/tmp race attacks)
     fs.protected_hardlinks = 1
     fs.protected_symlinks  = 1
+    # Slub allocator hardening — prevents heap exploitation
+    kernel.slab_nomerge = 1
 EOF
+    # Disable unprivileged user namespaces only if no container runtime detected
+    # Affected: Docker, Podman, LXC/LXD, containerd, Chrome/Firefox sandbox,
+    #           Flatpak, Snap, bubblewrap
+    _NS_SKIP=false
+    _NS_REASON=""
+    command -v docker     &>/dev/null && _NS_SKIP=true && _NS_REASON="docker"
+    command -v podman     &>/dev/null && _NS_SKIP=true && _NS_REASON="podman"
+    command -v lxc        &>/dev/null && _NS_SKIP=true && _NS_REASON="lxc"
+    command -v lxd        &>/dev/null && _NS_SKIP=true && _NS_REASON="lxd"
+    command -v flatpak    &>/dev/null && _NS_SKIP=true && _NS_REASON="flatpak"
+    command -v snap       &>/dev/null && _NS_SKIP=true && _NS_REASON="snap"
+    command -v bwrap      &>/dev/null && _NS_SKIP=true && _NS_REASON="bubblewrap"
+    systemctl is-active --quiet docker      2>/dev/null && _NS_SKIP=true && _NS_REASON="docker service"
+    systemctl is-active --quiet containerd  2>/dev/null && _NS_SKIP=true && _NS_REASON="containerd"
+    systemctl is-active --quiet lxd         2>/dev/null && _NS_SKIP=true && _NS_REASON="lxd service"
+    systemctl is-active --quiet podman      2>/dev/null && _NS_SKIP=true && _NS_REASON="podman service"
+ 
+    if [ "$_NS_SKIP" = false ]; then
+        echo "# Disable unprivileged user namespaces (privilege escalation vector)" \
+            >> "$SYSCTL_CONF"
+        echo "user.max_user_namespaces = 0" >> "$SYSCTL_CONF"
+        log_ok "user.max_user_namespaces = 0 (no container runtime detected)"
+    else
+        log_skip "user.max_user_namespaces — ${_NS_REASON} detected, keeping enabled"
+    fi
     chmod 644 "$SYSCTL_CONF"
     echo "SYSCTL:${SYSCTL_CONF}" >> "$UNDO_MANIFEST"
     sysctl -p "$SYSCTL_CONF" &>/dev/null \
