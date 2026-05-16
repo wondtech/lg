@@ -1,7 +1,7 @@
 #!/bin/bash
 # ══════════════════════════════════════════════════════════════════════════════
 # Linux Guardian v1.1 — Production-Ready Server Security Hardening
-# By WondTech.com | info@wondtech.com
+# By Mogbil Sourketti WondTech.com | info@wondtech.com
 #
 # Security Layers (Defence in Depth):
 #   [1] Binary Lockdown       — Restrict dangerous tools
