@@ -1004,7 +1004,39 @@ if [ "$(id -u)" -ne 0 ]; then
     exit 1
 fi
 
-# ── Handle special-mode flags BEFORE anything else ───────────────────────────
+# Parse arguments
+RUN_MODE="interactive"
+DRY_RUN=false
+UNDO_MODE=false
+FIXMAIL_MODE=false
+SCAN_MODE=false
+AUTO_ANALYZE_MODE=false
+INTEGRITY_MODE=false
+FORCE_MODE=false
+UPDATE_MODE=false
+
+LG_STATE_FILE="/root/lg/.applied"
+LG_SCAN_LOG="/var/log/lg-scan.log"
+LG_ANALYZE_LOG="/var/log/lg-analyze.log"
+LG_INTEGRITY_DB="/root/lg/integrity.db"
+
+for arg in "$@"; do
+    case "$arg" in
+        --cron)           RUN_MODE="cron" ;;
+        --auto)           RUN_MODE="auto" ;;
+        --dry-run)        DRY_RUN=true ;;
+        --undo)           UNDO_MODE=true ;;
+        --watch)          ;;
+        --force)          FORCE_MODE=true ;;
+        --fixmail)        FIXMAIL_MODE=true ;;
+        --scan)           SCAN_MODE=true ;;
+        --auto-analyze)   AUTO_ANALYZE_MODE=true ;;
+        --integrity)      INTEGRITY_MODE=true ;;
+        --update)         UPDATE_MODE=true ;;
+    esac
+done
+
+# ── Handle special-mode flags ─────────────────────────────────────────────────
 
 if [ "$UPDATE_MODE" = true ]; then
     _lg_update
@@ -1063,22 +1095,6 @@ if [ -f "$LG_STATE_FILE" ] && \
     _lg_status
     exit 0
 fi
-
-# Parse arguments
-RUN_MODE="interactive"
-DRY_RUN=false
-UNDO_MODE=false
-FIXMAIL_MODE=false
-SCAN_MODE=false
-AUTO_ANALYZE_MODE=false
-INTEGRITY_MODE=false
-FORCE_MODE=false
-UPDATE_MODE=false
-
-LG_STATE_FILE="/root/lg/.applied"
-LG_SCAN_LOG="/var/log/lg-scan.log"
-LG_ANALYZE_LOG="/var/log/lg-analyze.log"
-LG_INTEGRITY_DB="/root/lg/integrity.db"
 
 for arg in "$@"; do
     case "$arg" in
