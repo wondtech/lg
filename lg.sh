@@ -545,24 +545,18 @@ _lg_analyze() {
     echo -e "  ${BOLD}[PROC]${NC} Suspicious processes:"
     local PROC_ISSUES=0
     # Processes running from /tmp or /dev/shm
-    while IFS= read -r proc; do
-        echo -e "    ${RED}⚠${NC} Process from /tmp|/dev: $proc"
-        echo "[WARN] Suspicious process: $proc" >> "$LG_ANALYZE_LOG"
-        PROC_ISSUES=$((PROC_ISSUES+1))
-    done < <(ps aux 2>/dev/null | grep -E "/tmp/|/dev/shm" | grep -v grep | head -10 || true)
-    # Hidden process names (empty cmdline)
     while IFS= read -r pid; do
         [ -z "$(cat /proc/$pid/cmdline 2>/dev/null)" ] && continue
+
         local cmd
-        cmd=$(tr -d '\0' < /proc/$pid/cmdline 2>/dev/null | head -c 50 || true)
+        cmd=$(tr '\0' ' ' < /proc/$pid/cmdline 2>/dev/null | head -c 50)
+
         [[ "$cmd" == .* ]] && {
             echo -e "    ${RED}⚠${NC} Hidden process (PID $pid): $cmd"
             echo "[WARN] Hidden process PID=$pid cmd=$cmd" >> "$LG_ANALYZE_LOG"
             PROC_ISSUES=$((PROC_ISSUES+1))
         }
-    done < <(ls /proc/ 2>/dev/null | grep -E '^[0-9]+$' | head -50 || true)
-    [ "$PROC_ISSUES" -eq 0 ] && echo -e "    ${GREEN}✓${NC} No suspicious processes"
-    ISSUES=$((ISSUES+PROC_ISSUES))
+    done < <(find /proc -maxdepth 1 -type d -regex '.*/[0-9]+' -printf '%f\n' 2>/dev/null | head -50)
 
     # ── 3. Recently modified system files ─────────────────────────────────────
     echo ""
@@ -820,9 +814,12 @@ _lg_status() {
 
     # [5] PHP
     local _dfuncs
-    _dfuncs=$(php -r 'echo ini_get("disable_functions");' 2>/dev/null | wc -c || echo 0)
-    [ "$_dfuncs" -gt 50 ] && _PHP=0 || _PHP=1
-    _st "$_PHP" "[5] PHP disable_functions — $( [ $_PHP -eq 0 ] && echo "active (${_dfuncs} chars)" || echo 'not applied')"
+    _dfuncs=$(php -r 'echo ini_get("disable_functions");' 2>/dev/null \
+        | tr ',' '\n' \
+        | sed '/^\s*$/d' \
+        | wc -l)
+    [ "$_dfuncs" -gt 5 ] && _PHP=0 || _PHP=1
+    _st "$_PHP" "[5] PHP disable_functions — $( [ $_PHP -eq 0 ] && echo "active (${_dfuncs} functions)" || echo 'not applied')"
 
     # [5.1] PHP-FPM Pools
     local _pools
