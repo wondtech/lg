@@ -10,7 +10,6 @@
 #   [4] MySQL/MariaDB         — Harden database configuration
 #   [5] PHP disable_functions — Block shell_exec/system/exec + open_basedir
 #   [5.1] PHP-FPM Pools       — Isolate each site with open_basedir
-#   [5.2] Panel php.ini       — Fix date.timezone for all control panels
 #   [6] noexec /tmp /var/tmp  — Prevent uploaded binary execution
 #   [7] AppArmor / SELinux    — MAC + Dovecot/vmail context fixes
 #   [8] Auditd                — Real-time monitoring and alerting
@@ -839,9 +838,7 @@ _lg_status() {
     [ -d /usr/local/directadmin ] && _panel="DirectAdmin"
     { [ -d /usr/local/CyberPanel ] || [ -f /usr/bin/cyberpanel ]; } && _panel="CyberPanel"
     { [ -d /usr/local/hestia ] || [ -f /usr/local/hestia/bin/v-list-users ]; } && _panel="HestiaCP"
-    if [ "$_panel" != "none" ]; then
-        echo -e "  ${CYAN}i${NC} [5.2] Panel php.ini       — ${_panel} (tz: ${PHP_TIMEZONE})"
-    fi
+    [ "$_panel" != "none" ] && echo -e "  ${CYAN}i${NC} [5.2] Panel detected     — ${_panel}"
 
     # [6] noexec
     mount 2>/dev/null | grep -q "on /tmp.*noexec" && _NX=0 || _NX=1
@@ -1117,7 +1114,6 @@ for arg in "$@"; do
             echo "   [4] MySQL / MariaDB       Bind database to 127.0.0.1"
             echo "   [5] PHP Hardening         Disable 60+ dangerous functions globally"
             echo "   [5.1] PHP-FPM Pools       Isolate each site with open_basedir"
-            echo "   [5.2] Panel PHP           Fix date.timezone in panel php.ini files"
             echo "   [6] noexec                Prevent binary execution from /tmp + sites"
             echo "   [7] AppArmor / SELinux    Enforce MAC + fix vmail/Dovecot contexts"
             echo "   [8] Auditd                Real-time alerts for webshells + privesc"
@@ -1647,6 +1643,11 @@ opcache_get_status,opcache_reset,putenv,apache_setenv"
             continue
         fi
 
+        # Ensure file ends with newline before any append
+        [ -s "$inifile" ] && \
+            [ "$(tail -c1 "$inifile" | wc -l)" -eq 0 ] && \
+            echo "" >> "$inifile"
+
         # ── disable_functions (global — all sites) ────────────────────────────
         if grep -q "^disable_functions" "$inifile"; then
             sed -i "s|^disable_functions.*|disable_functions = ${DISABLE_FUNCTIONS}|" "$inifile"
@@ -1662,13 +1663,11 @@ opcache_get_status,opcache_reset,putenv,apache_setenv"
         if grep -qE "^\s*;*\s*date\.timezone" "$inifile"; then
             sed -i "s|^\s*;*\s*date\.timezone.*|date.timezone = ${PHP_TIMEZONE}|" "$inifile"
         else
-            echo "date.timezone = ${PHP_TIMEZONE}" >> "$inifile"
+            printf '\ndate.timezone = %s\n' "${PHP_TIMEZONE}" >> "$inifile"
         fi
         log_ok "date.timezone = ${PHP_TIMEZONE}: $(basename "$inifile")"
 
         # ── Global security settings ──────────────────────────────────────────
-        # open_basedir is intentionally excluded here —
-        # it is set per-site in PART 5.1 (PHP-FPM pool) or via .htaccess
         for key in "${!PHPSEC[@]}"; do
             val="${PHPSEC[$key]}"
             if grep -qE "^\s*${key}\s*=" "$inifile"; then
@@ -1676,7 +1675,7 @@ opcache_get_status,opcache_reset,putenv,apache_setenv"
             elif grep -qE "^\s*;\s*${key}\s*=" "$inifile"; then
                 sed -i "s|^\s*;\s*${key}\s*=.*|${key} = ${val}|" "$inifile"
             else
-                echo "${key} = ${val}" >> "$inifile"
+                printf '\n%s = %s\n' "${key}" "${val}" >> "$inifile"
             fi
         done
         log_ok "Global security settings applied: $inifile"
@@ -2654,102 +2653,6 @@ fi
 
 log_ok "Layer 7 complete (MAC: ${MAC_SYSTEM})"
 
-# ── PART 5.2 — Fix date.timezone in panel php.ini files ──────────────────────
-# Detect panel and fix date.timezone only — nothing else
-_L5_PANEL="none"
-{ [ -d /usr/local/cwpsrv ] || [ -f /usr/local/cwp/php71/bin/php ]; } && _L5_PANEL="cwp"
-[ -d /usr/local/cpanel ]                                               && _L5_PANEL="cpanel"
-{ [ -d /usr/local/psa ] || [ -d /opt/psa ]; }                         && _L5_PANEL="plesk"
-[ -d /usr/local/directadmin ]                                          && _L5_PANEL="directadmin"
-{ [ -d /usr/local/CyberPanel ] || [ -f /usr/bin/cyberpanel ]; }       && _L5_PANEL="cyberpanel"
-{ [ -d /usr/local/hestia ] || [ -f /usr/local/hestia/bin/v-list-users ]; } && _L5_PANEL="hestia"
-{ [ -d /usr/local/vesta  ] || [ -f /usr/local/vesta/bin/v-list-users  ]; } && _L5_PANEL="vesta"
-[ -d /usr/local/ispconfig ]                                            && _L5_PANEL="ispconfig"
-{ [ -d /www/server/panel ] || [ -f /usr/bin/bt ]; }                   && _L5_PANEL="aapanel"
-{ [ -d /usr/share/webmin ] || [ -f /usr/bin/webmin ]; }               && _L5_PANEL="webmin"
-[ -d /usr/local/interworx ]                                            && _L5_PANEL="interworx"
-{ [ -d /var/www/froxlor ] || [ -d /usr/share/froxlor ]; }             && _L5_PANEL="froxlor"
-[ -d /etc/runcloud ]                                                   && _L5_PANEL="runcloud"
-[ -f /usr/bin/centmin ]                                                && _L5_PANEL="centminmod"
-
-if [ "$_L5_PANEL" != "none" ]; then
-    section "PART 5.2: Panel php.ini — date.timezone (${_L5_PANEL})"
-    log_info "Panel detected: ${_L5_PANEL} — setting date.timezone = ${PHP_TIMEZONE}"
-
-    # Helper: fix date.timezone in one php.ini (skip CLI)
-    _fix_tz_ini() {
-        local _ini="$1"
-        [ -f "$_ini" ] || return 0
-        [[ "$_ini" == *cli* ]] && return 0
-        if grep -qE "^\s*;*\s*date\.timezone" "$_ini"; then
-            sed -i "s|^\s*;*\s*date\.timezone.*|date.timezone = ${PHP_TIMEZONE}|" "$_ini"
-        else
-            echo "date.timezone = ${PHP_TIMEZONE}" >> "$_ini"
-        fi
-        log_ok "date.timezone fixed: $(basename "$_ini")"
-    }
-
-    if [ "$DRY_RUN" = false ]; then
-        _P52_COUNT=0
-        case "$_L5_PANEL" in
-            cwp)
-                while IFS= read -r _ini; do
-                    _fix_tz_ini "$_ini" && _P52_COUNT=$((_P52_COUNT+1))
-                done < <(find /usr/local/cwp/ -name "php.ini" 2>/dev/null | sort -u)
-                systemctl restart cwpsrv 2>/dev/null && log_ok "cwpsrv restarted" || true
-                ;;
-            cpanel)
-                while IFS= read -r _ini; do
-                    _fix_tz_ini "$_ini" && _P52_COUNT=$((_P52_COUNT+1))
-                done < <({ find /usr/local/lib/php* -name "php.ini" 2>/dev/null
-                            find /opt/cpanel -name "php.ini" 2>/dev/null; } | sort -u)
-                ;;
-            plesk)
-                while IFS= read -r _ini; do
-                    _fix_tz_ini "$_ini" && _P52_COUNT=$((_P52_COUNT+1))
-                done < <({ find /opt/plesk -name "php.ini" 2>/dev/null
-                            find /usr/local/psa -name "php.ini" 2>/dev/null; } | sort -u)
-                systemctl restart psa 2>/dev/null || true
-                ;;
-            directadmin)
-                while IFS= read -r _ini; do
-                    _fix_tz_ini "$_ini" && _P52_COUNT=$((_P52_COUNT+1))
-                done < <(find /usr/local/php -name "php.ini" 2>/dev/null | sort -u)
-                ;;
-            cyberpanel)
-                while IFS= read -r _ini; do
-                    _fix_tz_ini "$_ini" && _P52_COUNT=$((_P52_COUNT+1))
-                done < <(find /usr/local/lsws -name "php.ini" 2>/dev/null | sort -u)
-                systemctl restart lsws 2>/dev/null || true
-                ;;
-            hestia|vesta|ispconfig|webmin|froxlor|runcloud)
-                while IFS= read -r _ini; do
-                    _fix_tz_ini "$_ini" && _P52_COUNT=$((_P52_COUNT+1))
-                done < <(find /etc/php -name "php.ini" 2>/dev/null | sort -u)
-                ;;
-            aapanel)
-                while IFS= read -r _ini; do
-                    _fix_tz_ini "$_ini" && _P52_COUNT=$((_P52_COUNT+1))
-                done < <(find /www/server/php -name "php.ini" 2>/dev/null | sort -u)
-                ;;
-            interworx)
-                while IFS= read -r _ini; do
-                    _fix_tz_ini "$_ini" && _P52_COUNT=$((_P52_COUNT+1))
-                done < <(find /usr/local/interworx -name "php.ini" 2>/dev/null | sort -u)
-                ;;
-            centminmod)
-                while IFS= read -r _ini; do
-                    _fix_tz_ini "$_ini" && _P52_COUNT=$((_P52_COUNT+1))
-                done < <(find /usr/local/lib/php* -name "php.ini" 2>/dev/null | sort -u)
-                ;;
-        esac
-        [ "$_P52_COUNT" -gt 0 ] \
-            && log_ok "Part 5.2: ${_P52_COUNT} panel php.ini file(s) updated" \
-            || log_skip "Part 5.2: No extra php.ini files found for ${_L5_PANEL}"
-    else
-        log_dry "Set date.timezone = ${PHP_TIMEZONE} in all ${_L5_PANEL} php.ini files"
-    fi
-fi
 
 # ══════════════════════════════════════════════════════════════════════════════
 # LAYER 8 — Auditd (Monitoring & Alerts)
