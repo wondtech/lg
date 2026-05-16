@@ -45,6 +45,7 @@ AUTO_ANALYZE_MODE=false
 INTEGRITY_MODE=false
 FORCE_MODE=false
 UPDATE_MODE=false
+HELP_MODE=false
 LG_STATE_FILE="/root/lg/.applied"
 LG_SCAN_LOG="/var/log/lg-scan.log"
 LG_ANALYZE_LOG="/var/log/lg-analyze.log"
@@ -321,33 +322,33 @@ _lg_fixmail() {
         _FM_TE=$(mktemp /tmp/dovecot_lg_XXXXXX.te)
         if [ "$_FM_TYPE" = "dovecot_var_t" ]; then
             cat > "$_FM_TE" << 'DOVEPOL'
-            module dovecot_lg 1.1;
-            require {
-                type dovecot_t; type mysqld_db_t; type var_t; type dovecot_var_t;
-                class file { append create getattr link lock map open read rename unlink write };
-                class dir  { add_name getattr read remove_name write };
-                class sock_file write;
-            }
-            allow dovecot_t mysqld_db_t:sock_file write;
-            allow dovecot_t var_t:dir  { add_name getattr read remove_name write };
-            allow dovecot_t var_t:file { append create getattr link lock map open read rename unlink write };
-            allow dovecot_t dovecot_var_t:dir  { add_name getattr read remove_name write };
-            allow dovecot_t dovecot_var_t:file { append create getattr link lock map open read rename unlink write };
+module dovecot_lg 1.1;
+require {
+    type dovecot_t; type mysqld_db_t; type var_t; type dovecot_var_t;
+    class file { append create getattr link lock map open read rename unlink write };
+    class dir  { add_name getattr read remove_name write };
+    class sock_file write;
+}
+allow dovecot_t mysqld_db_t:sock_file write;
+allow dovecot_t var_t:dir  { add_name getattr read remove_name write };
+allow dovecot_t var_t:file { append create getattr link lock map open read rename unlink write };
+allow dovecot_t dovecot_var_t:dir  { add_name getattr read remove_name write };
+allow dovecot_t dovecot_var_t:file { append create getattr link lock map open read rename unlink write };
 DOVEPOL
         else
             cat > "$_FM_TE" << 'DOVEPOL'
-            module dovecot_lg 1.1;
-            require {
-                type dovecot_t; type mysqld_db_t; type var_t; type mail_spool_t;
-                class file { append create getattr link lock map open read rename unlink write };
-                class dir  { add_name getattr read remove_name write };
-                class sock_file write;
-            }
-            allow dovecot_t mysqld_db_t:sock_file write;
-            allow dovecot_t var_t:dir  { add_name getattr read remove_name write };
-            allow dovecot_t var_t:file { append create getattr link lock map open read rename unlink write };
-            allow dovecot_t mail_spool_t:dir  { add_name getattr read remove_name write };
-            allow dovecot_t mail_spool_t:file { append create getattr link lock map open read rename unlink write };
+module dovecot_lg 1.1;
+require {
+    type dovecot_t; type mysqld_db_t; type var_t; type mail_spool_t;
+    class file { append create getattr link lock map open read rename unlink write };
+    class dir  { add_name getattr read remove_name write };
+    class sock_file write;
+}
+allow dovecot_t mysqld_db_t:sock_file write;
+allow dovecot_t var_t:dir  { add_name getattr read remove_name write };
+allow dovecot_t var_t:file { append create getattr link lock map open read rename unlink write };
+allow dovecot_t mail_spool_t:dir  { add_name getattr read remove_name write };
+allow dovecot_t mail_spool_t:file { append create getattr link lock map open read rename unlink write };
 DOVEPOL
         fi
         _FM_MOD="${_FM_TE%.te}.mod"
@@ -639,7 +640,7 @@ _lg_analyze() {
     echo ""
     echo -e "  ${BOLD}[PORTS]${NC} Unexpected listening ports:"
     local PORT_ISSUES=0
-    local KNOWN_PORTS="22|80|443|25|143|465|587|993|3306|5432|8080|8443|2030|2031|2082|2083|2086|2087|2095|2302"
+    local KNOWN_PORTS="20|21|22|25|53|80|110|143|443|465|587|953|993|995|2812|3306|5432|8080|8443|8787|9000|9090|2030|2031|2082|2083|2086|2087|2095|2096|2302|2525|11211|6379"
     while IFS= read -r port_line; do
         local lport
         lport=$(echo "$port_line" | awk '{print $5}' | rev | cut -d: -f1 | rev || true)
@@ -743,12 +744,17 @@ _lg_auto_analyze() {
     local INTERVAL=300  # 5 minutes
     local PID_FILE="/var/run/lg-analyze.pid"
 
-    # Check if already running
-    if [ -f "$PID_FILE" ] && kill -0 "$(cat "$PID_FILE")" 2>/dev/null; then
-        log_warn "lg-analyze already running (PID: $(cat "$PID_FILE"))"
-        log_info "Stop with: kill $(cat "$PID_FILE")"
-        return 0
+    # Clean PID file
+    if [ -f "$PID_FILE" ]; then
+        _OLD=$(cat "$PID_FILE" 2>/dev/null || true)
+        if [ -n "$_OLD" ]; then
+            kill "$_OLD" 2>/dev/null || true
+            sleep 1
+        fi
+        rm -f "$PID_FILE"
     fi
+    pgrep -f "lg --auto-analyze" | grep -v "^$$\$" | xargs kill 2>/dev/null || true
+    sleep 1
 
     section "AUTO-ANALYZE: Starting background monitoring (every ${INTERVAL}s)"
     log_info "PID file: ${PID_FILE}"
@@ -758,7 +764,8 @@ _lg_auto_analyze() {
 
     # Run as background daemon
     (
-        echo $$ > "$PID_FILE"
+        set +euo pipefail
+        echo $BASHPID > "$PID_FILE"
         while true; do
             {
                 echo "# ── Auto-analyze $(date '+%Y-%m-%d %H:%M:%S') ──"
@@ -790,9 +797,10 @@ _lg_auto_analyze() {
             sleep "$INTERVAL"
         done
     ) &
-    disown $!
-    echo $! > "$PID_FILE"
-    log_ok "Background monitoring started (PID: $!)"
+    local _DAEMON_PID=$!
+    disown "$_DAEMON_PID" 2>/dev/null || true
+    sleep 0.5
+    log_ok "Background monitoring started (PID: $_DAEMON_PID)"
 
     # Build SUID baseline
     find / -xdev -perm -4000 -type f 2>/dev/null > /root/lg/.suid_baseline || true
@@ -1040,6 +1048,63 @@ _lg_update() {
 }
 
 # ══════════════════════════════════════════════════════════════════════════════
+# FUNCTION: _lg_help — For help
+# ══════════════════════════════════════════════════════════════════════════════
+_lg_help() {
+    echo -e "${BOLD}USAGE:${NC}"
+    echo "   sudo lg [OPTIONS]"
+    echo ""
+    echo -e "${BOLD}OPTIONS:${NC}"
+    echo "   (none)           Interactive mode — recommended for first run"
+    echo "   --auto           Auto mode — no prompts, applies all layers"
+    echo "   --force          Force re-apply all layers (even if already applied)"
+    echo "   --dry-run        Preview every change without applying anything"
+    echo "   --undo           Rollback all changes from the last run"
+    echo "   --cron           Silent mode for cron jobs"
+    echo "   --watch          Monitor for new sites and harden automatically"
+    echo "   --fixmail        Fix Dovecot/vmail SELinux contexts and policy"
+    echo "   --scan [--path]  Scan for PHP/Perl/Python webshells and reverse shells"
+    echo "   --auto-analyze   Start background behavior monitoring (daemon)"
+    echo "   --integrity      Check integrity of critical system files"
+    echo "   --update         Download and install latest version from wondtech.com"
+    echo "   --help, -h       Show this help message"
+    echo ""
+    echo -e "${BOLD}SECURITY LAYERS:${NC}"
+    echo "   [1] Binary Lockdown       Restrict dangerous tools to root only"
+    echo "   [2] Kernel Hardening      Block unused modules + sysctl hardening"
+    echo "   [3] System Files          Secure permissions on sensitive files"
+    echo "   [4] MySQL / MariaDB       Bind database to 127.0.0.1"
+    echo "   [5] PHP Hardening         Disable 60+ dangerous functions globally"
+    echo "   [5.1] PHP-FPM Pools       Isolate each site with open_basedir"
+    echo "   [6] noexec                Prevent binary execution from /tmp + sites"
+    echo "   [7] AppArmor / SELinux    Enforce MAC + fix vmail/Dovecot contexts"
+    echo "   [8] Auditd                Real-time alerts for webshells + privesc"
+    echo "   [A] FTP + ClamAV          Scan uploaded files for malware"
+    echo "   [B] Snuffleupagus         PHP RASP runtime protection"
+    echo ""
+    echo -e "${BOLD}EXAMPLES:${NC}"
+    echo "   sudo lg                  # First run — interactive"
+    echo "   sudo lg --dry-run        # Preview changes safely"
+    echo "   sudo lg --auto           # Apply all layers without prompts"
+    echo "   sudo lg --force          # Re-apply all layers"
+    echo "   sudo lg --fixmail        # Fix Dovecot/vmail SELinux only"
+    echo "   sudo lg --scan           # Scan for webshells"
+    echo "   sudo lg --scan --path /var/www/html"
+    echo "   sudo lg --auto-analyze   # Start background monitoring"
+    echo "   sudo lg --integrity      # Check file integrity"
+    echo "   sudo lg --undo           # Rollback last run"
+    echo ""
+    echo -e "${BOLD}FILES:${NC}"
+    echo "   Log:       /var/log/lg-hardening.log"
+    echo "   Scan:      /var/log/lg-scan.log"
+    echo "   Analyze:   /var/log/lg-analyze.log"
+    echo "   Integrity: /root/lg/integrity.db"
+    echo "   Backups:   /root/lg/backups/"
+    echo ""
+    exit 0
+}
+
+# ══════════════════════════════════════════════════════════════════════════════
 # INITIALISATION
 # ══════════════════════════════════════════════════════════════════════════════
 
@@ -1063,10 +1128,12 @@ for arg in "$@"; do
         --auto-analyze)   AUTO_ANALYZE_MODE=true ;;
         --integrity)      INTEGRITY_MODE=true ;;
         --update)         UPDATE_MODE=true ;;
+        --help|-h)        HELP_MODE=true ;;
     esac
 done
 
 # ── Flags that run silently without banner ────────────────────────────────────
+if [ "$HELP_MODE" = true ];         then print_banner; _lg_help; exit 0; fi
 if [ "$UPDATE_MODE" = true ];       then _lg_update;       exit 0; fi
 if [ "$FIXMAIL_MODE" = true ];      then mkdir -p "$BACKUP_DIR" && chmod 700 "$BACKUP_DIR"; _lg_fixmail; exit 0; fi
 if [ "$AUTO_ANALYZE_MODE" = true ]; then _lg_auto_analyze; exit 0; fi
@@ -1104,80 +1171,6 @@ if [ -f "$LG_STATE_FILE" ] && \
     _lg_status
     exit 0
 fi
-
-for arg in "$@"; do
-    case "$arg" in
-        --cron)           RUN_MODE="cron" ;;
-        --auto)           RUN_MODE="auto" ;;
-        --dry-run)        DRY_RUN=true ;;
-        --undo)           UNDO_MODE=true ;;
-        --watch)          ;;
-        --force)          FORCE_MODE=true ;;
-        --fixmail)        FIXMAIL_MODE=true ;;
-        --scan)           SCAN_MODE=true ;;
-        --auto-analyze)   AUTO_ANALYZE_MODE=true ;;
-        --integrity)      INTEGRITY_MODE=true ;;
-        --update)         UPDATE_MODE=true ;;
-        --help|-h)
-            echo -e "${BOLD}${CYAN}"
-            echo "────────────────────────────────────────────────────────────────────────"
-            echo "   Linux Guardian v1.1 — Server Security Hardening | WondTech.com"
-            echo "────────────────────────────────────────────────────────────────────────"
-            echo -e "${NC}"
-            echo -e "${BOLD}USAGE:${NC}"
-            echo "   sudo lg [OPTIONS]"
-            echo ""
-            echo -e "${BOLD}OPTIONS:${NC}"
-            echo "   (none)           Interactive mode — recommended for first run"
-            echo "   --auto           Auto mode — no prompts, applies all layers"
-            echo "   --force          Force re-apply all layers (even if already applied)"
-            echo "   --dry-run        Preview every change without applying anything"
-            echo "   --undo           Rollback all changes from the last run"
-            echo "   --cron           Silent mode for cron jobs"
-            echo "   --watch          Monitor for new sites and harden automatically"
-            echo "   --fixmail        Fix Dovecot/vmail SELinux contexts and policy"
-            echo "   --scan [--path]  Scan for PHP/Perl/Python webshells and reverse shells"
-            echo "   --auto-analyze   Start background behavior monitoring (daemon)"
-            echo "   --integrity      Check integrity of critical system files"
-            echo "   --update         Download and install latest version from wondtech.com"
-            echo "   --help, -h       Show this help message"
-            echo ""
-            echo -e "${BOLD}SECURITY LAYERS:${NC}"
-            echo "   [1] Binary Lockdown       Restrict dangerous tools to root only"
-            echo "   [2] Kernel Hardening      Block unused modules + sysctl hardening"
-            echo "   [3] System Files          Secure permissions on sensitive files"
-            echo "   [4] MySQL / MariaDB       Bind database to 127.0.0.1"
-            echo "   [5] PHP Hardening         Disable 60+ dangerous functions globally"
-            echo "   [5.1] PHP-FPM Pools       Isolate each site with open_basedir"
-            echo "   [6] noexec                Prevent binary execution from /tmp + sites"
-            echo "   [7] AppArmor / SELinux    Enforce MAC + fix vmail/Dovecot contexts"
-            echo "   [8] Auditd                Real-time alerts for webshells + privesc"
-            echo "   [A] FTP + ClamAV          Scan uploaded files for malware"
-            echo "   [B] Snuffleupagus         PHP RASP runtime protection"
-            echo ""
-            echo -e "${BOLD}EXAMPLES:${NC}"
-            echo "   sudo lg                  # First run — interactive"
-            echo "   sudo lg --dry-run        # Preview changes safely"
-            echo "   sudo lg --auto           # Apply all layers without prompts"
-            echo "   sudo lg --force          # Re-apply all layers"
-            echo "   sudo lg --fixmail        # Fix Dovecot/vmail SELinux only"
-            echo "   sudo lg --scan           # Scan for webshells"
-            echo "   sudo lg --scan --path /var/www/html"
-            echo "   sudo lg --auto-analyze   # Start background monitoring"
-            echo "   sudo lg --integrity      # Check file integrity"
-            echo "   sudo lg --undo           # Rollback last run"
-            echo ""
-            echo -e "${BOLD}FILES:${NC}"
-            echo "   Log:       /var/log/lg-hardening.log"
-            echo "   Scan:      /var/log/lg-scan.log"
-            echo "   Analyze:   /var/log/lg-analyze.log"
-            echo "   Integrity: /root/lg/integrity.db"
-            echo "   Backups:   /root/lg/backups/"
-            echo ""
-            exit 0
-            ;;
-    esac
-done
 
 # Globals
 TIMESTAMP=$(date +%Y%m%d_%H%M%S)
