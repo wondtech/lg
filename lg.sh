@@ -1011,14 +1011,13 @@ _lg_update() {
 # INITIALISATION
 # ══════════════════════════════════════════════════════════════════════════════
 
-print_banner
-
 # Root check
 if [ "$(id -u)" -ne 0 ]; then
     log_error "Must be run as root.  Run: sudo $0"
     exit 1
 fi
 
+# Parse flags
 for arg in "$@"; do
     case "$arg" in
         --cron)           RUN_MODE="cron" ;;
@@ -1035,44 +1034,23 @@ for arg in "$@"; do
     esac
 done
 
-# ── Handle special-mode flags ─────────────────────────────────────────────────
-
-if [ "$UPDATE_MODE" = true ]; then
-    _lg_update
-    exit 0
-fi
-
-# --fixmail — standalone, no state check needed
-if [ "$FIXMAIL_MODE" = true ]; then
-    mkdir -p "$BACKUP_DIR" && chmod 700 "$BACKUP_DIR"
-    _lg_fixmail
-    exit 0
-fi
-
-# --scan — standalone scan
+# ── Flags that run silently without banner ────────────────────────────────────
+if [ "$UPDATE_MODE" = true ];       then _lg_update;       exit 0; fi
+if [ "$FIXMAIL_MODE" = true ];      then mkdir -p "$BACKUP_DIR" && chmod 700 "$BACKUP_DIR"; _lg_fixmail; exit 0; fi
+if [ "$AUTO_ANALYZE_MODE" = true ]; then _lg_auto_analyze; exit 0; fi
+if [ "$INTEGRITY_MODE" = true ];    then _lg_integrity;    exit 0; fi
 if [ "$SCAN_MODE" = true ]; then
-    mkdir -p "$(dirname "$LG_SCAN_LOG")" 2>/dev/null || true
-    SCAN_PATH=""
-    for arg in "$@"; do
-        [ "$arg" = "--path" ] && continue
-        [[ "$arg" == --path=* ]] && SCAN_PATH="${arg#--path=}" && continue
-        [[ "$arg" != --* ]] && [ -n "$arg" ] && SCAN_PATH="$arg"
+    _SCAN_PATH=""
+    for _a in "$@"; do
+        [[ "$_a" == --path=* ]] && _SCAN_PATH="${_a#--path=}" && break
+        [[ "$_a" != --* ]] && [[ -n "$_a" ]] && _SCAN_PATH="$_a"
     done
-    _lg_scan "$SCAN_PATH"
+    _lg_scan "$_SCAN_PATH"
     exit 0
 fi
 
-# --auto-analyze — start background daemon
-if [ "$AUTO_ANALYZE_MODE" = true ]; then
-    _lg_auto_analyze
-    exit 0
-fi
-
-# --integrity — file integrity check
-if [ "$INTEGRITY_MODE" = true ]; then
-    _lg_integrity
-    exit 0
-fi
+# ── Show banner for interactive/full modes ────────────────────────────────────
+print_banner
 
 # ── Second-run detection ──────────────────────────────────────────────────────
 # If already applied AND not --force, show status dashboard
@@ -3749,7 +3727,7 @@ if [ "$DRY_RUN" = false ]; then
     echo ""
 
     # ── Auto-add cron job for new user detection ──────────────────────────────
-    local _CRON_LINE="0 * * * * /usr/local/bin/lg --cron"
+    _CRON_LINE="0 * * * * /usr/local/bin/lg --cron"
     if command -v crontab &>/dev/null; then
         if ! crontab -l 2>/dev/null | grep -q "lg --cron"; then
             ( crontab -l 2>/dev/null; echo "$_CRON_LINE" ) | crontab -
