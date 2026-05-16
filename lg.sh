@@ -321,33 +321,33 @@ _lg_fixmail() {
         _FM_TE=$(mktemp /tmp/dovecot_lg_XXXXXX.te)
         if [ "$_FM_TYPE" = "dovecot_var_t" ]; then
             cat > "$_FM_TE" << 'DOVEPOL'
-module dovecot_lg 1.1;
-require {
-    type dovecot_t; type mysqld_db_t; type var_t; type dovecot_var_t;
-    class file { append create getattr link lock map open read rename unlink write };
-    class dir  { add_name getattr read remove_name write };
-    class sock_file write;
-}
-allow dovecot_t mysqld_db_t:sock_file write;
-allow dovecot_t var_t:dir  { add_name getattr read remove_name write };
-allow dovecot_t var_t:file { append create getattr link lock map open read rename unlink write };
-allow dovecot_t dovecot_var_t:dir  { add_name getattr read remove_name write };
-allow dovecot_t dovecot_var_t:file { append create getattr link lock map open read rename unlink write };
+            module dovecot_lg 1.1;
+            require {
+                type dovecot_t; type mysqld_db_t; type var_t; type dovecot_var_t;
+                class file { append create getattr link lock map open read rename unlink write };
+                class dir  { add_name getattr read remove_name write };
+                class sock_file write;
+            }
+            allow dovecot_t mysqld_db_t:sock_file write;
+            allow dovecot_t var_t:dir  { add_name getattr read remove_name write };
+            allow dovecot_t var_t:file { append create getattr link lock map open read rename unlink write };
+            allow dovecot_t dovecot_var_t:dir  { add_name getattr read remove_name write };
+            allow dovecot_t dovecot_var_t:file { append create getattr link lock map open read rename unlink write };
 DOVEPOL
         else
             cat > "$_FM_TE" << 'DOVEPOL'
-module dovecot_lg 1.1;
-require {
-    type dovecot_t; type mysqld_db_t; type var_t; type mail_spool_t;
-    class file { append create getattr link lock map open read rename unlink write };
-    class dir  { add_name getattr read remove_name write };
-    class sock_file write;
-}
-allow dovecot_t mysqld_db_t:sock_file write;
-allow dovecot_t var_t:dir  { add_name getattr read remove_name write };
-allow dovecot_t var_t:file { append create getattr link lock map open read rename unlink write };
-allow dovecot_t mail_spool_t:dir  { add_name getattr read remove_name write };
-allow dovecot_t mail_spool_t:file { append create getattr link lock map open read rename unlink write };
+            module dovecot_lg 1.1;
+            require {
+                type dovecot_t; type mysqld_db_t; type var_t; type mail_spool_t;
+                class file { append create getattr link lock map open read rename unlink write };
+                class dir  { add_name getattr read remove_name write };
+                class sock_file write;
+            }
+            allow dovecot_t mysqld_db_t:sock_file write;
+            allow dovecot_t var_t:dir  { add_name getattr read remove_name write };
+            allow dovecot_t var_t:file { append create getattr link lock map open read rename unlink write };
+            allow dovecot_t mail_spool_t:dir  { add_name getattr read remove_name write };
+            allow dovecot_t mail_spool_t:file { append create getattr link lock map open read rename unlink write };
 DOVEPOL
         fi
         _FM_MOD="${_FM_TE%.te}.mod"
@@ -795,7 +795,7 @@ _lg_status() {
         || echo -e "  ${RED}✗${NC} $2"; }
 
     # [1] Binary Lockdown
-    ls -l /usr/bin/nc 2>/dev/null | grep -q "rwxr-x---" && _BIN=0 || _BIN=1
+    ls -l /usr/bin/socat 2>/dev/null | grep -q "rwxr-x---" && _BIN=0 || _BIN=1
     _st "$_BIN" "[1] Binary Lockdown       — $([ $_BIN -eq 0 ] && echo 'active' || echo 'not applied')"
 
     # [2] Kernel Hardening
@@ -889,7 +889,7 @@ _lg_status() {
         if [ -n "$_vmail_dir" ]; then
             _vmail_ctx=$(ls -lZ "$_vmail_dir" 2>/dev/null | awk 'NR==2{print $4}' \
                 | grep -oE '[a-z_]+_t' | head -1 || echo "unknown")
-            if echo "$_vmail_ctx" | grep -qE "mail_spool_t|dovecot_var_t"; then
+            if echo "$_vmail_ctx" | grep -E "mail_spool_t|dovecot_var_t"; then
                 echo -e "  ${GREEN}✓${NC} vmail context            — ${_vmail_ctx}"
             else
                 echo -e "  ${RED}✗${NC} vmail context            — ${_vmail_ctx} (run: sudo lg --fixmail)"
@@ -1366,14 +1366,14 @@ if [ -d /etc/modprobe.d ]; then
         log_dry "Create $MODPROBE_CONF blocking: dccp sctp rds tipc rxrpc esp4 esp6"
     else
         cat > "$MODPROBE_CONF" << 'EOF'
-# Linux Guardian — block unused/vulnerable kernel modules
-install dccp  /bin/false
-install sctp  /bin/false
-install rds   /bin/false
-install tipc  /bin/false
-install rxrpc /bin/false
-install esp4  /bin/false
-install esp6  /bin/false
+        # Linux Guardian — block unused/vulnerable kernel modules
+        install dccp  /bin/false
+        install sctp  /bin/false
+        install rds   /bin/false
+        install tipc  /bin/false
+        install rxrpc /bin/false
+        install esp4  /bin/false
+        install esp6  /bin/false
 EOF
         chmod 644 "$MODPROBE_CONF"
         echo "MODPROBE:${MODPROBE_CONF}" >> "$UNDO_MANIFEST"
@@ -1393,32 +1393,32 @@ if [ "$DRY_RUN" = true ]; then
     log_dry "Create $SYSCTL_CONF with kernel/network hardening"
 else
     cat > "$SYSCTL_CONF" << 'EOF'
-# Linux Guardian — Kernel & Network Hardening
+    # Linux Guardian — Kernel & Network Hardening
 
-# ASLR
-kernel.randomize_va_space = 2
-# Restrict kernel log to root
-kernel.dmesg_restrict = 1
-# Hide kernel pointers
-kernel.kptr_restrict = 2
-# Disable core dumps for setuid programs
-fs.suid_dumpable = 0
-# SYN flood protection
-net.ipv4.tcp_syncookies = 1
-# Reverse path filtering (anti-spoofing)
-net.ipv4.conf.all.rp_filter     = 1
-net.ipv4.conf.default.rp_filter = 1
-# Ignore ICMP redirects
-net.ipv4.conf.all.accept_redirects     = 0
-net.ipv4.conf.default.accept_redirects = 0
-net.ipv6.conf.all.accept_redirects     = 0
-# Do not forward/send redirects
-net.ipv4.conf.all.send_redirects = 0
-# Ignore source-routed packets
-net.ipv4.conf.all.accept_source_route = 0
-# Protect hardlinks and symlinks (/tmp race attacks)
-fs.protected_hardlinks = 1
-fs.protected_symlinks  = 1
+    # ASLR
+    kernel.randomize_va_space = 2
+    # Restrict kernel log to root
+    kernel.dmesg_restrict = 1
+    # Hide kernel pointers
+    kernel.kptr_restrict = 2
+    # Disable core dumps for setuid programs
+    fs.suid_dumpable = 0
+    # SYN flood protection
+    net.ipv4.tcp_syncookies = 1
+    # Reverse path filtering (anti-spoofing)
+    net.ipv4.conf.all.rp_filter     = 1
+    net.ipv4.conf.default.rp_filter = 1
+    # Ignore ICMP redirects
+    net.ipv4.conf.all.accept_redirects     = 0
+    net.ipv4.conf.default.accept_redirects = 0
+    net.ipv6.conf.all.accept_redirects     = 0
+    # Do not forward/send redirects
+    net.ipv4.conf.all.send_redirects = 0
+    # Ignore source-routed packets
+    net.ipv4.conf.all.accept_source_route = 0
+    # Protect hardlinks and symlinks (/tmp race attacks)
+    fs.protected_hardlinks = 1
+    fs.protected_symlinks  = 1
 EOF
     chmod 644 "$SYSCTL_CONF"
     echo "SYSCTL:${SYSCTL_CONF}" >> "$UNDO_MANIFEST"
@@ -1596,16 +1596,16 @@ fi
 if [ "$PHP_SKIP" = false ] && [ ${#SELECTED_FILES[@]} -gt 0 ]; then
 
     DISABLE_FUNCTIONS="exec,passthru,shell_exec,system,popen,proc_open,proc_close,\
-proc_get_status,proc_terminate,proc_nice,pcntl_exec,pcntl_fork,pcntl_signal,\
-pcntl_waitpid,pcntl_wait,pcntl_wifexited,pcntl_wifstopped,pcntl_wifsignaled,\
-pcntl_wexitstatus,pcntl_wstopsig,pcntl_signal_dispatch,pcntl_get_last_error,\
-pcntl_strerror,pcntl_sigprocmask,pcntl_sigwaitinfo,pcntl_sigtimedwait,pcntl_alarm,\
-pcntl_getpriority,pcntl_setpriority,pcntl_async_signals,posix_kill,posix_mkfifo,\
-posix_setpgid,posix_setsid,posix_setuid,posix_setgid,posix_seteuid,posix_setegid,\
-fsockopen,pfsockopen,stream_socket_client,stream_socket_server,socket_create,\
-socket_connect,socket_bind,socket_listen,socket_accept,phpinfo,show_source,\
-highlight_file,symlink,link,dl,assert,create_function,parse_ini_file,\
-opcache_get_status,opcache_reset,putenv,apache_setenv"
+    proc_get_status,proc_terminate,proc_nice,pcntl_exec,pcntl_fork,pcntl_signal,\
+    pcntl_waitpid,pcntl_wait,pcntl_wifexited,pcntl_wifstopped,pcntl_wifsignaled,\
+    pcntl_wexitstatus,pcntl_wstopsig,pcntl_signal_dispatch,pcntl_get_last_error,\
+    pcntl_strerror,pcntl_sigprocmask,pcntl_sigwaitinfo,pcntl_sigtimedwait,pcntl_alarm,\
+    pcntl_getpriority,pcntl_setpriority,pcntl_async_signals,posix_kill,posix_mkfifo,\
+    posix_setpgid,posix_setsid,posix_setuid,posix_setgid,posix_seteuid,posix_setegid,\
+    fsockopen,pfsockopen,stream_socket_client,stream_socket_server,socket_create,\
+    socket_connect,socket_bind,socket_listen,socket_accept,phpinfo,show_source,\
+    highlight_file,symlink,link,dl,assert,create_function,parse_ini_file,\
+    opcache_get_status,opcache_reset,putenv,apache_setenv"
 
     # Declared once outside loop — avoids redeclaration and state leakage
     unset PHPSEC
@@ -1923,49 +1923,49 @@ setup_phpfpm_pools() {
         backup_file "$POOL_CONF" "phpfpm_pool"
 
         cat > "$POOL_CONF" << EOF
-; ══════════════════════════════════════════════════════
-; Linux Guardian — PHP-FPM Pool: ${SITE_NAME}
-; Generated: ${TIMESTAMP}
-;
-; Global settings (disable_functions, session security,
-; limits) are inherited from php.ini
-; Per-site: open_basedir + session path + logging
-; ══════════════════════════════════════════════════════
+        ; ══════════════════════════════════════════════════════
+        ; Linux Guardian — PHP-FPM Pool: ${SITE_NAME}
+        ; Generated: ${TIMESTAMP}
+        ;
+        ; Global settings (disable_functions, session security,
+        ; limits) are inherited from php.ini
+        ; Per-site: open_basedir + session path + logging
+        ; ══════════════════════════════════════════════════════
 
-[${SITE_NAME}]
+        [${SITE_NAME}]
 
-; ── Process user ───────────────────────────────────────
-user  = ${SITE_USER}
-group = ${SITE_GROUP}
+        ; ── Process user ───────────────────────────────────────
+        user  = ${SITE_USER}
+        group = ${SITE_GROUP}
 
-; ── Socket ─────────────────────────────────────────────
-listen       = ${SOCK_PATH}
-listen.owner = ${SOCK_OWNER}
-listen.group = ${SOCK_OWNER}
-listen.mode  = 0660
+        ; ── Socket ─────────────────────────────────────────────
+        listen       = ${SOCK_PATH}
+        listen.owner = ${SOCK_OWNER}
+        listen.group = ${SOCK_OWNER}
+        listen.mode  = 0660
 
-; ── Process management ─────────────────────────────────
-pm                   = dynamic
-pm.max_children      = 10
-pm.start_servers     = 2
-pm.min_spare_servers = 1
-pm.max_spare_servers = 3
-pm.max_requests      = 500
+        ; ── Process management ─────────────────────────────────
+        pm                   = dynamic
+        pm.max_children      = 10
+        pm.start_servers     = 2
+        pm.min_spare_servers = 1
+        pm.max_spare_servers = 3
+        pm.max_requests      = 500
 
-; ── Per-site: open_basedir ─────────────────────────────
-; Restricts file access to this site's directory only
-php_admin_value[open_basedir] = ${OPEN_BASEDIR}
+        ; ── Per-site: open_basedir ─────────────────────────────
+        ; Restricts file access to this site's directory only
+        php_admin_value[open_basedir] = ${OPEN_BASEDIR}
 
-; ── Per-site: session isolation ────────────────────────
-; Each site stores sessions in its own directory
-php_value[session.save_handler] = files
-php_value[session.save_path]    = ${SESSION_PATH}
+        ; ── Per-site: session isolation ────────────────────────
+        ; Each site stores sessions in its own directory
+        php_value[session.save_handler] = files
+        php_value[session.save_path]    = ${SESSION_PATH}
 
-; ── Per-site: logging ──────────────────────────────────
-php_admin_value[error_log] = ${ERROR_LOG}
-access.log                 = ${LOG_BASE}/${SITE_NAME}-access.log
-slowlog                    = ${LOG_BASE}/${SITE_NAME}-slow.log
-request_slowlog_timeout    = 5s
+        ; ── Per-site: logging ──────────────────────────────────
+        php_admin_value[error_log] = ${ERROR_LOG}
+        access.log                 = ${LOG_BASE}/${SITE_NAME}-access.log
+        slowlog                    = ${LOG_BASE}/${SITE_NAME}-slow.log
+        request_slowlog_timeout    = 5s
 EOF
 
         chmod 640 "$POOL_CONF"
@@ -2420,39 +2420,39 @@ case "$MAC_SYSTEM" in
 
                     if [ "$_USE_DOVECOT_VAR_T" = true ]; then
                         cat > "$_DOVE_TE" << 'DOVEPOL'
-module dovecot_lg 1.1;
-require {
-    type dovecot_t;
-    type mysqld_db_t;
-    type var_t;
-    type dovecot_var_t;
-    class file { append create getattr link lock map open read rename unlink write };
-    class dir  { add_name getattr read remove_name write };
-    class sock_file write;
-}
-allow dovecot_t mysqld_db_t:sock_file write;
-allow dovecot_t var_t:dir  { add_name getattr read remove_name write };
-allow dovecot_t var_t:file { append create getattr link lock map open read rename unlink write };
-allow dovecot_t dovecot_var_t:dir  { add_name getattr read remove_name write };
-allow dovecot_t dovecot_var_t:file { append create getattr link lock map open read rename unlink write };
+                        module dovecot_lg 1.1;
+                        require {
+                            type dovecot_t;
+                            type mysqld_db_t;
+                            type var_t;
+                            type dovecot_var_t;
+                            class file { append create getattr link lock map open read rename unlink write };
+                            class dir  { add_name getattr read remove_name write };
+                            class sock_file write;
+                        }
+                        allow dovecot_t mysqld_db_t:sock_file write;
+                        allow dovecot_t var_t:dir  { add_name getattr read remove_name write };
+                        allow dovecot_t var_t:file { append create getattr link lock map open read rename unlink write };
+                        allow dovecot_t dovecot_var_t:dir  { add_name getattr read remove_name write };
+                        allow dovecot_t dovecot_var_t:file { append create getattr link lock map open read rename unlink write };
 DOVEPOL
                     else
                         cat > "$_DOVE_TE" << 'DOVEPOL'
-module dovecot_lg 1.1;
-require {
-    type dovecot_t;
-    type mysqld_db_t;
-    type var_t;
-    type mail_spool_t;
-    class file { append create getattr link lock map open read rename unlink write };
-    class dir  { add_name getattr read remove_name write };
-    class sock_file write;
-}
-allow dovecot_t mysqld_db_t:sock_file write;
-allow dovecot_t var_t:dir  { add_name getattr read remove_name write };
-allow dovecot_t var_t:file { append create getattr link lock map open read rename unlink write };
-allow dovecot_t mail_spool_t:dir  { add_name getattr read remove_name write };
-allow dovecot_t mail_spool_t:file { append create getattr link lock map open read rename unlink write };
+                        module dovecot_lg 1.1;
+                        require {
+                            type dovecot_t;
+                            type mysqld_db_t;
+                            type var_t;
+                            type mail_spool_t;
+                            class file { append create getattr link lock map open read rename unlink write };
+                            class dir  { add_name getattr read remove_name write };
+                            class sock_file write;
+                        }
+                        allow dovecot_t mysqld_db_t:sock_file write;
+                        allow dovecot_t var_t:dir  { add_name getattr read remove_name write };
+                        allow dovecot_t var_t:file { append create getattr link lock map open read rename unlink write };
+                        allow dovecot_t mail_spool_t:dir  { add_name getattr read remove_name write };
+                        allow dovecot_t mail_spool_t:file { append create getattr link lock map open read rename unlink write };
 DOVEPOL
                     fi
                     _DOVE_MOD="${_DOVE_TE%.te}.mod"
@@ -2547,9 +2547,9 @@ DOVEPOL
                     log_ok "SELinux set to enforcing in /etc/selinux/config"
                 else
                     cat > /etc/selinux/config << 'SECONF'
-# Linux Guardian — SELinux configuration
-SELINUX=enforcing
-SELINUXTYPE=targeted
+                    # Linux Guardian — SELinux configuration
+                    SELINUX=enforcing
+                    SELINUXTYPE=targeted
 SECONF
                     log_ok "SELinux config created"
                 fi
@@ -2690,35 +2690,35 @@ else
               || echo "33")
 
         cat > "$AUDIT_RULES" << EOF
-## Linux Guardian Audit Rules — ${TIMESTAMP}
+        ## Linux Guardian Audit Rules — ${TIMESTAMP}
 
-# Webshell execution — exec from writable dirs
--a always,exit -F arch=b64 -S execve -F dir=/tmp     -k tmp_exec
--a always,exit -F arch=b32 -S execve -F dir=/tmp     -k tmp_exec
--a always,exit -F arch=b64 -S execve -F dir=/var/tmp -k tmp_exec
+        # Webshell execution — exec from writable dirs
+        -a always,exit -F arch=b64 -S execve -F dir=/tmp     -k tmp_exec
+        -a always,exit -F arch=b32 -S execve -F dir=/tmp     -k tmp_exec
+        -a always,exit -F arch=b64 -S execve -F dir=/var/tmp -k tmp_exec
 
-# PHP/Apache exec (web user uid=${WWWUID})
--a always,exit -F arch=b64 -S execve -F uid=${WWWUID} -k webshell
+        # PHP/Apache exec (web user uid=${WWWUID})
+        -a always,exit -F arch=b64 -S execve -F uid=${WWWUID} -k webshell
 
-# Critical file modifications
--w /etc/passwd          -p wa -k passwd_change
--w /etc/shadow          -p wa -k shadow_change
--w /etc/sudoers         -p wa -k sudoers_change
--w /etc/sudoers.d       -p wa -k sudoers_change
--w /etc/ssh/sshd_config -p wa -k sshd_config
--w /etc/crontab         -p wa -k cron_change
--w /etc/cron.d          -p wa -k cron_change
+        # Critical file modifications
+        -w /etc/passwd          -p wa -k passwd_change
+        -w /etc/shadow          -p wa -k shadow_change
+        -w /etc/sudoers         -p wa -k sudoers_change
+        -w /etc/sudoers.d       -p wa -k sudoers_change
+        -w /etc/ssh/sshd_config -p wa -k sshd_config
+        -w /etc/crontab         -p wa -k cron_change
+        -w /etc/cron.d          -p wa -k cron_change
 
-# Privilege escalation
--a always,exit -F arch=b64 -S setuid   -k priv_esc
--a always,exit -F arch=b64 -S setgid   -k priv_esc
--a always,exit -F arch=b64 -S setreuid -k priv_esc
+        # Privilege escalation
+        -a always,exit -F arch=b64 -S setuid   -k priv_esc
+        -a always,exit -F arch=b64 -S setgid   -k priv_esc
+        -a always,exit -F arch=b64 -S setreuid -k priv_esc
 
-# Exec from home directories
--a always,exit -F arch=b64 -S execve -F dir=/home -k home_exec
+        # Exec from home directories
+        -a always,exit -F arch=b64 -S execve -F dir=/home -k home_exec
 
-# PHP config changes
--w /etc/php -p wa -k php_config
+        # PHP config changes
+        -w /etc/php -p wa -k php_config
 EOF
         chmod 640 "$AUDIT_RULES"
         echo "AUDITD_RULE:${AUDIT_RULES}" >> "$UNDO_MANIFEST"
@@ -2726,30 +2726,30 @@ EOF
         # ── Email alert script — triggered by audisp ──────────────────────────
         AUDISP_ALERT="/etc/audit/lg-alert.sh"
         cat > "$AUDISP_ALERT" << ALERTEOF
-#!/bin/bash
-# Linux Guardian — Auditd email alert
-# Called by audispd when a monitored rule fires
-ALERT_EMAIL="${ALERT_EMAIL}"
-LOG="${LOG_FILE}"
+        #!/bin/bash
+        # Linux Guardian — Auditd email alert
+        # Called by audispd when a monitored rule fires
+        ALERT_EMAIL="${ALERT_EMAIL}"
+        LOG="${LOG_FILE}"
 
-read -r -t 1 LINE || true
-[ -z "\$LINE" ] && exit 0
+        read -r -t 1 LINE || true
+        [ -z "\$LINE" ] && exit 0
 
-# Only alert on our rule keys
-echo "\$LINE" | grep -qE '"key":"(webshell|tmp_exec|priv_esc|passwd_change|shadow_change|sudoers_change|home_exec)"' || exit 0
+        # Only alert on our rule keys
+        echo "\$LINE" | grep -qE '"key":"(webshell|tmp_exec|priv_esc|passwd_change|shadow_change|sudoers_change|home_exec)"' || exit 0
 
-TS=\$(date '+%Y-%m-%d %H:%M:%S')
-HOST=\$(hostname)
-KEY=\$(echo "\$LINE" | grep -oP '"key":"\K[^"]+')
-COMM=\$(echo "\$LINE" | grep -oP '"comm":"\K[^"]+' || echo "unknown")
-PID=\$(echo "\$LINE"  | grep -oP '"pid":\K[0-9]+'  || echo "?")
+        TS=\$(date '+%Y-%m-%d %H:%M:%S')
+        HOST=\$(hostname)
+        KEY=\$(echo "\$LINE" | grep -oP '"key":"\K[^"]+')
+        COMM=\$(echo "\$LINE" | grep -oP '"comm":"\K[^"]+' || echo "unknown")
+        PID=\$(echo "\$LINE"  | grep -oP '"pid":\K[0-9]+'  || echo "?")
 
-SUBJECT="[LG ALERT] \${KEY} detected on \${HOST}"
-BODY=\$(printf "Linux Guardian Security Alert\n\nHost:    %s\nTime:    %s\nKey:     %s\nProcess: %s (PID %s)\n\nRaw event:\n%s\n\nLog: %s" \
-    "\$HOST" "\$TS" "\$KEY" "\$COMM" "\$PID" "\$LINE" "\$LOG")
+        SUBJECT="[LG ALERT] \${KEY} detected on \${HOST}"
+        BODY=\$(printf "Linux Guardian Security Alert\n\nHost:    %s\nTime:    %s\nKey:     %s\nProcess: %s (PID %s)\n\nRaw event:\n%s\n\nLog: %s" \
+            "\$HOST" "\$TS" "\$KEY" "\$COMM" "\$PID" "\$LINE" "\$LOG")
 
-echo "\$BODY" | mail -s "\$SUBJECT" "\$ALERT_EMAIL" 2>/dev/null
-echo "\$TS [ALERT] \$KEY — \$COMM (PID \$PID)" >> "\$LOG"
+        echo "\$BODY" | mail -s "\$SUBJECT" "\$ALERT_EMAIL" 2>/dev/null
+        echo "\$TS [ALERT] \$KEY — \$COMM (PID \$PID)" >> "\$LOG"
 ALERTEOF
         chmod 750 "$AUDISP_ALERT"
         echo "AUDITD_RULE:${AUDISP_ALERT}" >> "$UNDO_MANIFEST"
@@ -2762,11 +2762,11 @@ ALERTEOF
 
         if [ -n "$AUDISP_PLUGIN_DIR" ]; then
             cat > "${AUDISP_PLUGIN_DIR}/lg-alert.conf" << PLUGEOF
-active = yes
-direction = out
-path = ${AUDISP_ALERT}
-type = always
-format = json
+            active = yes
+            direction = out
+            path = ${AUDISP_ALERT}
+            type = always
+            format = json
 PLUGEOF
             log_ok "Audisp plugin registered: ${AUDISP_PLUGIN_DIR}/lg-alert.conf"
             echo "AUDITD_RULE:${AUDISP_PLUGIN_DIR}/lg-alert.conf" >> "$UNDO_MANIFEST"
@@ -2775,8 +2775,8 @@ PLUGEOF
             # Fallback: cron checks audit log every minute
             AUDIT_CRON="/etc/cron.d/lg-audit-alert"
             cat > "$AUDIT_CRON" << CRONEOF
-# Linux Guardian — audit alert fallback (runs every minute)
-* * * * * root ausearch -k webshell -k tmp_exec -k priv_esc -ts recent 2>/dev/null | grep -q 'type=SYSCALL' && ausearch -k webshell -k tmp_exec -k priv_esc -ts recent 2>/dev/null | mail -s "[LG ALERT] Suspicious activity on \$(hostname)" ${ALERT_EMAIL}
+            # Linux Guardian — audit alert fallback (runs every minute)
+            * * * * * root ausearch -k webshell -k tmp_exec -k priv_esc -ts recent 2>/dev/null | grep -q 'type=SYSCALL' && ausearch -k webshell -k tmp_exec -k priv_esc -ts recent 2>/dev/null | mail -s "[LG ALERT] Suspicious activity on \$(hostname)" ${ALERT_EMAIL}
 CRONEOF
             chmod 640 "$AUDIT_CRON"
             echo "AUDITD_RULE:${AUDIT_CRON}" >> "$UNDO_MANIFEST"
@@ -2861,19 +2861,19 @@ else
         mkdir -p /etc/pure-ftpd
         log_info "ClamAV alert email: ${ALERT_EMAIL}"
         cat > /etc/pure-ftpd/clamav_check.sh << CLAMAVEOF
-#!/bin/bash
-# Linux Guardian — ClamAV upload scanner
-MAXSIZE=10485760
-ALERT="${ALERT_EMAIL}"
-[ -z "\$1" ] || [ ! -f "\$1" ] && exit 0
-if [ "\${UPLOAD_SIZE:-0}" -le "\$MAXSIZE" ] && command -v clamdscan &>/dev/null; then
-    if clamdscan --no-summary --infected "\$1" 2>/dev/null | grep -q FOUND; then
-        RESULT=\$(clamdscan --no-summary --infected "\$1" 2>/dev/null)
-        clamdscan --remove --no-summary "\$1" 2>/dev/null
-        printf "Infected upload removed:\n%s\n" "\$RESULT" \
-            | mail -s "[LG] Infected Upload" "\$ALERT"
-    fi
-fi
+        #!/bin/bash
+        # Linux Guardian — ClamAV upload scanner
+        MAXSIZE=10485760
+        ALERT="${ALERT_EMAIL}"
+        [ -z "\$1" ] || [ ! -f "\$1" ] && exit 0
+        if [ "\${UPLOAD_SIZE:-0}" -le "\$MAXSIZE" ] && command -v clamdscan &>/dev/null; then
+            if clamdscan --no-summary --infected "\$1" 2>/dev/null | grep -q FOUND; then
+                RESULT=\$(clamdscan --no-summary --infected "\$1" 2>/dev/null)
+                clamdscan --remove --no-summary "\$1" 2>/dev/null
+                printf "Infected upload removed:\n%s\n" "\$RESULT" \
+                    | mail -s "[LG] Infected Upload" "\$ALERT"
+            fi
+        fi
 CLAMAVEOF
         chmod 750 /etc/pure-ftpd/clamav_check.sh
         log_ok "ClamAV scanner: /etc/pure-ftpd/clamav_check.sh"
@@ -2994,41 +2994,41 @@ setup_snuffleupagus() {
     chmod 755 "$SNUFF_DIR"
 
     cat > "$SNUFF_RULES" << 'RULESEOF'
-# ══════════════════════════════════════════════════════════════════════════════
-# Linux Guardian — Snuffleupagus Rules (shared — all sites)
-# ══════════════════════════════════════════════════════════════════════════════
+    # ══════════════════════════════════════════════════════════════════════════════
+    # Linux Guardian — Snuffleupagus Rules (shared — all sites)
+    # ══════════════════════════════════════════════════════════════════════════════
 
-# ── Disable dangerous execution functions ─────────────────────────────────────
-sp.disable_function.function("system").drop();
-sp.disable_function.function("exec").drop();
-sp.disable_function.function("shell_exec").drop();
-sp.disable_function.function("passthru").drop();
-sp.disable_function.function("popen").drop();
-sp.disable_function.function("proc_open").drop();
-sp.disable_function.function("pcntl_exec").drop();
-sp.disable_function.function("pcntl_fork").drop();
-sp.disable_function.function("posix_setuid").drop();
-sp.disable_function.function("posix_setgid").drop();
-sp.disable_function.function("posix_seteuid").drop();
-sp.disable_function.function("posix_setegid").drop();
+    # ── Disable dangerous execution functions ─────────────────────────────────────
+    sp.disable_function.function("system").drop();
+    sp.disable_function.function("exec").drop();
+    sp.disable_function.function("shell_exec").drop();
+    sp.disable_function.function("passthru").drop();
+    sp.disable_function.function("popen").drop();
+    sp.disable_function.function("proc_open").drop();
+    sp.disable_function.function("pcntl_exec").drop();
+    sp.disable_function.function("pcntl_fork").drop();
+    sp.disable_function.function("posix_setuid").drop();
+    sp.disable_function.function("posix_setgid").drop();
+    sp.disable_function.function("posix_seteuid").drop();
+    sp.disable_function.function("posix_setegid").drop();
 
-# ── Eval — log first, switch to .drop() when confident ───────────────────────
-sp.disable_function.function("eval").log();
+    # ── Eval — log first, switch to .drop() when confident ───────────────────────
+    sp.disable_function.function("eval").log();
 
-# ── Cookie protection ─────────────────────────────────────────────────────────
-sp.cookie.name("*").encrypt().samesite("Strict").readonly();
+    # ── Cookie protection ─────────────────────────────────────────────────────────
+    sp.cookie.name("*").encrypt().samesite("Strict").readonly();
 
-# ── Block dangerous upload extensions ────────────────────────────────────────
-sp.upload.disable_upload.extensions("php,phtml,phar,php7,php8,pht").drop();
+    # ── Block dangerous upload extensions ────────────────────────────────────────
+    sp.upload.disable_upload.extensions("php,phtml,phar,php7,php8,pht").drop();
 
-# ── XXE protection ────────────────────────────────────────────────────────────
-sp.xxe_protection.enable();
+    # ── XXE protection ────────────────────────────────────────────────────────────
+    sp.xxe_protection.enable();
 
-# ── Unserialize HMAC — prevent object injection ───────────────────────────────
-sp.unserialize_hmac.enable();
+    # ── Unserialize HMAC — prevent object injection ───────────────────────────────
+    sp.unserialize_hmac.enable();
 
-# ── Global strict mode ────────────────────────────────────────────────────────
-sp.global_strict.enable();
+    # ── Global strict mode ────────────────────────────────────────────────────────
+    sp.global_strict.enable();
 RULESEOF
 
     chmod 640 "$SNUFF_RULES"
@@ -3058,10 +3058,10 @@ RULESEOF
                         backup_file "$pool_conf" "phpfpm_snuff"
                         cat >> "$pool_conf" << EOF
 
-; ── Snuffleupagus (Linux Guardian) ───────────────────
-; Loaded per-pool so each site uses the shared rules
-php_admin_value[extension]                = ${SNUFF_SO}
-php_admin_value[snuffleupagus.rules_file] = ${SNUFF_RULES}
+                        ; ── Snuffleupagus (Linux Guardian) ───────────────────
+                        ; Loaded per-pool so each site uses the shared rules
+                        php_admin_value[extension]                = ${SNUFF_SO}
+                        php_admin_value[snuffleupagus.rules_file] = ${SNUFF_RULES}
 EOF
                         log_ok "[FPM] Snuffleupagus → pool: $(basename "$pool_conf")"
                         ADDED_POOLS=$((ADDED_POOLS+1))
@@ -3077,9 +3077,9 @@ EOF
                         backup_file "$WWW_CONF" "phpfpm_snuff"
                         cat >> "$WWW_CONF" << EOF
 
-; ── Snuffleupagus (Linux Guardian) ───────────────────
-php_admin_value[extension]                = ${SNUFF_SO}
-php_admin_value[snuffleupagus.rules_file] = ${SNUFF_RULES}
+                        ; ── Snuffleupagus (Linux Guardian) ───────────────────
+                        php_admin_value[extension]                = ${SNUFF_SO}
+                        php_admin_value[snuffleupagus.rules_file] = ${SNUFF_RULES}
 EOF
                         log_ok "[FPM] Snuffleupagus → www.conf (fallback)"
                     else
@@ -3377,39 +3377,39 @@ watch_mode() {
             chmod 700 "$W_SESSION_PATH" 2>/dev/null
 
             cat > "$W_POOL_CONF" << POOLEOF
-; Linux Guardian — PHP-FPM Pool: ${SN}
-; Generated: ${TS}
-; Global settings inherited from php.ini
-; Per-site: open_basedir + session + logging
+            ; Linux Guardian — PHP-FPM Pool: ${SN}
+            ; Generated: ${TS}
+            ; Global settings inherited from php.ini
+            ; Per-site: open_basedir + session + logging
 
-[${SN}]
-user  = ${W_SITE_USER}
-group = ${W_SITE_GROUP}
+            [${SN}]
+            user  = ${W_SITE_USER}
+            group = ${W_SITE_GROUP}
 
-listen       = /run/php-fpm/${SN}.sock
-listen.owner = ${W_SOCK_OWNER}
-listen.group = ${W_SOCK_OWNER}
-listen.mode  = 0660
+            listen       = /run/php-fpm/${SN}.sock
+            listen.owner = ${W_SOCK_OWNER}
+            listen.group = ${W_SOCK_OWNER}
+            listen.mode  = 0660
 
-pm                   = dynamic
-pm.max_children      = 10
-pm.start_servers     = 2
-pm.min_spare_servers = 1
-pm.max_spare_servers = 3
-pm.max_requests      = 500
+            pm                   = dynamic
+            pm.max_children      = 10
+            pm.start_servers     = 2
+            pm.min_spare_servers = 1
+            pm.max_spare_servers = 3
+            pm.max_requests      = 500
 
-; Per-site: open_basedir only
-php_admin_value[open_basedir]   = ${W_OPEN_BASEDIR}
+            ; Per-site: open_basedir only
+            php_admin_value[open_basedir]   = ${W_OPEN_BASEDIR}
 
-; Per-site: session isolation
-php_value[session.save_handler] = files
-php_value[session.save_path]    = ${W_SESSION_PATH}
+            ; Per-site: session isolation
+            php_value[session.save_handler] = files
+            php_value[session.save_path]    = ${W_SESSION_PATH}
 
-; Per-site: logging
-php_admin_value[error_log]      = /var/log/php-fpm/${SN}-error.log
-access.log                      = /var/log/php-fpm/${SN}-access.log
-slowlog                         = /var/log/php-fpm/${SN}-slow.log
-request_slowlog_timeout         = 5s
+            ; Per-site: logging
+            php_admin_value[error_log]      = /var/log/php-fpm/${SN}-error.log
+            access.log                      = /var/log/php-fpm/${SN}-access.log
+            slowlog                         = /var/log/php-fpm/${SN}-slow.log
+            request_slowlog_timeout         = 5s
 POOLEOF
             chmod 640 "$W_POOL_CONF"
 
@@ -3492,7 +3492,7 @@ if [ "$RUN_MODE" = "cron" ]; then
     # Find new users
     _NEW_USERS=()
     for _u in "${_CURRENT_USERS[@]}"; do
-_found=false
+        _found=false
         for _k in "${_KNOWN_USERS[@]}"; do
             [ "$_u" = "$_k" ] && _found=true && break
         done
@@ -3530,7 +3530,7 @@ _found=false
                     [[ "$_ini" == *cli* ]] && continue
                     if grep -qE "^\s*open_basedir\s*=" "$_ini"; then
                         # Append new path to existing open_basedir
-_cur=""
+                        _cur=""
                         _cur=$(grep -E "^\s*open_basedir\s*=" "$_ini" | head -1)
                         echo "$_cur" | grep -q "$_NEW_PATH" || \
                             sed -i "s|^\s*open_basedir\s*=.*|&:${_NEW_PATH}|" "$_ini"
@@ -3554,24 +3554,24 @@ _cur=""
                     chown "${_W_USER}:${_W_GROUP}" "$_W_SESSION" 2>/dev/null
                     chmod 700 "$_W_SESSION" 2>/dev/null
                     cat > "$_W_POOL_CONF" << CRON_POOL
-; Linux Guardian — auto-created for new user: ${_u}
-; Generated: ${_TS}
-[${_u}]
-user  = ${_W_USER}
-group = ${_W_GROUP}
-listen       = /run/php-fpm/${_u}.sock
-listen.owner = apache
-listen.group = apache
-listen.mode  = 0660
-pm = dynamic
-pm.max_children      = 10
-pm.start_servers     = 2
-pm.min_spare_servers = 1
-pm.max_spare_servers = 3
-pm.max_requests      = 500
-php_admin_value[open_basedir] = ${_NEW_PATH}:/tmp:/usr/share/php
-php_value[session.save_path]  = ${_W_SESSION}
-php_admin_value[error_log]    = /var/log/php-fpm/${_u}-error.log
+                    ; Linux Guardian — auto-created for new user: ${_u}
+                    ; Generated: ${_TS}
+                    [${_u}]
+                    user  = ${_W_USER}
+                    group = ${_W_GROUP}
+                    listen       = /run/php-fpm/${_u}.sock
+                    listen.owner = apache
+                    listen.group = apache
+                    listen.mode  = 0660
+                    pm = dynamic
+                    pm.max_children      = 10
+                    pm.start_servers     = 2
+                    pm.min_spare_servers = 1
+                    pm.max_spare_servers = 3
+                    pm.max_requests      = 500
+                    php_admin_value[open_basedir] = ${_NEW_PATH}:/tmp:/usr/share/php
+                    php_value[session.save_path]  = ${_W_SESSION}
+                    php_admin_value[error_log]    = /var/log/php-fpm/${_u}-error.log
 CRON_POOL
                     chmod 640 "$_W_POOL_CONF"
                     restart_php_services "fpm" 2>/dev/null || true
