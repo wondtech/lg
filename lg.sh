@@ -36,6 +36,21 @@
 
 set -euo pipefail
 
+# ── Default values for all flags (must come before any usage) ─────────────────
+RUN_MODE="interactive"
+DRY_RUN=false
+UNDO_MODE=false
+FIXMAIL_MODE=false
+SCAN_MODE=false
+AUTO_ANALYZE_MODE=false
+INTEGRITY_MODE=false
+FORCE_MODE=false
+UPDATE_MODE=false
+LG_STATE_FILE="/root/lg/.applied"
+LG_SCAN_LOG="/var/log/lg-scan.log"
+LG_ANALYZE_LOG="/var/log/lg-analyze.log"
+LG_INTEGRITY_DB="/root/lg/integrity.db"
+
 # ─── Colours ────────────────────────────────────────────────────────────────
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -1003,22 +1018,6 @@ if [ "$(id -u)" -ne 0 ]; then
     log_error "Must be run as root.  Run: sudo $0"
     exit 1
 fi
-
-# Parse arguments
-RUN_MODE="interactive"
-DRY_RUN=false
-UNDO_MODE=false
-FIXMAIL_MODE=false
-SCAN_MODE=false
-AUTO_ANALYZE_MODE=false
-INTEGRITY_MODE=false
-FORCE_MODE=false
-UPDATE_MODE=false
-
-LG_STATE_FILE="/root/lg/.applied"
-LG_SCAN_LOG="/var/log/lg-scan.log"
-LG_ANALYZE_LOG="/var/log/lg-analyze.log"
-LG_INTEGRITY_DB="/root/lg/integrity.db"
 
 for arg in "$@"; do
     case "$arg" in
