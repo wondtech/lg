@@ -858,9 +858,9 @@ _lg_status() {
     echo -e "  ${BOLD}[PHP-FPM]${NC} Status check"
 
     if systemctl is-active --quiet php-fpm 2>/dev/null; then
-        echo -e "  ${GREEN}✓${NC} [5.1] PHP-FPM service      — running"
+        echo -e "  ${GREEN}✓${NC} [5.1] PHP-FPM service     — running"
     else
-        echo -e "  ${RED}✗${NC} [5.1] PHP-FPM service      — not running"
+        echo -e "  ${RED}✗${NC} [5.1] PHP-FPM service     — not running"
     fi
 
     # [5.2] Panel
