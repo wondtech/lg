@@ -1,6 +1,6 @@
 #!/bin/bash
 # ══════════════════════════════════════════════════════════════════════════════
-# Linux Guardian v1.0 — Production-Ready Server Security Hardening
+# Linux Guardian v1.1 — Production-Ready Server Security Hardening
 # By WondTech.com | info@wondtech.com
 #
 # Security Layers (Defence in Depth):
@@ -8,20 +8,30 @@
 #   [2] Kernel Hardening      — Harden kernel + sysctl
 #   [3] System Files          — Secure critical file permissions
 #   [4] MySQL/MariaDB         — Harden database configuration
-#   [5] PHP disable_functions — Block shell_exec/system/exec
+#   [5] PHP disable_functions — Block shell_exec/system/exec + open_basedir
+#   [5.1] PHP-FPM Pools       — Isolate each site with open_basedir
+#   [5.2] Panel php.ini       — Fix date.timezone for all control panels
 #   [6] noexec /tmp /var/tmp  — Prevent uploaded binary execution
-#   [7] AppArmor / SELinux    — Mandatory access control for web server
+#   [7] AppArmor / SELinux    — MAC + Dovecot/vmail context fixes
 #   [8] Auditd                — Real-time monitoring and alerting
 #   [A] FTP + ClamAV          — Scan uploaded files for malware
 #   [B] Snuffleupagus         — PHP RASP
 #
 # Usage:
-#   sudo lg                  Interactive (recommended first run)
+#   sudo lg                  Interactive — recommended for first run
+#   sudo lg                  Second run  — shows security status dashboard
+#   sudo lg --force          Re-apply all layers
 #   sudo lg --auto           Auto mode — no prompts
-#   sudo lg --cron           Silent mode for cron jobs
 #   sudo lg --dry-run        Preview changes without applying
 #   sudo lg --undo           Rollback all changes from last run
-#   sudo lg --watch          Watch for new sites and isolate them automatically
+#   sudo lg --cron           Silent mode — logs to /var/log/lg-hardening.log
+#   sudo lg --watch          Watch for new sites and harden automatically
+#   sudo lg --fixmail        Fix Dovecot/vmail SELinux contexts
+#   sudo lg --scan           Scan for webshells and reverse shells
+#   sudo lg --auto-analyze   Start background behavior monitoring (daemon)
+#   sudo lg --integrity      Check integrity of critical system files
+#   sudo lg --update         Update to latest version from lg.wondtech.com
+#   sudo lg --help           Show full help
 # ══════════════════════════════════════════════════════════════════════════════
 
 set -euo pipefail
@@ -38,6 +48,8 @@ NC='\033[0m'
 _lg_exit() {
     local code=$?
     [ $code -eq 0 ] && return
+    # Only show error after globals are initialised (TIMESTAMP set)
+    [ -z "${TIMESTAMP:-}" ] && return
     echo -e "\n  ${RED}[ERROR]${NC}   Script exited unexpectedly (code: ${code})" >&2
     echo -e "  ${YELLOW}[WARN]${NC}    Some layers may be incomplete — review log: ${LOG_FILE:-/var/log/lg-hardening.log}" >&2
 }
@@ -53,7 +65,7 @@ print_banner() {
     echo "   ▐▙▄▄▖▗▄█▄▖▐▌  ▐▌▝▚▄▞▘▗▞▘▝▚▖  ▝▚▄▞▘▝▚▄▞▘▐▌ ▐▌▐▌ ▐▌▐▙▄▄▀▗▄█▄▖▐▌ ▐▌▐▌"
     echo ""
     echo "   ╔══════════════════════════════════════════════════════════════════╗"
-    echo "   ║  Linux Server Security Hardening  v1.0  |  WondTech.com          ║"
+    echo "   ║  Linux Server Security Hardening  v1.1  |  WondTech.com          ║"
     echo "   ║  One Script · Defence in Depth · Zero Compromise                 ║"
     echo "   ╚══════════════════════════════════════════════════════════════════╝"
     echo "────────────────────────────────────────────────────────────────────────"
@@ -239,6 +251,748 @@ restart_php_services() {
 }
 
 # ══════════════════════════════════════════════════════════════════════════════
+# FUNCTION: _lg_fixmail — Fix Dovecot/vmail SELinux contexts
+# ══════════════════════════════════════════════════════════════════════════════
+_lg_fixmail() {
+    section "FIXMAIL: Dovecot / vmail SELinux Fix"
+
+    # Detect vmail path
+    _FM_VMAIL=""
+    for _vp in /var/vmail /home/vmail /var/mail/vhosts /var/spool/mail; do
+        [ -d "$_vp" ] && _FM_VMAIL="$_vp" && break
+    done
+
+    if [ -z "$_FM_VMAIL" ]; then
+        log_warn "No vmail directory found — nothing to fix"
+        return 0
+    fi
+    log_info "Mail storage: ${_FM_VMAIL}"
+
+    # Detect correct SELinux type
+    _FM_TYPE="mail_spool_t"
+    grep -q "dovecot_var_t" \
+        /etc/selinux/targeted/contexts/files/file_contexts 2>/dev/null \
+        && _FM_TYPE="dovecot_var_t"
+    log_info "SELinux type: ${_FM_TYPE}"
+
+    # Register fcontext
+    if command -v semanage &>/dev/null; then
+        semanage fcontext -d "${_FM_VMAIL}(/.*)?" 2>/dev/null || true
+        semanage fcontext -a -t "$_FM_TYPE" "${_FM_VMAIL}(/.*)?" 2>/dev/null || true
+        semanage fcontext -l 2>/dev/null | grep -q "${_FM_VMAIL}.*${_FM_TYPE}" \
+            && log_ok "fcontext registered: ${_FM_VMAIL} → ${_FM_TYPE}" \
+            || log_warn "fcontext registration failed — applying chcon directly"
+    fi
+
+    # Remove stale lock files + relabel
+    find "$_FM_VMAIL" -name "*.lock" -delete 2>/dev/null || true
+    setenforce 0 2>/dev/null || true
+    restorecon -RFv "$_FM_VMAIL" 2>/dev/null | tail -5 || true
+    setenforce 1 2>/dev/null || true
+    log_ok "restorecon applied: ${_FM_VMAIL}"
+
+    # Fix Dovecot log contexts
+    for _dlog in /var/log/dovecot.log /var/log/dovecot-info.log /var/log/dovecot-debug.log; do
+        [ -f "$_dlog" ] || continue
+        command -v semanage &>/dev/null && {
+            semanage fcontext -a -t dovecot_var_log_t "$_dlog" 2>/dev/null \
+                || semanage fcontext -m -t dovecot_var_log_t "$_dlog" 2>/dev/null || true
+        }
+        chcon -t dovecot_var_log_t "$_dlog" 2>/dev/null || true
+        log_ok "Log context fixed: ${_dlog}"
+    done
+
+    # Apply dovecot_lg policy
+    if command -v checkmodule &>/dev/null && command -v semodule_package &>/dev/null; then
+        _FM_TE=$(mktemp /tmp/dovecot_lg_XXXXXX.te)
+        if [ "$_FM_TYPE" = "dovecot_var_t" ]; then
+            cat > "$_FM_TE" << 'DOVEPOL'
+module dovecot_lg 1.1;
+require {
+    type dovecot_t; type mysqld_db_t; type var_t; type dovecot_var_t;
+    class file { append create getattr link lock map open read rename unlink write };
+    class dir  { add_name getattr read remove_name write };
+    class sock_file write;
+}
+allow dovecot_t mysqld_db_t:sock_file write;
+allow dovecot_t var_t:dir  { add_name getattr read remove_name write };
+allow dovecot_t var_t:file { append create getattr link lock map open read rename unlink write };
+allow dovecot_t dovecot_var_t:dir  { add_name getattr read remove_name write };
+allow dovecot_t dovecot_var_t:file { append create getattr link lock map open read rename unlink write };
+DOVEPOL
+        else
+            cat > "$_FM_TE" << 'DOVEPOL'
+module dovecot_lg 1.1;
+require {
+    type dovecot_t; type mysqld_db_t; type var_t; type mail_spool_t;
+    class file { append create getattr link lock map open read rename unlink write };
+    class dir  { add_name getattr read remove_name write };
+    class sock_file write;
+}
+allow dovecot_t mysqld_db_t:sock_file write;
+allow dovecot_t var_t:dir  { add_name getattr read remove_name write };
+allow dovecot_t var_t:file { append create getattr link lock map open read rename unlink write };
+allow dovecot_t mail_spool_t:dir  { add_name getattr read remove_name write };
+allow dovecot_t mail_spool_t:file { append create getattr link lock map open read rename unlink write };
+DOVEPOL
+        fi
+        _FM_MOD="${_FM_TE%.te}.mod"
+        _FM_PP="${_FM_TE%.te}.pp"
+        checkmodule -M -m -o "$_FM_MOD" "$_FM_TE" 2>/dev/null \
+            && semodule_package -o "$_FM_PP" -m "$_FM_MOD" 2>/dev/null \
+            && semodule -i "$_FM_PP" 2>/dev/null \
+            && log_ok "SELinux policy applied: dovecot_lg v1.1" \
+            || log_warn "dovecot_lg policy failed — check checkpolicy package"
+        rm -f "$_FM_TE" "$_FM_MOD" "$_FM_PP" 2>/dev/null || true
+    else
+        log_warn "checkmodule not found — install: yum install checkpolicy -y"
+    fi
+
+    setsebool -P domain_can_mmap_files 1 2>/dev/null \
+        && log_ok "SELinux bool: domain_can_mmap_files = on" || true
+
+    # Re-register fcontext after semodule (survives reboot)
+    if command -v semanage &>/dev/null; then
+        semanage fcontext -d "${_FM_VMAIL}(/.*)?" 2>/dev/null || true
+        semanage fcontext -a -t "$_FM_TYPE" "${_FM_VMAIL}(/.*)?" 2>/dev/null || true
+        log_ok "fcontext re-registered (survives reboot)"
+    fi
+
+    # Restart Dovecot
+    if systemctl is-active --quiet dovecot 2>/dev/null; then
+        systemctl restart dovecot 2>/dev/null \
+            && log_ok "Dovecot restarted successfully" \
+            || log_warn "Dovecot restart failed"
+    elif systemctl is-enabled --quiet dovecot 2>/dev/null; then
+        systemctl start dovecot 2>/dev/null \
+            && log_ok "Dovecot started successfully" \
+            || log_warn "Dovecot failed to start"
+    else
+        log_skip "Dovecot not installed"
+    fi
+
+    log_ok "fixmail complete"
+}
+
+# ══════════════════════════════════════════════════════════════════════════════
+# FUNCTION: _lg_scan — Scan for webshells and reverse shells
+# ══════════════════════════════════════════════════════════════════════════════
+_lg_scan() {
+    local SCAN_PATH="${1:-}"
+    # Detect scan paths
+    local PATHS=()
+    if [ -n "$SCAN_PATH" ] && [ -d "$SCAN_PATH" ]; then
+        PATHS=("$SCAN_PATH")
+    else
+        for d in /var/www /home/*/public_html /tmp /var/tmp /dev/shm; do
+            [ -d "$d" ] && PATHS+=("$d")
+        done
+    fi
+
+    section "SCAN: Malicious File Detection"
+    log_info "Scanning: ${PATHS[*]}"
+    log_info "Log: ${LG_SCAN_LOG}"
+    echo ""
+
+    local FOUND=0
+    local TS
+    TS=$(date '+%Y-%m-%d %H:%M:%S')
+    echo "# Linux Guardian Scan — ${TS}" >> "$LG_SCAN_LOG"
+
+    # PHP webshell patterns
+    local PHP_PATTERNS=(
+        'eval\s*(\s*base64_decode'
+        'eval\s*(\s*gzinflate'
+        'eval\s*(\s*str_rot13'
+        'eval\s*(\s*gzuncompress'
+        '\$_\(GET\|POST\|REQUEST\|COOKIE\)\s*\[.*\]\s*('
+        'system\s*(\s*\$_'
+        'passthru\s*(\s*\$_'
+        'shell_exec\s*(\s*\$_'
+        'exec\s*(\s*\$_'
+        'popen\s*(\s*\$_'
+        'proc_open\s*(\s*\$_'
+        'assert\s*(\s*\$_'
+        'preg_replace.*\/e[^a-z]'
+        'base64_decode.*eval'
+        'FilesMan\|b374k\|c99shell\|r57shell\|WSO\|indoxploit'
+        'uname.*-a.*\$_\|id.*\$_.*whoami'
+        '@eval\|@system\|@exec\|@passthru'
+        'chr(99).chr(109).chr(100)'
+        'gzinflate.*base64_decode\|base64_decode.*gzinflate'
+    )
+
+    # Perl/Python reverse shell patterns
+    local GENERAL_PATTERNS=(
+        'use\s*Socket.*connect.*STDOUT'
+        'import\s*socket.*subprocess\|subprocess.*import\s*socket'
+        'os\.system\|os\.popen\|subprocess\.call'
+        '/dev/tcp/\|/dev/udp/'
+        'bash\s*-i\s*>&\s*/dev/tcp'
+        'python.*socket.*connect\|perl.*socket.*connect'
+        'nc\s*-e\s*/bin\|ncat\s*-e\s*/bin'
+        'bash.*>.*&.*tcp\|sh.*>.*&.*tcp'
+    )
+
+    _scan_dir() {
+        local dir="$1"
+        [ -d "$dir" ] || return 0
+
+        # PHP files
+        while IFS= read -r f; do
+            [ -f "$f" ] || continue
+            for pat in "${PHP_PATTERNS[@]}"; do
+                if grep -qsiE "$pat" "$f" 2>/dev/null; then
+                    echo -e "  ${RED}[WARN]${NC} PHP webshell: $f"
+                    echo -e "         Pattern: $pat"
+                    echo "[WARN] PHP webshell: $f | Pattern: $pat" >> "$LG_SCAN_LOG"
+                    FOUND=$((FOUND+1))
+                    break
+                fi
+            done
+        done < <(find "$dir" -type f \( -name "*.php" -o -name "*.php5" \
+            -o -name "*.php7" -o -name "*.phtml" \) 2>/dev/null)
+
+        # Perl/Python/Shell files + hidden files
+        while IFS= read -r f; do
+            [ -f "$f" ] || continue
+            for pat in "${GENERAL_PATTERNS[@]}"; do
+                if grep -qsiE "$pat" "$f" 2>/dev/null; then
+                    echo -e "  ${RED}[WARN]${NC} Reverse shell: $f"
+                    echo -e "         Pattern: $pat"
+                    echo "[WARN] Reverse shell: $f | Pattern: $pat" >> "$LG_SCAN_LOG"
+                    FOUND=$((FOUND+1))
+                    break
+                fi
+            done
+        done < <(find "$dir" -type f \( -name "*.pl" -o -name "*.py" \
+            -o -name "*.sh" -o -name ".*" \) 2>/dev/null)
+
+        # Executable files in upload dirs
+        while IFS= read -r f; do
+            [ -f "$f" ] || continue
+            echo -e "  ${YELLOW}[WARN]${NC} Executable in web dir: $f"
+            echo "[WARN] Executable in web dir: $f" >> "$LG_SCAN_LOG"
+            FOUND=$((FOUND+1))
+        done < <(find "$dir" -type f \( -name "*.sh" -o -name "*.pl" \
+            -o -name "*.py" -o -name "*.elf" \) \
+            -not -path "*/vendor/*" -not -path "*/.git/*" 2>/dev/null)
+    }
+
+    for p in "${PATHS[@]}"; do
+        log_info "Scanning: $p"
+        _scan_dir "$p"
+    done
+
+    echo ""
+    if [ "$FOUND" -gt 0 ]; then
+        echo -e "  ${RED}[ALERT]${NC} ${FOUND} suspicious file(s) found — review: ${LG_SCAN_LOG}"
+        # Send email alert
+        if command -v mail &>/dev/null; then
+            echo "Linux Guardian SCAN ALERT: ${FOUND} suspicious files on $(hostname)" \
+                | mail -s "[LG ALERT] Webshell scan: $(hostname)" "${ALERT_EMAIL:-root}" \
+                2>/dev/null || true
+        fi
+    else
+        echo -e "  ${GREEN}[OK]${NC}      No suspicious files found"
+    fi
+    log_ok "Scan complete — ${FOUND} finding(s)"
+}
+
+# ══════════════════════════════════════════════════════════════════════════════
+# FUNCTION: _lg_analyze — Analyze system behavior for anomalies
+# ══════════════════════════════════════════════════════════════════════════════
+_lg_analyze() {
+    section "ANALYZE: System Behavior Analysis"
+    log_info "Log: ${LG_ANALYZE_LOG}"
+    echo ""
+
+    local TS ISSUES=0
+    TS=$(date '+%Y-%m-%d %H:%M:%S')
+    echo "# Linux Guardian Analysis — ${TS}" >> "$LG_ANALYZE_LOG"
+
+    # ── 1. Suspicious outbound connections ────────────────────────────────────
+    echo -e "  ${BOLD}[NET]${NC} Outbound connections:"
+    local EXPECTED_PORTS="80|443|22|25|143|465|587|993|3306|5432"
+    while IFS= read -r conn; do
+        local proc port
+        proc=$(echo "$conn" | awk '{print $7}' | cut -d/ -f2 || true)
+        port=$(echo "$conn" | awk '{print $5}' | rev | cut -d: -f1 | rev || true)
+        if ! echo "$port" | grep -qE "^(${EXPECTED_PORTS})$"; then
+            echo -e "    ${YELLOW}⚠${NC} Suspicious: $conn"
+            echo "[WARN] Suspicious connection: $conn" >> "$LG_ANALYZE_LOG"
+            ISSUES=$((ISSUES+1))
+        fi
+    done < <(ss -tnp state established 2>/dev/null | grep -v "127.0.0.1\|::1" | tail -20 || true)
+    [ "$ISSUES" -eq 0 ] && echo -e "    ${GREEN}✓${NC} No suspicious connections"
+
+    # ── 2. Suspicious running processes ───────────────────────────────────────
+    echo ""
+    echo -e "  ${BOLD}[PROC]${NC} Suspicious processes:"
+    local PROC_ISSUES=0
+    # Processes running from /tmp or /dev/shm
+    while IFS= read -r proc; do
+        echo -e "    ${RED}⚠${NC} Process from /tmp|/dev: $proc"
+        echo "[WARN] Suspicious process: $proc" >> "$LG_ANALYZE_LOG"
+        PROC_ISSUES=$((PROC_ISSUES+1))
+    done < <(ps aux 2>/dev/null | grep -E "/tmp/|/dev/shm" | grep -v grep | head -10 || true)
+    # Hidden process names (empty cmdline)
+    while IFS= read -r pid; do
+        [ -z "$(cat /proc/$pid/cmdline 2>/dev/null)" ] && continue
+        local cmd
+        cmd=$(tr -d '\0' < /proc/$pid/cmdline 2>/dev/null | head -c 50 || true)
+        [[ "$cmd" == .* ]] && {
+            echo -e "    ${RED}⚠${NC} Hidden process (PID $pid): $cmd"
+            echo "[WARN] Hidden process PID=$pid cmd=$cmd" >> "$LG_ANALYZE_LOG"
+            PROC_ISSUES=$((PROC_ISSUES+1))
+        }
+    done < <(ls /proc/ 2>/dev/null | grep -E '^[0-9]+$' | head -50 || true)
+    [ "$PROC_ISSUES" -eq 0 ] && echo -e "    ${GREEN}✓${NC} No suspicious processes"
+    ISSUES=$((ISSUES+PROC_ISSUES))
+
+    # ── 3. Recently modified system files ─────────────────────────────────────
+    echo ""
+    echo -e "  ${BOLD}[FILES]${NC} System files modified in last 24h:"
+    local FILE_ISSUES=0
+    while IFS= read -r f; do
+        echo -e "    ${YELLOW}⚠${NC} Modified: $f"
+        echo "[WARN] System file modified: $f" >> "$LG_ANALYZE_LOG"
+        FILE_ISSUES=$((FILE_ISSUES+1))
+    done < <(find /etc /usr/bin /usr/sbin /bin /sbin \
+        -newer /proc/1/exe -type f 2>/dev/null \
+        | grep -vE "\.pyc$|__pycache__|\.log$" | head -10 || true)
+    [ "$FILE_ISSUES" -eq 0 ] && echo -e "    ${GREEN}✓${NC} No system files modified"
+    ISSUES=$((ISSUES+FILE_ISSUES))
+
+    # ── 4. Failed login attempts ───────────────────────────────────────────────
+    echo ""
+    echo -e "  ${BOLD}[AUTH]${NC} Failed logins (last 1h):"
+    local FAIL_COUNT=0
+    FAIL_COUNT=$(grep "Failed password" /var/log/secure /var/log/auth.log 2>/dev/null \
+        | awk -v d="$(date -d '1 hour ago' '+%b %e %H' 2>/dev/null || date '+%b %e %H')" \
+        '$0 >= d' | wc -l || echo 0)
+    if [ "$FAIL_COUNT" -gt 50 ]; then
+        echo -e "    ${RED}⚠${NC} ${FAIL_COUNT} failed logins — possible brute force"
+        echo "[WARN] ${FAIL_COUNT} failed logins in last hour" >> "$LG_ANALYZE_LOG"
+        ISSUES=$((ISSUES+1))
+    else
+        echo -e "    ${GREEN}✓${NC} ${FAIL_COUNT} failed logins (normal)"
+    fi
+
+    # ── 5. Suspicious crontab entries ─────────────────────────────────────────
+    echo ""
+    echo -e "  ${BOLD}[CRON]${NC} Crontab entries:"
+    local CRON_ISSUES=0
+    while IFS= read -r entry; do
+        if echo "$entry" | grep -qE "/tmp/|/dev/shm|wget|curl|bash -i|nc "; then
+            echo -e "    ${RED}⚠${NC} Suspicious cron: $entry"
+            echo "[WARN] Suspicious crontab: $entry" >> "$LG_ANALYZE_LOG"
+            CRON_ISSUES=$((CRON_ISSUES+1))
+        fi
+    done < <({ crontab -l 2>/dev/null
+                for f in /etc/cron* /var/spool/cron/crontabs/*; do
+                    [ -f "$f" ] && cat "$f" 2>/dev/null
+                done; } | grep -v "^#" || true)
+    [ "$CRON_ISSUES" -eq 0 ] && echo -e "    ${GREEN}✓${NC} No suspicious cron entries"
+    ISSUES=$((ISSUES+CRON_ISSUES))
+
+    # ── 6. Listening ports check ──────────────────────────────────────────────
+    echo ""
+    echo -e "  ${BOLD}[PORTS]${NC} Unexpected listening ports:"
+    local PORT_ISSUES=0
+    local KNOWN_PORTS="22|80|443|25|143|465|587|993|3306|5432|8080|8443|2030|2031|2082|2083|2086|2087|2095|2302"
+    while IFS= read -r port_line; do
+        local lport
+        lport=$(echo "$port_line" | awk '{print $5}' | rev | cut -d: -f1 | rev || true)
+        if ! echo "$lport" | grep -qE "^(${KNOWN_PORTS})$"; then
+            echo -e "    ${YELLOW}⚠${NC} Unexpected port: $port_line"
+            echo "[INFO] Unexpected listening port: $port_line" >> "$LG_ANALYZE_LOG"
+            PORT_ISSUES=$((PORT_ISSUES+1))
+        fi
+    done < <(ss -tlnp 2>/dev/null | tail -n +2 || true)
+    [ "$PORT_ISSUES" -eq 0 ] && echo -e "    ${GREEN}✓${NC} All listening ports look normal"
+
+    echo ""
+    echo "────────────────────────────────────────────────────────────────────────"
+    if [ "$ISSUES" -gt 0 ]; then
+        echo -e "  ${RED}[ALERT]${NC} ${ISSUES} anomalie(s) detected — review: ${LG_ANALYZE_LOG}"
+        if command -v mail &>/dev/null; then
+            echo "Linux Guardian ANALYZE ALERT: ${ISSUES} anomalies on $(hostname)" \
+                | mail -s "[LG ALERT] Behavior analysis: $(hostname)" "${ALERT_EMAIL:-root}" \
+                2>/dev/null || true
+        fi
+    else
+        echo -e "  ${GREEN}[OK]${NC}      System behavior looks normal"
+    fi
+    log_ok "Analysis complete — ${ISSUES} anomalie(s)"
+}
+
+# ══════════════════════════════════════════════════════════════════════════════
+# FUNCTION: _lg_integrity — File integrity check
+# ══════════════════════════════════════════════════════════════════════════════
+_lg_integrity() {
+    section "INTEGRITY: Critical File Integrity Check"
+
+    local CRITICAL_FILES=(
+        /etc/passwd /etc/shadow /etc/group /etc/gshadow
+        /etc/ssh/sshd_config /etc/sudoers
+        /boot/grub2/grub.cfg /boot/grub/grub.cfg
+        /usr/bin/sudo /usr/bin/su /usr/sbin/sshd
+        /usr/sbin/useradd /usr/sbin/userdel
+    )
+
+    if [ ! -f "$LG_INTEGRITY_DB" ]; then
+        # First run — build database
+        log_info "Building integrity database: ${LG_INTEGRITY_DB}"
+        mkdir -p "$(dirname "$LG_INTEGRITY_DB")"
+        : > "$LG_INTEGRITY_DB"
+        for f in "${CRITICAL_FILES[@]}"; do
+            [ -f "$f" ] || continue
+            local hash
+            hash=$(sha256sum "$f" 2>/dev/null | awk '{print $1}' || true)
+            [ -n "$hash" ] && echo "${hash}  ${f}" >> "$LG_INTEGRITY_DB"
+            log_ok "Recorded: $f"
+        done
+        chmod 600 "$LG_INTEGRITY_DB"
+        log_ok "Integrity database created: ${LG_INTEGRITY_DB}"
+        log_info "Run 'sudo lg --integrity' again to verify"
+        return 0
+    fi
+
+    # Verify against database
+    local CHANGES=0
+    log_info "Verifying against: ${LG_INTEGRITY_DB}"
+    echo ""
+    while IFS= read -r line; do
+        local stored_hash stored_file current_hash
+        stored_hash=$(echo "$line" | awk '{print $1}')
+        stored_file=$(echo "$line" | awk '{print $2}')
+        [ -f "$stored_file" ] || {
+            echo -e "  ${RED}[WARN]${NC} MISSING: ${stored_file}"
+            echo "[WARN] File missing: ${stored_file}" >> "$LG_ANALYZE_LOG"
+            CHANGES=$((CHANGES+1))
+            continue
+        }
+        current_hash=$(sha256sum "$stored_file" 2>/dev/null | awk '{print $1}' || true)
+        if [ "$current_hash" != "$stored_hash" ]; then
+            echo -e "  ${RED}[WARN]${NC} MODIFIED: ${stored_file}"
+            echo "[WARN] File modified: ${stored_file}" >> "$LG_ANALYZE_LOG"
+            CHANGES=$((CHANGES+1))
+        else
+            echo -e "  ${GREEN}[OK]${NC}      ${stored_file}"
+        fi
+    done < "$LG_INTEGRITY_DB"
+
+    echo ""
+    if [ "$CHANGES" -gt 0 ]; then
+        echo -e "  ${RED}[ALERT]${NC} ${CHANGES} file(s) changed since last check"
+        if command -v mail &>/dev/null; then
+            echo "Linux Guardian INTEGRITY ALERT: ${CHANGES} files changed on $(hostname)" \
+                | mail -s "[LG ALERT] Integrity check: $(hostname)" "${ALERT_EMAIL:-root}" \
+                2>/dev/null || true
+        fi
+    else
+        echo -e "  ${GREEN}[OK]${NC}      All critical files intact"
+    fi
+    log_ok "Integrity check complete — ${CHANGES} change(s)"
+}
+
+# ══════════════════════════════════════════════════════════════════════════════
+# FUNCTION: _lg_auto_analyze — Background monitoring daemon
+# ══════════════════════════════════════════════════════════════════════════════
+_lg_auto_analyze() {
+    local INTERVAL=300  # 5 minutes
+    local PID_FILE="/var/run/lg-analyze.pid"
+
+    # Check if already running
+    if [ -f "$PID_FILE" ] && kill -0 "$(cat "$PID_FILE")" 2>/dev/null; then
+        log_warn "lg-analyze already running (PID: $(cat "$PID_FILE"))"
+        log_info "Stop with: kill $(cat "$PID_FILE")"
+        return 0
+    fi
+
+    section "AUTO-ANALYZE: Starting background monitoring (every ${INTERVAL}s)"
+    log_info "PID file: ${PID_FILE}"
+    log_info "Log: ${LG_ANALYZE_LOG}"
+    log_info "Stop with: kill \$(cat ${PID_FILE})"
+    echo ""
+
+    # Run as background daemon
+    (
+        echo $$ > "$PID_FILE"
+        while true; do
+            {
+                echo "# ── Auto-analyze $(date '+%Y-%m-%d %H:%M:%S') ──"
+                # Quick checks only in daemon mode
+                # 1. Suspicious processes
+                ps aux 2>/dev/null | grep -E "/tmp/|/dev/shm" | grep -v grep | while read -r p; do
+                    echo "[AUTO-WARN] Suspicious process: $p"
+                    command -v mail &>/dev/null && \
+                        echo "$p" | mail -s "[LG AUTO-ALERT] Suspicious process: $(hostname)" \
+                        "${ALERT_EMAIL:-root}" 2>/dev/null || true
+                done
+                # 2. Executable files in /tmp
+                find /tmp /var/tmp -type f -perm /111 2>/dev/null | while read -r f; do
+                    echo "[AUTO-WARN] Executable in /tmp: $f"
+                    command -v mail &>/dev/null && \
+                        echo "$f" | mail -s "[LG AUTO-ALERT] Executable in /tmp: $(hostname)" \
+                        "${ALERT_EMAIL:-root}" 2>/dev/null || true
+                done
+                # 3. New SUID files
+                find / -xdev -perm -4000 -type f 2>/dev/null | \
+                    grep -vF "$(cat /root/lg/.suid_baseline 2>/dev/null || true)" | \
+                    while read -r f; do
+                        echo "[AUTO-WARN] New SUID file: $f"
+                        command -v mail &>/dev/null && \
+                            echo "$f" | mail -s "[LG AUTO-ALERT] New SUID: $(hostname)" \
+                            "${ALERT_EMAIL:-root}" 2>/dev/null || true
+                    done
+            } >> "$LG_ANALYZE_LOG" 2>&1
+            sleep "$INTERVAL"
+        done
+    ) &
+    disown $!
+    echo $! > "$PID_FILE"
+    log_ok "Background monitoring started (PID: $!)"
+
+    # Build SUID baseline
+    find / -xdev -perm -4000 -type f 2>/dev/null > /root/lg/.suid_baseline || true
+    log_ok "SUID baseline recorded"
+}
+
+# ══════════════════════════════════════════════════════════════════════════════
+# FUNCTION: _lg_status — Security status dashboard
+# ══════════════════════════════════════════════════════════════════════════════
+_lg_status() {
+    local LAST_RUN="unknown"
+    [ -f "$LG_STATE_FILE" ] && LAST_RUN=$(cat "$LG_STATE_FILE" 2>/dev/null || echo "unknown")
+
+    echo ""
+    echo -e "${BOLD}${CYAN}"
+    echo "────────────────────────────────────────────────────────────────────────"
+    echo "   Linux Guardian v1.1 — Security Status Dashboard"
+    printf "   Last applied: %s\n" "$LAST_RUN"
+    echo "────────────────────────────────────────────────────────────────────────"
+    echo -e "${NC}"
+
+    # Helper: check result
+    _st() { [ "$1" = "0" ] \
+        && echo -e "  ${GREEN}✓${NC} $2" \
+        || echo -e "  ${RED}✗${NC} $2"; }
+
+    # [1] Binary Lockdown
+    ls -l /usr/bin/nc 2>/dev/null | grep -q "rwxr-x---" && _BIN=0 || _BIN=1
+    _st "$_BIN" "[1] Binary Lockdown       — $([ $_BIN -eq 0 ] && echo 'active' || echo 'not applied')"
+
+    # [2] Kernel Hardening
+    [ -f /etc/sysctl.d/99-lg-hardening.conf ] && _KERN=0 || _KERN=1
+    _st "$_KERN" "[2] Kernel Hardening      — $([ $_KERN -eq 0 ] && echo 'active' || echo 'not applied')"
+
+    # [3] System Files
+    local _shperm
+    _shperm=$(stat -c '%a' /etc/shadow 2>/dev/null || echo "0")
+    [ "$_shperm" = "600" ] && _SYS=0 || _SYS=1
+    _st "$_SYS" "[3] System Files          — $([ $_SYS -eq 0 ] && echo 'hardened' || echo 'not hardened')"
+
+    # [4] MySQL
+    if command -v mysql &>/dev/null || command -v mysqld &>/dev/null; then
+        local _bind
+        _bind=$(grep "bind-address" /etc/my.cnf /etc/mysql/my.cnf 2>/dev/null | grep "127.0.0.1" || true)
+        [ -n "$_bind" ] && _DB=0 || _DB=1
+        _st "$_DB" "[4] MySQL/MariaDB         — $([ $_DB -eq 0 ] && echo 'bound to 127.0.0.1' || echo 'check bind-address')"
+    else
+        echo -e "  ${CYAN}—${NC} [4] MySQL/MariaDB         — not installed"
+    fi
+
+    # [5] PHP
+    local _dfuncs
+    _dfuncs=$(php -r 'echo ini_get("disable_functions");' 2>/dev/null | wc -c || echo 0)
+    [ "$_dfuncs" -gt 50 ] && _PHP=0 || _PHP=1
+    _st "$_PHP" "[5] PHP disable_functions — $( [ $_PHP -eq 0 ] && echo "active (${_dfuncs} chars)" || echo 'not applied')"
+
+    # [5.1] PHP-FPM Pools
+    local _pools
+    _pools=$(find /etc/php-fpm.d /etc/php/*/fpm/pool.d \
+        -name "*.conf" 2>/dev/null | grep -v "www.conf" | wc -l || echo 0)
+    echo -e "  ${CYAN}i${NC} [5.1] PHP-FPM Pools       — ${_pools} pool(s) active"
+
+    # [5.2] Panel
+    local _panel="none"
+    { [ -d /usr/local/cwpsrv ] || [ -f /usr/local/cwp/php71/bin/php ]; } && _panel="CWP"
+    [ -d /usr/local/cpanel ]   && _panel="cPanel"
+    { [ -d /usr/local/psa ] || [ -d /opt/psa ]; } && _panel="Plesk"
+    [ -d /usr/local/directadmin ] && _panel="DirectAdmin"
+    { [ -d /usr/local/CyberPanel ] || [ -f /usr/bin/cyberpanel ]; } && _panel="CyberPanel"
+    { [ -d /usr/local/hestia ] || [ -f /usr/local/hestia/bin/v-list-users ]; } && _panel="HestiaCP"
+    if [ "$_panel" != "none" ]; then
+        echo -e "  ${CYAN}i${NC} [5.2] Panel php.ini       — ${_panel} (tz: ${PHP_TIMEZONE})"
+    fi
+
+    # [6] noexec
+    mount 2>/dev/null | grep -q "on /tmp.*noexec" && _NX=0 || _NX=1
+    _st "$_NX" "[6] noexec /tmp           — $([ $_NX -eq 0 ] && echo 'active' || echo 'not mounted')"
+
+    # [7] SELinux/AppArmor
+    local _mac_status="none"
+    if command -v sestatus &>/dev/null; then
+        _mac_status=$(sestatus 2>/dev/null | awk '/Current mode/{print $3}' || echo "unknown")
+        [ "$_mac_status" = "enforcing" ] && _MAC=0 || _MAC=1
+        _st "$_MAC" "[7] SELinux               — ${_mac_status}"
+    elif command -v apparmor_status &>/dev/null; then
+        _mac_status="active"
+        echo -e "  ${GREEN}✓${NC} [7] AppArmor              — active"
+    else
+        echo -e "  ${RED}✗${NC} [7] MAC                   — not active"
+    fi
+
+    # [8] Auditd
+    systemctl is-active --quiet auditd 2>/dev/null && _AUD=0 || _AUD=1
+    local _rules
+    _rules=$(auditctl -l 2>/dev/null | wc -l || echo 0)
+    _st "$_AUD" "[8] Auditd                — $([ $_AUD -eq 0 ] && echo "active (${_rules} rules)" || echo 'not running')"
+
+    # [A] ClamAV
+    if svc_installed clamscan clamdscan; then
+        echo -e "  ${GREEN}✓${NC} [A] FTP + ClamAV          — installed"
+    else
+        echo -e "  ${CYAN}—${NC} [A] FTP + ClamAV          — not installed"
+    fi
+
+    # [B] Snuffleupagus
+    if php -m 2>/dev/null | grep -qi snuffleupagus; then
+        echo -e "  ${GREEN}✓${NC} [B] Snuffleupagus         — active"
+    else
+        echo -e "  ${CYAN}—${NC} [B] Snuffleupagus         — not installed"
+    fi
+
+    # Dovecot status
+    echo ""
+    if systemctl is-active --quiet dovecot 2>/dev/null; then
+        echo -e "  ${GREEN}✓${NC} Dovecot                  — running"
+        # vmail context
+        local _vmail_dir="" _vmail_ctx=""
+        for _vp in /var/vmail /home/vmail /var/mail/vhosts; do
+            [ -d "$_vp" ] && _vmail_dir="$_vp" && break
+        done
+        if [ -n "$_vmail_dir" ]; then
+            _vmail_ctx=$(ls -lZ "$_vmail_dir" 2>/dev/null | awk 'NR==2{print $4}' \
+                | grep -oE '[a-z_]+_t' | head -1 || echo "unknown")
+            if echo "$_vmail_ctx" | grep -qE "mail_spool_t|dovecot_var_t"; then
+                echo -e "  ${GREEN}✓${NC} vmail context            — ${_vmail_ctx}"
+            else
+                echo -e "  ${RED}✗${NC} vmail context            — ${_vmail_ctx} (run: sudo lg --fixmail)"
+            fi
+        fi
+        # dovecot_lg policy
+        semodule -l 2>/dev/null | grep -q "dovecot_lg" \
+            && echo -e "  ${GREEN}✓${NC} dovecot_lg policy        — loaded" \
+            || echo -e "  ${YELLOW}!${NC} dovecot_lg policy        — not loaded (run: sudo lg --fixmail)"
+    else
+        echo -e "  ${CYAN}—${NC} Dovecot                  — not running"
+    fi
+
+    # Auto-analyze status
+    echo ""
+    local _pid_file="/var/run/lg-analyze.pid"
+    if [ -f "$_pid_file" ] && kill -0 "$(cat "$_pid_file")" 2>/dev/null; then
+        echo -e "  ${GREEN}✓${NC} Auto-analyze             — running (PID: $(cat "$_pid_file"))"
+    else
+        echo -e "  ${CYAN}—${NC} Auto-analyze             — stopped (start: sudo lg --auto-analyze)"
+    fi
+
+    echo ""
+    echo "────────────────────────────────────────────────────────────────────────"
+
+    # ── Inline scan + analyze ──────────────────────────────────────────────────
+    echo ""
+    _lg_scan
+    echo ""
+    _lg_analyze
+    echo ""
+    _lg_integrity
+
+    echo ""
+    echo "────────────────────────────────────────────────────────────────────────"
+    echo -e "  ${CYAN}Run 'sudo lg --force'     to re-apply all layers${NC}"
+    echo -e "  ${CYAN}Run 'sudo lg --fixmail'   to fix Dovecot/vmail${NC}"
+    echo -e "  ${CYAN}Run 'sudo lg --undo'      to rollback${NC}"
+    echo "────────────────────────────────────────────────────────────────────────"
+    echo ""
+}
+
+# ══════════════════════════════════════════════════════════════════════════════
+# FUNCTION: _lg_update — Download and install latest version
+# ══════════════════════════════════════════════════════════════════════════════
+_lg_update() {
+    local UPDATE_URL="http://lg.wondtech.com/lg.sh"
+    local INSTALL_PATH
+    INSTALL_PATH=$(readlink -f "$0" 2>/dev/null || echo "/usr/local/bin/lg")
+    local TMP_FILE
+    TMP_FILE=$(mktemp /tmp/lg_update_XXXXXX.sh)
+
+    section "UPDATE: Linux Guardian"
+    log_info "Current: ${INSTALL_PATH}"
+    log_info "Source:  ${UPDATE_URL}"
+    echo ""
+
+    # Download
+    if command -v curl &>/dev/null; then
+        curl -fsSL "$UPDATE_URL" -o "$TMP_FILE" 2>/dev/null \
+            || { log_error "Download failed — check: ${UPDATE_URL}"; rm -f "$TMP_FILE"; exit 1; }
+    elif command -v wget &>/dev/null; then
+        wget -q "$UPDATE_URL" -O "$TMP_FILE" 2>/dev/null \
+            || { log_error "Download failed — check: ${UPDATE_URL}"; rm -f "$TMP_FILE"; exit 1; }
+    else
+        log_error "curl or wget required for update"
+        rm -f "$TMP_FILE"
+        exit 1
+    fi
+
+    # Verify downloaded file is valid bash
+    if ! bash -n "$TMP_FILE" 2>/dev/null; then
+        log_error "Downloaded file has syntax errors — aborting update"
+        rm -f "$TMP_FILE"
+        exit 1
+    fi
+
+    # Extract version from downloaded file
+    local NEW_VER
+    NEW_VER=$(grep -m1 "^# Linux Guardian v" "$TMP_FILE" 2>/dev/null \
+        | grep -oP 'v[0-9]+\.[0-9]+' | head -1 || echo "unknown")
+
+    # Extract current version
+    local CUR_VER
+    CUR_VER=$(grep -m1 "^# Linux Guardian v" "$INSTALL_PATH" 2>/dev/null \
+        | grep -oP 'v[0-9]+\.[0-9]+' | head -1 || echo "unknown")
+
+    log_info "Current version: ${CUR_VER}"
+    log_info "New version:     ${NEW_VER}"
+    echo ""
+
+    if [ "$NEW_VER" = "$CUR_VER" ] && [ "$NEW_VER" != "unknown" ]; then
+        log_ok "Already up to date (${CUR_VER})"
+        rm -f "$TMP_FILE"
+        exit 0
+    fi
+
+    # Backup current version
+    local BACKUP="${INSTALL_PATH}.backup.${CUR_VER}"
+    cp "$INSTALL_PATH" "$BACKUP" 2>/dev/null \
+        && log_ok "Backup saved: ${BACKUP}" \
+        || log_warn "Could not backup current version"
+
+    # Install new version
+    chmod +x "$TMP_FILE"
+    mv "$TMP_FILE" "$INSTALL_PATH" \
+        && chmod +x "$INSTALL_PATH" \
+        && log_ok "Updated: ${INSTALL_PATH} (${CUR_VER} → ${NEW_VER})" \
+        || { log_error "Failed to install update"; rm -f "$TMP_FILE"; exit 1; }
+
+    echo ""
+    log_ok "Update complete — run 'sudo lg' to continue"
+}
+
+# ══════════════════════════════════════════════════════════════════════════════
 # INITIALISATION
 # ══════════════════════════════════════════════════════════════════════════════
 
@@ -250,47 +1004,118 @@ if [ "$(id -u)" -ne 0 ]; then
     exit 1
 fi
 
+# ── Handle special-mode flags BEFORE anything else ───────────────────────────
+
+if [ "$UPDATE_MODE" = true ]; then
+    _lg_update
+    exit 0
+fi
+
+# --fixmail — standalone, no state check needed
+if [ "$FIXMAIL_MODE" = true ]; then
+    mkdir -p "$BACKUP_DIR" && chmod 700 "$BACKUP_DIR"
+    _lg_fixmail
+    exit 0
+fi
+
+# --scan — standalone scan
+if [ "$SCAN_MODE" = true ]; then
+    mkdir -p "$(dirname "$LG_SCAN_LOG")" 2>/dev/null || true
+    SCAN_PATH=""
+    for arg in "$@"; do
+        [ "$arg" = "--path" ] && continue
+        [[ "$arg" == --path=* ]] && SCAN_PATH="${arg#--path=}" && continue
+        [[ "$arg" != --* ]] && [ -n "$arg" ] && SCAN_PATH="$arg"
+    done
+    _lg_scan "$SCAN_PATH"
+    exit 0
+fi
+
+# --auto-analyze — start background daemon
+if [ "$AUTO_ANALYZE_MODE" = true ]; then
+    _lg_auto_analyze
+    exit 0
+fi
+
+# --integrity — file integrity check
+if [ "$INTEGRITY_MODE" = true ]; then
+    _lg_integrity
+    exit 0
+fi
+
+# ── Second-run detection ──────────────────────────────────────────────────────
+# If already applied AND not --force, show status dashboard
+if [ -f "$LG_STATE_FILE" ] && \
+   [ "$FORCE_MODE" = false ] && \
+   [ "$DRY_RUN" = false ] && \
+   [ "$UNDO_MODE" = false ] && \
+   [ "$RUN_MODE" != "cron" ]; then
+
+    # Detect timezone for status display
+    PHP_TIMEZONE=""
+    PHP_TIMEZONE=$(timedatectl 2>/dev/null | awk '/Time zone/{print $3}' | head -1 || true)
+    [ -z "$PHP_TIMEZONE" ] && \
+        PHP_TIMEZONE=$(cat /etc/timezone 2>/dev/null | head -1 | tr -d '[:space:]' || true)
+    [ -z "$PHP_TIMEZONE" ] && \
+        PHP_TIMEZONE=$(readlink /etc/localtime 2>/dev/null | sed 's|.*/zoneinfo/||' || true)
+    [ -z "$PHP_TIMEZONE" ] && PHP_TIMEZONE="UTC"
+
+    _lg_status
+    exit 0
+fi
+
 # Parse arguments
 RUN_MODE="interactive"
 DRY_RUN=false
 UNDO_MODE=false
+FIXMAIL_MODE=false
+SCAN_MODE=false
+AUTO_ANALYZE_MODE=false
+INTEGRITY_MODE=false
+FORCE_MODE=false
+UPDATE_MODE=false
+
+LG_STATE_FILE="/root/lg/.applied"
+LG_SCAN_LOG="/var/log/lg-scan.log"
+LG_ANALYZE_LOG="/var/log/lg-analyze.log"
+LG_INTEGRITY_DB="/root/lg/integrity.db"
 
 for arg in "$@"; do
     case "$arg" in
-        --cron)    RUN_MODE="cron" ;;
-        --auto)    RUN_MODE="auto" ;;
-        --dry-run) DRY_RUN=true ;;
-        --undo)    UNDO_MODE=true ;;
-        --watch)   ;;
+        --cron)           RUN_MODE="cron" ;;
+        --auto)           RUN_MODE="auto" ;;
+        --dry-run)        DRY_RUN=true ;;
+        --undo)           UNDO_MODE=true ;;
+        --watch)          ;;
+        --force)          FORCE_MODE=true ;;
+        --fixmail)        FIXMAIL_MODE=true ;;
+        --scan)           SCAN_MODE=true ;;
+        --auto-analyze)   AUTO_ANALYZE_MODE=true ;;
+        --integrity)      INTEGRITY_MODE=true ;;
+        --update)         UPDATE_MODE=true ;;
         --help|-h)
             echo -e "${BOLD}${CYAN}"
             echo "────────────────────────────────────────────────────────────────────────"
-            echo "   Linux Guardian v1.0 — Server Security Hardening | WondTech.com"
+            echo "   Linux Guardian v1.1 — Server Security Hardening | WondTech.com"
             echo "────────────────────────────────────────────────────────────────────────"
             echo -e "${NC}"
             echo -e "${BOLD}USAGE:${NC}"
             echo "   sudo lg [OPTIONS]"
             echo ""
             echo -e "${BOLD}OPTIONS:${NC}"
-            echo "   (none)       Interactive mode — recommended for first run"
-            echo "                Prompts for email, timezone, and php.ini selection"
-            echo ""
-            echo "   --auto       Auto mode — no prompts, applies all layers"
-            echo "                Uses detected timezone and selects all php.ini files"
-            echo ""
-            echo "   --dry-run    Preview every change without applying anything"
-            echo "                Safe to run on production — zero modifications"
-            echo ""
-            echo "   --undo       Rollback all changes from the last run"
-            echo "                Restores files, permissions, mounts, and audit rules"
-            echo ""
-            echo "   --cron       Silent mode for scheduled cron jobs"
-            echo "                Logs to /var/log/lg-hardening.log only"
-            echo ""
-            echo "   --watch      Watch mode — monitor for new sites and harden automatically"
-            echo "                Applies noexec + open_basedir + PHP-FPM pool per new site"
-            echo ""
-            echo "   --help, -h   Show this help message"
+            echo "   (none)           Interactive mode — recommended for first run"
+            echo "   --auto           Auto mode — no prompts, applies all layers"
+            echo "   --force          Force re-apply all layers (even if already applied)"
+            echo "   --dry-run        Preview every change without applying anything"
+            echo "   --undo           Rollback all changes from the last run"
+            echo "   --cron           Silent mode for cron jobs"
+            echo "   --watch          Monitor for new sites and harden automatically"
+            echo "   --fixmail        Fix Dovecot/vmail SELinux contexts and policy"
+            echo "   --scan [--path]  Scan for PHP/Perl/Python webshells and reverse shells"
+            echo "   --auto-analyze   Start background behavior monitoring (daemon)"
+            echo "   --integrity      Check integrity of critical system files"
+            echo "   --update         Download and install latest version from wondtech.com"
+            echo "   --help, -h       Show this help message"
             echo ""
             echo -e "${BOLD}SECURITY LAYERS:${NC}"
             echo "   [1] Binary Lockdown       Restrict dangerous tools to root only"
@@ -310,20 +1135,20 @@ for arg in "$@"; do
             echo "   sudo lg                  # First run — interactive"
             echo "   sudo lg --dry-run        # Preview changes safely"
             echo "   sudo lg --auto           # Apply all layers without prompts"
+            echo "   sudo lg --force          # Re-apply all layers"
+            echo "   sudo lg --fixmail        # Fix Dovecot/vmail SELinux only"
+            echo "   sudo lg --scan           # Scan for webshells"
+            echo "   sudo lg --scan --path /var/www/html"
+            echo "   sudo lg --auto-analyze   # Start background monitoring"
+            echo "   sudo lg --integrity      # Check file integrity"
             echo "   sudo lg --undo           # Rollback last run"
-            echo "   sudo lg --watch          # Monitor for new sites"
-            echo "   sudo lg --cron           # Add to crontab for scheduled hardening"
             echo ""
             echo -e "${BOLD}FILES:${NC}"
-            echo "   Log:      /var/log/lg-hardening.log"
-            echo "   Backups:  /root/lg/backups/"
-            echo "   Undo:     sudo lg --undo"
-            echo ""
-            echo -e "${BOLD}VERIFY:${NC}"
-            echo "   bash -n /usr/local/bin/lg && echo 'Syntax OK'"
-            echo "   php -r 'echo ini_get(\"disable_functions\");' | tr , '\n' | head -5"
-            echo "   mount | grep noexec"
-            echo "   sestatus 2>/dev/null || apparmor_status 2>/dev/null"
+            echo "   Log:       /var/log/lg-hardening.log"
+            echo "   Scan:      /var/log/lg-scan.log"
+            echo "   Analyze:   /var/log/lg-analyze.log"
+            echo "   Integrity: /root/lg/integrity.db"
+            echo "   Backups:   /root/lg/backups/"
             echo ""
             exit 0
             ;;
@@ -621,6 +1446,7 @@ log_ok "Layer 2 complete"
 # ══════════════════════════════════════════════════════════════════════════════
 section "LAYER 3: System Files Permissions"
 
+unset SYSFILE_PERMS
 declare -A SYSFILE_PERMS=(
     ["/etc/shadow"]="600"
     ["/etc/gshadow"]="600"
@@ -867,8 +1693,103 @@ opcache_get_status,opcache_reset,putenv,apache_setenv"
     # Restart services based on PHP mode
     if [ "$DRY_RUN" = false ]; then
         _L5_MODE=$(detect_php_mode 2>/dev/null || echo "mod_php")
+
+        # ── open_basedir for CGI / mod_php ────────────────────────────────────
+        # For PHP-FPM: open_basedir is set per-site in PART 5.1 pool files
+        # For CGI / mod_php: set it globally in php.ini per detected site
+        if [[ "$_L5_MODE" == "cgi" || "$_L5_MODE" == "mod_php" ]]; then
+            _SITES_OBD=()
+
+            # ── Standard paths ────────────────────────────────────────────────
+            for d in /var/www/*/; do
+                [ -d "$d" ] && [[ "$d" != "/var/www/html/" ]] && _SITES_OBD+=("${d%/}")
+            done
+            for d in /home/*/public_html/; do
+                [ -d "$d" ] && _SITES_OBD+=("${d%/}")
+            done
+            [ -d /var/www/html ] && _SITES_OBD+=("/var/www/html")
+
+            # ── Panel-specific paths ──────────────────────────────────────────
+            # CWP
+            for d in /home/*/public_html/ /usr/local/cwpsrv/htdocs/; do
+                [ -d "$d" ] && _SITES_OBD+=("${d%/}")
+            done
+            # cPanel
+            for d in /home/*/public_html/; do
+                [ -d "$d" ] && _SITES_OBD+=("${d%/}")
+            done
+            # Plesk
+            for d in /var/www/vhosts/*/httpdocs/ /var/www/vhosts/*/web/; do
+                [ -d "$d" ] && _SITES_OBD+=("${d%/}")
+            done
+            # DirectAdmin
+            for d in /home/*/domains/*/public_html/; do
+                [ -d "$d" ] && _SITES_OBD+=("${d%/}")
+            done
+            # CyberPanel
+            for d in /home/*/public_html/; do
+                [ -d "$d" ] && _SITES_OBD+=("${d%/}")
+            done
+            # HestiaCP / VestaCP
+            for d in /home/*/web/*/public_html/; do
+                [ -d "$d" ] && _SITES_OBD+=("${d%/}")
+            done
+            # ISPConfig
+            for d in /var/www/clients/*/web*/web/; do
+                [ -d "$d" ] && _SITES_OBD+=("${d%/}")
+            done
+            # aaPanel
+            for d in /www/wwwroot/*/; do
+                [ -d "$d" ] && _SITES_OBD+=("${d%/}")
+            done
+            # InterWorx
+            for d in /home/*/html/ /home/*/htdocs/; do
+                [ -d "$d" ] && _SITES_OBD+=("${d%/}")
+            done
+            # Froxlor
+            for d in /var/customers/webs/*/; do
+                [ -d "$d" ] && _SITES_OBD+=("${d%/}")
+            done
+
+            # ── Deduplicate ───────────────────────────────────────────────────
+            if [ ${#_SITES_OBD[@]} -gt 0 ]; then
+                mapfile -t _SITES_OBD < <(printf '%s\n' "${_SITES_OBD[@]}" | sort -u)
+            fi
+
+            if [ ${#_SITES_OBD[@]} -gt 0 ]; then
+                # Build combined open_basedir
+                _OBD_VALUE=""
+                for _s in "${_SITES_OBD[@]}"; do
+                    _OBD_VALUE="${_OBD_VALUE}${_s}:"
+                done
+                _OBD_VALUE="${_OBD_VALUE}/tmp:/usr/share/php:/usr/share/pear"
+
+                log_info "open_basedir paths detected (${#_SITES_OBD[@]} sites):"
+                for _s in "${_SITES_OBD[@]}"; do
+                    echo "    → ${_s}"
+                done
+
+                for inifile in "${SELECTED_FILES[@]}"; do
+                    [[ "$inifile" == *cli* ]] && continue
+                    if grep -qE "^\s*open_basedir\s*=" "$inifile"; then
+                        sed -i "s|^\s*open_basedir\s*=.*|open_basedir = ${_OBD_VALUE}|" "$inifile"
+                    elif grep -qE "^\s*;\s*open_basedir\s*=" "$inifile"; then
+                        sed -i "s|^\s*;\s*open_basedir\s*=.*|open_basedir = ${_OBD_VALUE}|" "$inifile"
+                    else
+                        echo "open_basedir = ${_OBD_VALUE}" >> "$inifile"
+                    fi
+                    log_ok "open_basedir set (${_L5_MODE}): $(basename "$inifile")"
+                done
+            else
+                log_skip "open_basedir: no site directories detected"
+            fi
+        else
+            log_info "open_basedir: handled per-site in PART 5.1 (PHP-FPM pools)"
+        fi
+
         restart_php_services "$_L5_MODE"
     else
+        log_dry "open_basedir: set per-site for CGI/mod_php or per-pool for FPM"
         log_dry "Restart PHP/web services"
     fi
 fi
@@ -2645,6 +3566,138 @@ if [[ "${1:-}" == "--watch" ]]; then
     exit 0
 fi
 
+# ── Entry point for --cron ────────────────────────────────────────────────────
+# In cron mode: also check for new users added since last run
+if [ "$RUN_MODE" = "cron" ]; then
+    _LG_USERS_DB="/root/lg/.known_users"
+    _LG_USERS_LOG="/var/log/lg-hardening.log"
+    _TS=$(date '+%Y-%m-%d %H:%M:%S')
+
+    # Build current user list (users with /home/USER/public_html)
+    _CURRENT_USERS=()
+    for _d in /home/*/public_html/; do
+        [ -d "$_d" ] || continue
+        _u=$(echo "$_d" | cut -d/ -f3)
+        _CURRENT_USERS+=("$_u")
+    done
+    # Also check /var/www new directories
+    for _d in /var/www/*/; do
+        [ -d "$_d" ] || continue
+        _s=$(basename "${_d%/}")
+        [[ "$_s" == "html" ]] && continue
+        _CURRENT_USERS+=("$_s")
+    done
+
+    # Load known users
+    _KNOWN_USERS=()
+    [ -f "$_LG_USERS_DB" ] && \
+        mapfile -t _KNOWN_USERS < "$_LG_USERS_DB" 2>/dev/null || true
+
+    # Find new users
+    _NEW_USERS=()
+    for _u in "${_CURRENT_USERS[@]}"; do
+_found=false
+        for _k in "${_KNOWN_USERS[@]}"; do
+            [ "$_u" = "$_k" ] && _found=true && break
+        done
+        [ "$_found" = false ] && _NEW_USERS+=("$_u")
+    done
+
+    # Apply hardening to each new user
+    if [ ${#_NEW_USERS[@]} -gt 0 ]; then
+        echo "${_TS} [CRON] New users/sites detected: ${_NEW_USERS[*]}" >> "$_LG_USERS_LOG"
+
+        _W_PHP_MODE=$(detect_php_mode 2>/dev/null || echo "mod_php")
+        _W_POOL_DIR=$(find_pool_dir)
+
+        for _u in "${_NEW_USERS[@]}"; do
+            # Detect site path
+            _NEW_PATH=""
+            [ -d "/home/${_u}/public_html" ] && _NEW_PATH="/home/${_u}/public_html"
+            [ -d "/var/www/${_u}" ]          && _NEW_PATH="/var/www/${_u}"
+            [ -z "$_NEW_PATH" ]              && continue
+
+            echo "${_TS} [CRON] Hardening new site: ${_u} (${_NEW_PATH})" >> "$_LG_USERS_LOG"
+
+            # [6] noexec
+            if ! mount 2>/dev/null | grep -qE " on ${_NEW_PATH} .*noexec"; then
+                mount --bind "$_NEW_PATH" "$_NEW_PATH" 2>/dev/null \
+                    && mount -o remount,noexec,nosuid,nodev,bind "$_NEW_PATH" 2>/dev/null \
+                    && echo "${_TS} [CRON] noexec applied: ${_NEW_PATH}" >> "$_LG_USERS_LOG" \
+                    || echo "${_TS} [CRON] noexec failed: ${_NEW_PATH}" >> "$_LG_USERS_LOG"
+            fi
+
+            # [5] open_basedir for CGI/mod_php
+            if [[ "$_W_PHP_MODE" == "cgi" || "$_W_PHP_MODE" == "mod_php" ]]; then
+                _OBD="${_NEW_PATH}:/tmp:/usr/share/php:/usr/share/pear"
+                while IFS= read -r _ini; do
+                    [[ "$_ini" == *cli* ]] && continue
+                    if grep -qE "^\s*open_basedir\s*=" "$_ini"; then
+                        # Append new path to existing open_basedir
+_cur=""
+                        _cur=$(grep -E "^\s*open_basedir\s*=" "$_ini" | head -1)
+                        echo "$_cur" | grep -q "$_NEW_PATH" || \
+                            sed -i "s|^\s*open_basedir\s*=.*|&:${_NEW_PATH}|" "$_ini"
+                    else
+                        echo "open_basedir = ${_OBD}" >> "$_ini"
+                    fi
+                done < <(find / -maxdepth 7 -type f -name "php.ini" \
+                    ! -path "*/cli/*" 2>/dev/null | sort -u)
+                echo "${_TS} [CRON] open_basedir updated for: ${_u}" >> "$_LG_USERS_LOG"
+            fi
+
+            # [5.1] PHP-FPM pool
+            if [ -n "$_W_POOL_DIR" ] && [[ "$_W_PHP_MODE" == "fpm" ]]; then
+                _W_POOL_CONF="${_W_POOL_DIR}/${_u}.conf"
+                if [ ! -f "$_W_POOL_CONF" ]; then
+                    _W_USER=$(stat -c '%U' "$_NEW_PATH" 2>/dev/null || echo "www-data")
+                    id "$_W_USER" &>/dev/null || _W_USER="www-data"
+                    _W_GROUP=$(id -gn "$_W_USER" 2>/dev/null || echo "www-data")
+                    _W_SESSION="/var/lib/php/sessions/${_u}"
+                    mkdir -p "$_W_SESSION" 2>/dev/null
+                    chown "${_W_USER}:${_W_GROUP}" "$_W_SESSION" 2>/dev/null
+                    chmod 700 "$_W_SESSION" 2>/dev/null
+                    cat > "$_W_POOL_CONF" << CRON_POOL
+; Linux Guardian — auto-created for new user: ${_u}
+; Generated: ${_TS}
+[${_u}]
+user  = ${_W_USER}
+group = ${_W_GROUP}
+listen       = /run/php-fpm/${_u}.sock
+listen.owner = apache
+listen.group = apache
+listen.mode  = 0660
+pm = dynamic
+pm.max_children      = 10
+pm.start_servers     = 2
+pm.min_spare_servers = 1
+pm.max_spare_servers = 3
+pm.max_requests      = 500
+php_admin_value[open_basedir] = ${_NEW_PATH}:/tmp:/usr/share/php
+php_value[session.save_path]  = ${_W_SESSION}
+php_admin_value[error_log]    = /var/log/php-fpm/${_u}-error.log
+CRON_POOL
+                    chmod 640 "$_W_POOL_CONF"
+                    restart_php_services "fpm" 2>/dev/null || true
+                    echo "${_TS} [CRON] PHP-FPM pool created: ${_W_POOL_CONF}" >> "$_LG_USERS_LOG"
+                fi
+            fi
+
+            echo "${_TS} [CRON] ${_u} hardened: noexec + open_basedir + pool" >> "$_LG_USERS_LOG"
+        done
+    fi
+
+    # Update known users database
+    printf '%s\n' "${_CURRENT_USERS[@]}" > "$_LG_USERS_DB" 2>/dev/null || true
+fi
+
+# ── Save state file (marks first run complete — triggers status on next run) ──
+if [ "$DRY_RUN" = false ]; then
+    mkdir -p "$(dirname "$LG_STATE_FILE")" 2>/dev/null || true
+    date '+%Y-%m-%d %H:%M:%S' > "$LG_STATE_FILE"
+    chmod 600 "$LG_STATE_FILE"
+fi
+
 # ══════════════════════════════════════════════════════════════════════════════
 # FINAL SUMMARY
 # ══════════════════════════════════════════════════════════════════════════════
@@ -2679,6 +3732,18 @@ if [ "$DRY_RUN" = false ]; then
     echo -e "  ${CYAN}Watch:${NC}    sudo $0 --watch"
     echo -e "  ${CYAN}Log:${NC}      $LOG_FILE"
     echo ""
+
+    # ── Auto-add cron job for new user detection ──────────────────────────────
+    local _CRON_LINE="0 * * * * /usr/local/bin/lg --cron"
+    if command -v crontab &>/dev/null; then
+        if ! crontab -l 2>/dev/null | grep -q "lg --cron"; then
+            ( crontab -l 2>/dev/null; echo "$_CRON_LINE" ) | crontab -
+            log_ok "Cron job added: ${_CRON_LINE}"
+            log_info "Runs hourly — detects new users/sites and hardens them automatically"
+        else
+            log_ok "Cron job already exists — hourly new-user detection active"
+        fi
+    fi
     echo -e "${YELLOW}Verify:${NC}"
     echo "  php -r 'echo ini_get(\"disable_functions\");' | tr , '\n' | head -5"
     echo "  mount | grep noexec"
