@@ -856,10 +856,25 @@ _lg_status() {
     echo ""
     echo -e "  ${BOLD}[PHP-FPM]${NC} Status check"
 
-    if systemctl is-active --quiet php-fpm 2>/dev/null; then
-        echo -e "  ${GREEN}✓${NC} PHP-FPM service — running"
+    # Detect PHP-FPM service — varies by distro and panel
+    _FPMSERVICE=""
+    for _svc in php-fpm php8.2-fpm php8.1-fpm php8.0-fpm php7.4-fpm \
+                php7.3-fpm php7.2-fpm php7.1-fpm php7.0-fpm \
+                php56-php-fpm php-fpm74 php-fpm80 php-fpm81 php-fpm82; do
+        systemctl is-active --quiet "$_svc" 2>/dev/null \
+            && _FPMSERVICE="$_svc" && break
+    done
+    # CWP manages PHP-FPM internally via cwpsrv — check process directly
+    if [ -z "$_FPMSERVICE" ]; then
+        pgrep -x php-fpm &>/dev/null \
+            && _FPMSERVICE="php-fpm (process)" || true
+    fi
+
+    if [ -n "$_FPMSERVICE" ]; then
+        echo -e "  ${GREEN}✓${NC} PHP-FPM service — running (${_FPMSERVICE})"
     else
-        echo -e "  ${RED}✗${NC} PHP-FPM service — not running"
+        echo -e "  ${YELLOW}!${NC} PHP-FPM service — not running as standalone"
+        echo -e "    ${CYAN}(panel may handle PHP-FPM internally)${NC}"
     fi
 
     _pools=$(ps aux 2>/dev/null \
