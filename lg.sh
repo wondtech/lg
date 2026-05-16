@@ -543,23 +543,41 @@ _lg_analyze() {
     # ── 2. Suspicious running processes ───────────────────────────────────────
     echo ""
     echo -e "  ${BOLD}[PROC]${NC} Suspicious processes:"
+
     local PROC_ISSUES=0
-    # Processes running from /tmp or /dev/shm
-    while IFS= read -r pid; do
-        [ -z "$(cat /proc/$pid/cmdline 2>/dev/null)" ] && continue
-        local cmd
+    while IFS= read -r proc; do
+        echo -e "    ${RED}⚠${NC} Process from /tmp|/dev: $proc"
+        echo "[WARN] Suspicious process: $proc" >> "$LG_ANALYZE_LOG"
+        PROC_ISSUES=$((PROC_ISSUES+1))
+    done < <(
+        ps aux 2>/dev/null \
+        | grep -E "/tmp/|/dev/shm" \
+        | grep -v grep \
+        | head -10 || true
+    )
+
+    for pid_dir in /proc/[0-9]*; do
+        pid="${pid_dir##*/}"
+        [ -r "/proc/$pid/cmdline" ] || continue
         cmd=""
-        if IFS= read -r -d '' cmd < /proc/$pid/cmdline 2>/dev/null; then
-            cmd=${cmd//[$'\n']/ }
-            cmd=${cmd:0:50}
+        if IFS= read -r -d '' cmd < "/proc/$pid/cmdline" 2>/dev/null; then
+            :
         fi
-        [[ "$cmd" == .* ]] && {
+        cmd=${cmd//[$'\n']/ }
+        cmd=${cmd:0:50}
+        [ -z "$cmd" ] && continue
+        if [[ "$cmd" == .* ]]; then
             echo -e "    ${RED}⚠${NC} Hidden process (PID $pid): $cmd"
             echo "[WARN] Hidden process PID=$pid cmd=$cmd" >> "$LG_ANALYZE_LOG"
             PROC_ISSUES=$((PROC_ISSUES+1))
-        }
-    done < <(find /proc -maxdepth 1 -type d -regex '.*/[0-9]+' -printf '%f\n' 2>/dev/null | head -50)
+        fi
+    done
 
+    if [ "$PROC_ISSUES" -eq 0 ]; then
+        echo -e "    ${GREEN}✓${NC} No suspicious processes"
+    fi
+
+    ISSUES=$((ISSUES+PROC_ISSUES))
     # ── 3. Recently modified system files ─────────────────────────────────────
     echo ""
     echo -e "  ${BOLD}[FILES]${NC} System files modified in last 24h:"
