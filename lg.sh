@@ -887,8 +887,9 @@ _lg_status() {
             [ -d "$_vp" ] && _vmail_dir="$_vp" && break
         done
         if [ -n "$_vmail_dir" ]; then
-            _vmail_ctx=$(ls -lZ "$_vmail_dir" 2>/dev/null | awk 'NR==2{print $4}' \
-                | grep -oE '[a-z_]+_t' | head -1 || echo "unknown")
+            _vmail_ctx=$(stat -c '%C' "$_vmail_dir" 2>/dev/null \
+                | grep -oE '[a-z_]+_t' \
+                | head -1)
             if echo "$_vmail_ctx" | grep -E "mail_spool_t|dovecot_var_t"; then
                 echo -e "  ${GREEN}✓${NC} vmail context            — ${_vmail_ctx}"
             else
