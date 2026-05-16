@@ -547,10 +547,12 @@ _lg_analyze() {
     # Processes running from /tmp or /dev/shm
     while IFS= read -r pid; do
         [ -z "$(cat /proc/$pid/cmdline 2>/dev/null)" ] && continue
-
         local cmd
-        cmd=$(tr '\0' ' ' < /proc/$pid/cmdline 2>/dev/null | head -c 50)
-
+        cmd=""
+        if IFS= read -r -d '' cmd < /proc/$pid/cmdline 2>/dev/null; then
+            cmd=${cmd//[$'\n']/ }
+            cmd=${cmd:0:50}
+        fi
         [[ "$cmd" == .* ]] && {
             echo -e "    ${RED}⚠${NC} Hidden process (PID $pid): $cmd"
             echo "[WARN] Hidden process PID=$pid cmd=$cmd" >> "$LG_ANALYZE_LOG"
