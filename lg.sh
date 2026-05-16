@@ -595,10 +595,21 @@ _lg_analyze() {
     # ── 4. Failed login attempts ───────────────────────────────────────────────
     echo ""
     echo -e "  ${BOLD}[AUTH]${NC} Failed logins (last 1h):"
+
     local FAIL_COUNT=0
-    FAIL_COUNT=$(grep "Failed password" /var/log/secure /var/log/auth.log 2>/dev/null \
-        | awk -v d="$(date -d '1 hour ago' '+%b %e %H' 2>/dev/null || date '+%b %e %H')" \
-        '$0 >= d' | wc -l || echo 0)
+    if command -v journalctl >/dev/null 2>&1; then
+        FAIL_COUNT=$(journalctl --since "1 hour ago" 2>/dev/null \
+            | grep -i "failed password" \
+            | wc -l)
+    else
+        FAIL_COUNT=$((
+            grep -h "Failed password" /var/log/auth.log /var/log/secure 2>/dev/null
+        ) | wc -l)
+    fi
+    FAIL_COUNT=$(echo "$FAIL_COUNT" | tr -d '[:space:]')
+    case "$FAIL_COUNT" in
+        ''|*[!0-9]*) FAIL_COUNT=0 ;;
+    esac
     if [ "$FAIL_COUNT" -gt 50 ]; then
         echo -e "    ${RED}⚠${NC} ${FAIL_COUNT} failed logins — possible brute force"
         echo "[WARN] ${FAIL_COUNT} failed logins in last hour" >> "$LG_ANALYZE_LOG"
@@ -842,10 +853,36 @@ _lg_status() {
     _st "$_PHP" "[5] PHP disable_functions — $( [ $_PHP -eq 0 ] && echo "active (${_dfuncs} functions)" || echo 'not applied')"
 
     # [5.1] PHP-FPM Pools
-    local _pools
-    _pools=$(find /etc/php-fpm.d /etc/php/*/fpm/pool.d \
-        -name "*.conf" 2>/dev/null | grep -v "www.conf" | wc -l || echo 0)
-    echo -e "  ${CYAN}i${NC} [5.1] PHP-FPM Pools       — ${_pools} pool(s) active"
+    echo ""
+    echo -e "  ${BOLD}[PHP-FPM]${NC} Status check"
+
+    if systemctl is-active --quiet php-fpm 2>/dev/null; then
+        echo -e "  ${GREEN}✓${NC} PHP-FPM service — running"
+    else
+        echo -e "  ${RED}✗${NC} PHP-FPM service — not running"
+    fi
+
+    _pools=$(ps aux 2>/dev/null \
+        | grep "php-fpm: pool" \
+        | grep -v grep \
+        | wc -l)
+
+    _pools=$(echo "$_pools" | tr -d '[:space:]')
+    case "$_pools" in ''|*[!0-9]*) _pools=0 ;; esac
+
+    echo -e "  ${CYAN}i${NC} Active pools  — $_pools"
+
+    _users=$(ps aux 2>/dev/null \
+        | grep "php-fpm: pool" \
+        | grep -v grep \
+        | awk '{print $1}' \
+        | sort -u \
+        | wc -l)
+
+    _users=$(echo "$_users" | tr -d '[:space:]')
+    case "$_users" in ''|*[!0-9]*) _users=0 ;; esac
+
+    echo -e "  ${CYAN}i${NC} Pool users    — $_users"
 
     # [5.2] Panel
     local _panel="none"
