@@ -858,9 +858,9 @@ _lg_status() {
     echo -e "  ${BOLD}[PHP-FPM]${NC} Status check"
 
     if systemctl is-active --quiet php-fpm 2>/dev/null; then
-        echo -e "  ${GREEN}✓${NC} [5.1] PHP-FPM service — running"
+        echo -e "  ${GREEN}✓${NC} [5.1] PHP-FPM service      — running"
     else
-        echo -e "  ${RED}✗${NC} [5.1] PHP-FPM service — not running"
+        echo -e "  ${RED}✗${NC} [5.1] PHP-FPM service      — not running"
     fi
 
     # [5.2] Panel
@@ -871,7 +871,7 @@ _lg_status() {
     [ -d /usr/local/directadmin ] && _panel="DirectAdmin"
     { [ -d /usr/local/CyberPanel ] || [ -f /usr/bin/cyberpanel ]; } && _panel="CyberPanel"
     { [ -d /usr/local/hestia ] || [ -f /usr/local/hestia/bin/v-list-users ]; } && _panel="HestiaCP"
-    [ "$_panel" != "none" ] && echo -e "  ${CYAN}i${NC} [5.2] Panel detected     — ${_panel}"
+    [ "$_panel" != "none" ] && echo -e "  ${CYAN}i${NC} [5.2] Panel detected      — ${_panel}"
 
     # [6] noexec
     mount 2>/dev/null | grep -q "on /tmp.*noexec" && _NX=0 || _NX=1
