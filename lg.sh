@@ -45,7 +45,7 @@ AUTO_ANALYZE_MODE=false
 INTEGRITY_MODE=false
 FORCE_MODE=false
 UPDATE_MODE=false
-HELP_MODE=false
+WATCH_MODE=false
 LG_STATE_FILE="/root/lg/.applied"
 LG_SCAN_LOG="/var/log/lg-scan.log"
 LG_ANALYZE_LOG="/var/log/lg-analyze.log"
@@ -208,13 +208,16 @@ install_pkg() {
 
 # ── detect_php_mode: returns fpm / cgi / mod_php ─────────────────────────────
 detect_php_mode() {
-    for b in php-fpm php-fpm8.2 php-fpm8.1 php-fpm8.0 php-fpm7.4; do
-        if command -v "$b" &>/dev/null \
-           || [ -x "/usr/sbin/${b}" ] \
-           || [ -x "/usr/local/sbin/${b}" ]; then
-            echo "fpm"; return
-        fi
-    done
+    # Auto-detect any installed php-fpm binary
+    while IFS= read -r b; do
+        command -v "$b" &>/dev/null \
+            || [ -x "/usr/sbin/${b}" ] \
+            || [ -x "/usr/local/sbin/${b}" ] \
+            && echo "fpm" && return
+    done < <(compgen -c 2>/dev/null | grep -E "^php-fpm|^php[0-9]" | sort -u || \
+             find /usr/sbin /usr/local/sbin /usr/bin /usr/local/bin \
+                  -name "php-fpm*" -o -name "php*-fpm" 2>/dev/null \
+             | xargs -I{} basename {} | sort -u || true)
     if command -v php-cgi &>/dev/null \
        || [ -x "/usr/local/bin/php-cgi" ]; then
         echo "cgi"; return
@@ -228,38 +231,77 @@ detect_php_mode() {
 
 # ── find_pool_dir: locate PHP-FPM pool directory ─────────────────────────────
 find_pool_dir() {
-    for d in \
-        /etc/php-fpm.d \
-        /etc/php/8.2/fpm/pool.d /etc/php/8.1/fpm/pool.d \
-        /etc/php/8.0/fpm/pool.d /etc/php/7.4/fpm/pool.d \
-        /etc/php/fpm/pool.d /usr/local/etc/php-fpm.d; do
+    # Check standard fixed paths first
+    for d in /etc/php-fpm.d /usr/local/etc/php-fpm.d; do
         [ -d "$d" ] && echo "$d" && return
     done
+    # Auto-detect versioned pool directories
+    local _d
+    _d=$(find /etc/php /usr/local/etc/php \
+              -maxdepth 4 -type d -name "pool.d" \
+              2>/dev/null | sort -rV | head -1 || true)
+    [ -n "$_d" ] && echo "$_d" && return
     echo ""
 }
 
-# ── restart_php_services: restart web/php services by mode ───────────────────
+# ── detect_webserver_user: find the web server socket owner ──────────────────
+detect_webserver_user() {
+    # Returns the user that owns the web server process
+    for _ws in nginx apache2 httpd lighttpd caddy; do
+        if svc_running "$_ws" 2>/dev/null; then
+            case "$_ws" in
+                nginx)              echo "nginx";    return ;;
+                apache2)            echo "www-data"; return ;;
+                httpd)              echo "apache";   return ;;
+                lighttpd)           echo "lighttpd"; return ;;
+                caddy)              echo "caddy";    return ;;
+            esac
+        fi
+    done
+    # Fallback — read from process table
+    local _u
+    _u=$(ps aux 2>/dev/null | grep -E "nginx|apache2|httpd" \
+        | grep -v grep | awk '{print $1}' | grep -v root | head -1 || true)
+    [ -n "$_u" ] && echo "$_u" && return
+    echo "apache"  # safe default
+}
 restart_php_services() {
     local mode="$1"
     case "$mode" in
         fpm)
-            for svc in php-fpm php8.2-fpm php8.1-fpm php8.0-fpm php7.4-fpm; do
-                systemctl is-active --quiet "$svc" 2>/dev/null \
-                    && systemctl restart "$svc" 2>/dev/null \
-                    && { log_ok "Restarted: $svc"; return 0; }
-            done
-            log_warn "No active php-fpm service — restart manually"
+            # Auto-detect active php-fpm service
+            local _restarted=0
+            while IFS= read -r svc; do
+                systemctl is-active --quiet "$svc" 2>/dev/null && {
+                    systemctl restart "$svc" 2>/dev/null \
+                        && { log_ok "Restarted: $svc"; _restarted=1; break; } \
+                        || log_warn "Failed to restart: $svc"
+                }
+            done < <({ systemctl list-units --type=service --state=active \
+                            --no-legend 2>/dev/null \
+                          | awk '{print $1}' \
+                          | grep -E "^php.*fpm" | sort -rV
+                        echo "php-fpm"
+                      } | sort -u || true)
+            [ "$_restarted" -eq 0 ] && \
+                log_warn "No active php-fpm service — restart manually"
             ;;
         cgi|mod_php)
             local _restarted=0
-            for svc in apache2 httpd nginx; do
-                if systemctl is-active --quiet "$svc" 2>/dev/null; then
+            while IFS= read -r svc; do
+                systemctl is-active --quiet "$svc" 2>/dev/null && {
                     systemctl restart "$svc" 2>/dev/null \
                         && { log_ok "Restarted: $svc"; _restarted=$((_restarted+1)); } \
                         || log_warn "Failed to restart: $svc"
-                fi
-            done
-            [ "$_restarted" -eq 0 ] && log_warn "No active web service found to restart"
+                }
+            done < <(systemctl list-units --type=service --state=active \
+                         --no-legend 2>/dev/null \
+                     | awk '{print $1}' \
+                     | grep -E "^(nginx|apache2|httpd|lighttpd|caddy)\.service" \
+                     | sed 's/\.service//' \
+                     || printf 'apache2\nhttpd\nnginx\n')
+            [ "$_restarted" -eq 0 ] && \
+                log_warn "No active web service found to restart"
             ;;
     esac
     return 0
@@ -800,7 +842,10 @@ _lg_auto_analyze() {
     local _DAEMON_PID=$!
     disown "$_DAEMON_PID" 2>/dev/null || true
     sleep 0.5
-    log_ok "Background monitoring started (PID: $_DAEMON_PID)"
+    # Real PID written by $BASHPID inside the subshell
+    local _REAL_PID
+    _REAL_PID=$(cat "$PID_FILE" 2>/dev/null || echo "$_DAEMON_PID")
+    log_ok "Background monitoring started (PID: ${_REAL_PID})"
 
     # Build SUID baseline
     find / -xdev -perm -4000 -type f 2>/dev/null > /root/lg/.suid_baseline || true
@@ -811,7 +856,8 @@ _lg_auto_analyze() {
 # FUNCTION: _lg_status — Security status dashboard
 # ══════════════════════════════════════════════════════════════════════════════
 _lg_status() {
-    set +e
+    local _lg_status_old_flags="$-"
+    set +euo pipefail
     local LAST_RUN="unknown"
     [ -f "$LG_STATE_FILE" ] && LAST_RUN=$(cat "$LG_STATE_FILE" 2>/dev/null || echo "unknown")
 
@@ -864,11 +910,24 @@ _lg_status() {
     # [5.1] PHP-FPM Pools
     echo ""
     echo -e "  ${BOLD}[PHP-FPM]${NC} Status check"
-
-    if systemctl is-active --quiet php-fpm 2>/dev/null; then
-        echo -e "  ${GREEN}✓${NC} [5.1] PHP-FPM service     — running"
+    _FPMSERVICE=""
+    # Auto-detect any active php-fpm service
+    while IFS= read -r _svc; do
+        svc_running "$_svc" 2>/dev/null \
+            && _FPMSERVICE="$_svc" && break
+    done < <({ systemctl list-units --type=service --state=active \
+                    --no-legend 2>/dev/null \
+                  | awk '{print $1}' \
+                  | grep -E "^php.*fpm"
+                echo "php-fpm"
+              } | sort -rV | sort -u || true)
+    [ -z "$_FPMSERVICE" ] && \
+        pgrep -x php-fpm &>/dev/null && _FPMSERVICE="php-fpm (process)"
+    if [ -n "$_FPMSERVICE" ]; then
+        echo -e "  ${GREEN}✓${NC} [5.1] PHP-FPM             — running (${_FPMSERVICE})"
     else
-        echo -e "  ${RED}✗${NC} [5.1] PHP-FPM service     — not running"
+        echo -e "  ${YELLOW}!${NC} [5.1] PHP-FPM             — not running as standalone"
+        echo -e "    ${CYAN}(panel may manage PHP-FPM internally)${NC}"
     fi
 
     # [5.2] Panel
@@ -899,7 +958,7 @@ _lg_status() {
     fi
 
     # [8] Auditd
-    systemctl is-active --quiet auditd 2>/dev/null && _AUD=0 || _AUD=1
+    svc_running auditd && _AUD=0 || _AUD=1
     local _rules
     _rules=$(auditctl -l 2>/dev/null | wc -l || echo 0)
     _st "$_AUD" "[8] Auditd                — $([ $_AUD -eq 0 ] && echo "active (${_rules} rules)" || echo 'not running')"
@@ -920,7 +979,7 @@ _lg_status() {
 
     # Dovecot status
     echo ""
-    if systemctl is-active --quiet dovecot 2>/dev/null; then
+    if svc_running dovecot; then
         echo -e "  ${GREEN}✓${NC} Dovecot                  — running"
         # vmail context
         local _vmail_dir="" _vmail_ctx=""
@@ -957,13 +1016,26 @@ _lg_status() {
     echo ""
     echo "────────────────────────────────────────────────────────────────────────"
 
-    # ── Inline scan + analyze ──────────────────────────────────────────────────
+    # ── Inline scan + analyze + integrity ─────────────────────────────────────
     echo ""
-    _lg_scan
-    echo ""
-    _lg_analyze
-    echo ""
-    _lg_integrity
+    if [ -t 0 ]; then
+        read -r -t 15 -p "  Run scan + analyze + integrity? [Y/n] (auto in 15s): " _RUN_CHECKS || true
+        echo ""
+    else
+        _RUN_CHECKS="y"
+    fi
+    if [[ "${_RUN_CHECKS:-y}" =~ ^[Yy]?$ ]]; then
+        _lg_scan
+        echo ""
+        _lg_analyze
+        echo ""
+        _lg_integrity
+    else
+        echo -e "  ${CYAN}Tips:${NC}"
+        echo -e "   sudo lg --scan        # scan for webshells"
+        echo -e "   sudo lg --analyze     # analyze system behavior"
+        echo -e "   sudo lg --integrity   # check file integrity"
+    fi
 
     echo ""
     echo "────────────────────────────────────────────────────────────────────────"
@@ -972,7 +1044,8 @@ _lg_status() {
     echo -e "  ${CYAN}Run 'sudo lg --undo'      to rollback${NC}"
     echo "────────────────────────────────────────────────────────────────────────"
     echo ""
-    set -e
+    # Restore original shell flags
+    set -euo pipefail
 }
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1013,12 +1086,12 @@ _lg_update() {
     # Extract version from downloaded file
     local NEW_VER
     NEW_VER=$(grep -m1 "^# Linux Guardian v" "$TMP_FILE" 2>/dev/null \
-        | grep -oP 'v[0-9]+\.[0-9]+' | head -1 || echo "unknown")
+        | grep -oE 'v[0-9]+.[0-9]+' | head -1 || echo "unknown")
 
     # Extract current version
     local CUR_VER
     CUR_VER=$(grep -m1 "^# Linux Guardian v" "$INSTALL_PATH" 2>/dev/null \
-        | grep -oP 'v[0-9]+\.[0-9]+' | head -1 || echo "unknown")
+        | grep -oE 'v[0-9]+.[0-9]+' | head -1 || echo "unknown")
 
     log_info "Current version: ${CUR_VER}"
     log_info "New version:     ${NEW_VER}"
@@ -1121,7 +1194,7 @@ for arg in "$@"; do
         --auto)           RUN_MODE="auto" ;;
         --dry-run)        DRY_RUN=true ;;
         --undo)           UNDO_MODE=true ;;
-        --watch)          ;;
+        --watch)          WATCH_MODE=true ;;
         --force)          FORCE_MODE=true ;;
         --fixmail)        FIXMAIL_MODE=true ;;
         --scan)           SCAN_MODE=true ;;
@@ -1159,15 +1232,7 @@ if [ -f "$LG_STATE_FILE" ] && \
    [ "$UNDO_MODE" = false ] && \
    [ "$RUN_MODE" != "cron" ]; then
 
-    # Detect timezone for status display
-    PHP_TIMEZONE=""
-    PHP_TIMEZONE=$(timedatectl 2>/dev/null | awk '/Time zone/{print $3}' | head -1 || true)
-    [ -z "$PHP_TIMEZONE" ] && \
-        PHP_TIMEZONE=$(cat /etc/timezone 2>/dev/null | head -1 | tr -d '[:space:]' || true)
-    [ -z "$PHP_TIMEZONE" ] && \
-        PHP_TIMEZONE=$(readlink /etc/localtime 2>/dev/null | sed 's|.*/zoneinfo/||' || true)
-    [ -z "$PHP_TIMEZONE" ] && PHP_TIMEZONE="UTC"
-
+    PHP_TIMEZONE=$(_detect_timezone)
     _lg_status
     exit 0
 fi
@@ -1194,15 +1259,18 @@ elif [ "$DRY_RUN" = false ]; then
     exec > >(tee -a "$LOG_FILE") 2>&1
 fi
 
-# ── Ask for alert email once — used by Auditd, ClamAV, and Watch mode ────────
-# Detect timezone first (used for date.timezone in php.ini)
-PHP_TIMEZONE=""
-PHP_TIMEZONE=$(timedatectl 2>/dev/null | awk '/Time zone/{print $3}' | head -1 || true)
-[ -z "$PHP_TIMEZONE" ] && \
-    PHP_TIMEZONE=$(cat /etc/timezone 2>/dev/null | head -1 | tr -d '[:space:]' || true)
-[ -z "$PHP_TIMEZONE" ] && \
-    PHP_TIMEZONE=$(readlink /etc/localtime 2>/dev/null | sed 's|.*/zoneinfo/||' || true)
-[ -z "$PHP_TIMEZONE" ] && PHP_TIMEZONE="UTC"
+# ── Detect server timezone (shared function) ──────────────────────────────────
+_detect_timezone() {
+    local _tz=""
+    _tz=$(timedatectl 2>/dev/null | awk '/Time zone/{print $3}' | head -1 || true)
+    [ -z "$_tz" ] && \
+        _tz=$(cat /etc/timezone 2>/dev/null | head -1 | tr -d '[:space:]' || true)
+    [ -z "$_tz" ] && \
+        _tz=$(readlink /etc/localtime 2>/dev/null | sed 's|.*/zoneinfo/||' || true)
+    [ -z "$_tz" ] && _tz="UTC"
+    echo "$_tz"
+}
+PHP_TIMEZONE=$(_detect_timezone)
 
 if [[ "$RUN_MODE" == "interactive" ]] && [ "$DRY_RUN" = false ] && [ "$UNDO_MODE" = false ]; then
     echo ""
@@ -1851,20 +1919,19 @@ section "PART 5.1: PHP-FPM Pool per Site (auto-detect)"
 
 setup_phpfpm_pools() {
 
-    # ── Detect php-fpm binary ─────────────────────────────────────────────────
+    # ── Detect php-fpm binary — auto-discover any version ─────────────────────
     PHPFPM_BIN=""
-    for b in php-fpm php-fpm8.2 php-fpm8.1 php-fpm8.0 php-fpm7.4 php-fpm74; do
-        bp=$(command -v "$b" 2>/dev/null \
-            || { [ -x "/usr/sbin/${b}"       ] && echo "/usr/sbin/${b}"; }       \
-            || { [ -x "/usr/local/sbin/${b}" ] && echo "/usr/local/sbin/${b}"; } \
-            || { [ -x "/usr/local/bin/${b}"  ] && echo "/usr/local/bin/${b}"; }  \
-            || true)
-        bp=$(echo "$bp" | head -1)
-        if [ -n "$bp" ] && [ -x "$bp" ]; then
-            PHPFPM_BIN="$bp"
-            break
-        fi
-    done
+    while IFS= read -r _candidate; do
+        [ -x "$_candidate" ] && PHPFPM_BIN="$_candidate" && break
+    done < <(
+        # From PATH
+        compgen -c 2>/dev/null | grep -E "^php-fpm|^php[0-9].*fpm" | sort -rV | \
+            while read -r b; do command -v "$b" 2>/dev/null; done
+        # From common sbin/bin dirs
+        find /usr/sbin /usr/local/sbin /usr/bin /usr/local/bin \
+             -maxdepth 1 \( -name "php-fpm*" -o -name "php*fpm" \) \
+             -executable 2>/dev/null | sort -rV
+    )
 
     if [ -z "$PHPFPM_BIN" ]; then
         log_skip "php-fpm not found — skipping pool configuration"
@@ -1875,23 +1942,14 @@ setup_phpfpm_pools() {
     fi
     log_ok "php-fpm found: $PHPFPM_BIN"
 
-    # ── Detect PHP-FPM pool directory ─────────────────────────────────────────
-    POOL_DIR=""
-    for d in \
-        /etc/php-fpm.d \
-        /etc/php/8.2/fpm/pool.d \
-        /etc/php/8.1/fpm/pool.d \
-        /etc/php/8.0/fpm/pool.d \
-        /etc/php/7.4/fpm/pool.d \
-        /etc/php/fpm/pool.d \
-        /usr/local/etc/php-fpm.d; do
-        [ -d "$d" ] && POOL_DIR="$d" && break
-    done
+    # ── Detect PHP-FPM pool directory — auto-discover ─────────────────────────
+    POOL_DIR=$(find_pool_dir)
 
     if [ -z "$POOL_DIR" ]; then
         log_warn "PHP-FPM pool directory not found — trying to locate..."
-        POOL_DIR=$($PHPFPM_BIN --test 2>&1 \
-            | grep -oP 'include=\K[^*]+' | head -1 | xargs dirname 2>/dev/null || true)
+        POOL_DIR=$("$PHPFPM_BIN" --test 2>&1 \
+            | grep -oE 'include=[^*]+' | sed 's/include=//' \
+            | head -1 | xargs dirname 2>/dev/null || true)
         [ -d "$POOL_DIR" ] || {
             log_warn "Cannot detect pool directory — skipping"
             PHPFPM_SKIP=true
@@ -1900,12 +1958,16 @@ setup_phpfpm_pools() {
     fi
     log_ok "PHP-FPM pool dir: $POOL_DIR"
 
-    # ── Detect PHP-FPM service name ───────────────────────────────────────────
+    # ── Detect PHP-FPM service name — auto-discover ───────────────────────────
     PHPFPM_SVC=""
-    for svc in php-fpm php8.2-fpm php8.1-fpm php8.0-fpm php7.4-fpm; do
+    while IFS= read -r _svc; do
         systemctl list-units --type=service --all 2>/dev/null \
-            | grep -q "${svc}.service" && PHPFPM_SVC="$svc" && break
-    done
+            | grep -q "${_svc}" && PHPFPM_SVC="${_svc%.service}" && break
+    done < <(
+        systemctl list-units --type=service --all --no-legend 2>/dev/null \
+            | awk '{print $1}' | grep -E "php.*fpm" | sort -rV || true
+        echo "php-fpm.service"
+    )
     [ -z "$PHPFPM_SVC" ] && log_warn "php-fpm service not detected — will skip restart"
 
     # ── Detect sites ──────────────────────────────────────────────────────────
@@ -1954,9 +2016,7 @@ setup_phpfpm_pools() {
         SITE_GROUP=$(id -gn "$SITE_USER" 2>/dev/null || echo "www-data")
 
         # Detect web server socket owner
-        SOCK_OWNER="apache"
-        systemctl is-active --quiet nginx  2>/dev/null && SOCK_OWNER="nginx"
-        systemctl is-active --quiet apache2 2>/dev/null && SOCK_OWNER="www-data"
+        SOCK_OWNER=$(detect_webserver_user)
 
         POOL_CONF="${POOL_DIR}/${SITE_NAME}.conf"
         SOCK_PATH="/run/php-fpm/${SITE_NAME}.sock"
@@ -2795,9 +2855,9 @@ EOF
 
         TS=\$(date '+%Y-%m-%d %H:%M:%S')
         HOST=\$(hostname)
-        KEY=\$(echo "\$LINE" | grep -oP '"key":"\K[^"]+')
-        COMM=\$(echo "\$LINE" | grep -oP '"comm":"\K[^"]+' || echo "unknown")
-        PID=\$(echo "\$LINE"  | grep -oP '"pid":\K[0-9]+'  || echo "?")
+        KEY=\$(echo "\$LINE" | grep -oE '"key":"\K[^"]+')
+        COMM=\$(echo "\$LINE" | grep -oE '"comm":"\K[^"]+' || echo "unknown")
+        PID=\$(echo "\$LINE"  | grep -oE '"pid":\K[0-9]+'  || echo "?")
 
         SUBJECT="[LG ALERT] \${KEY} detected on \${HOST}"
         BODY=\$(printf "Linux Guardian Security Alert\n\nHost:    %s\nTime:    %s\nKey:     %s\nProcess: %s (PID %s)\n\nRaw event:\n%s\n\nLog: %s" \
@@ -3267,7 +3327,7 @@ watch_mode() {
     echo ""
 
     # ── Watch loop ────────────────────────────────────────────────────────────
-    # Disable pipefail for the inotifywait pipe — it exits non-zero on Ctrl+C
+    # Disable exit-on-error for inotifywait pipe — exits non-zero on Ctrl+C
     set +e
     inotifywait \
         --monitor \
@@ -3278,7 +3338,8 @@ watch_mode() {
         /var/www \
         /home \
         2>/dev/null | while IFS= read -r NEW_PATH; do
-    set -e
+    # restore inside pipe subshell is harmless but documents intent
+    set +e
 
         # Only care about directories
         [ -d "$NEW_PATH" ] || continue
@@ -3419,9 +3480,7 @@ watch_mode() {
             W_SITE_USER=$(stat -c '%U' "$NEW_PATH" 2>/dev/null || echo "www-data")
             id "$W_SITE_USER" &>/dev/null || W_SITE_USER="www-data"
             W_SITE_GROUP=$(id -gn "$W_SITE_USER" 2>/dev/null || echo "www-data")
-            W_SOCK_OWNER="apache"
-            systemctl is-active --quiet nginx   2>/dev/null && W_SOCK_OWNER="nginx"
-            systemctl is-active --quiet apache2 2>/dev/null && W_SOCK_OWNER="www-data"
+            W_SOCK_OWNER=$(detect_webserver_user)
 
             W_POOL_CONF="${W_POOL_DIR}/${SN}.conf"
             W_SESSION_PATH="/var/lib/php/sessions/${SN}"
@@ -3485,12 +3544,19 @@ POOLEOF
         if [ "$UPDATED_INI" -gt 0 ]; then
             echo -e "  ${GREEN}[OK]${NC}      open_basedir updated in ${UPDATED_INI} php.ini file(s)"
             echo "${TS} [WATCH] open_basedir updated in ${UPDATED_INI} php.ini(s) for ${SN}" >> "$LOG_FILE"
-            for svc in apache2 httpd nginx; do
-                systemctl is-active --quiet "$svc" 2>/dev/null \
-                    && systemctl restart "$svc" 2>/dev/null \
-                    && echo -e "  ${GREEN}[OK]${NC}      Restarted: ${svc}" \
-                    || true
-            done
+            # Auto-detect and restart active web server
+            while IFS= read -r _svc; do
+                systemctl is-active --quiet "$_svc" 2>/dev/null && {
+                    systemctl restart "$_svc" 2>/dev/null \
+                        && echo -e "  ${GREEN}[OK]${NC}      Restarted: ${_svc}" \
+                        || true
+                    break
+                }
+            done < <(systemctl list-units --type=service --state=active \
+                         --no-legend 2>/dev/null \
+                     | awk '{print $1}' \
+                     | grep -E "^(nginx|apache2|httpd|lighttpd|caddy)" \
+                     || echo "httpd")
         fi
 
         # ── Summary for this site ─────────────────────────────────────────────
@@ -3512,7 +3578,7 @@ POOLEOF
 }
 
 # ── Entry point for --watch ───────────────────────────────────────────────────
-if [[ "${1:-}" == "--watch" ]]; then
+if [ "$WATCH_MODE" = true ]; then
     watch_mode
     exit 0
 fi
