@@ -53,7 +53,7 @@ sudo lg --help                  # Show all options
 | [1] | **Binary Lockdown** | Restricts nc, gcc, python, perl, curl, wget and 30+ tools to root only |
 | [2] | **Kernel Hardening** | Blocks dccp, sctp, rds, tipc modules — applies ASLR, SYN cookies, reverse path filtering |
 | [3] | **System Files** | Hardens /etc/shadow, /etc/passwd, sshd_config, cron directories |
-| [4] | **MySQL / MariaDB** | Binds database to 127.0.0.1 |
+| [4] | **Apache & MySQL / MariaDB** | ServerTokens, ServerSignature, UseCanonicalName and Binds database to 127.0.0.1 |
 | [5] | **PHP Hardening** | Disables 60+ dangerous functions + sets open_basedir per site + date.timezone |
 | [5.1] | **PHP-FPM Pools** | Creates an isolated pool per site with open_basedir, session dir, and logs |
 | [5.2] | **Panel php.ini** | Fixes date.timezone in all panel-specific php.ini files |
