@@ -102,7 +102,17 @@ run_cmd() {
     if [ "$DRY_RUN" = true ]; then log_dry "$*"
     else "$@"; fi
 }
-
+# ─── Detect Timezone ─────────────────────────────────────────────────────────
+_detect_timezone() {
+    local _tz=""
+    _tz=$(timedatectl 2>/dev/null | awk '/Time zone/{print $3}' | head -1 || true)
+    [ -z "$_tz" ] && \
+        _tz=$(cat /etc/timezone 2>/dev/null | head -1 | tr -d '[:space:]' || true)
+    [ -z "$_tz" ] && \
+        _tz=$(readlink /etc/localtime 2>/dev/null | sed 's|.*/zoneinfo/||' || true)
+    [ -z "$_tz" ] && _tz="UTC"
+    echo "$_tz"
+}
 # ─── backup_file: copy + record in undo manifest ─────────────────────────────
 backup_file() {
     local src="$1" tag="${2:-file}"
@@ -307,7 +317,39 @@ restart_php_services() {
     esac
     return 0
 }
-
+# ── detect_panel: returns panel name and service name ────────────────────────
+detect_panel() {
+    # Returns: "PanelName:service_name" or "none:"
+    { [ -d /usr/local/cwpsrv ] || [ -f /usr/local/cwp/php71/bin/php ]; } \
+        && echo "CWP:cwpsrv"          && return
+    [ -d /usr/local/cpanel ] \
+        && echo "cPanel:cpanel"        && return
+    { [ -d /usr/local/psa ] || [ -d /opt/psa ]; } \
+        && echo "Plesk:psa"            && return
+    [ -d /usr/local/directadmin ] \
+        && echo "DirectAdmin:directadmin" && return
+    { [ -d /usr/local/CyberPanel ] || [ -f /usr/bin/cyberpanel ]; } \
+        && echo "CyberPanel:lsws"      && return
+    { [ -d /usr/local/hestia ] || [ -f /usr/local/hestia/bin/v-list-users ]; } \
+        && echo "HestiaCP:hestia"      && return
+    { [ -d /usr/local/vesta ] || [ -f /usr/local/vesta/bin/v-list-users ]; } \
+        && echo "VestaCP:vesta"        && return
+    [ -d /usr/local/ispconfig ] \
+        && echo "ISPConfig:ispconfig"  && return
+    { [ -d /www/server/panel ] || [ -f /usr/bin/bt ]; } \
+        && echo "aaPanel:bt"           && return
+    { [ -d /usr/share/webmin ] || [ -f /usr/bin/webmin ]; } \
+        && echo "Webmin:webmin"        && return
+    [ -d /usr/local/interworx ] \
+        && echo "InterWorx:iworx"      && return
+    { [ -d /var/www/froxlor ] || [ -d /usr/share/froxlor ]; } \
+        && echo "Froxlor:froxlor"      && return
+    [ -d /etc/runcloud ] \
+        && echo "RunCloud:runcloud-hub" && return
+    [ -f /usr/bin/centmin ] \
+        && echo "CentminMod:nginx"     && return
+    echo "none:"
+}
 # ══════════════════════════════════════════════════════════════════════════════
 # FUNCTION: _lg_fixmail — Fix Dovecot/vmail SELinux contexts
 # ══════════════════════════════════════════════════════════════════════════════
@@ -908,38 +950,43 @@ _lg_status() {
     [ "$_dfuncs" -gt 5 ] && _PHP=0 || _PHP=1
     _st "$_PHP" "[5] PHP disable_functions — $( [ $_PHP -eq 0 ] && echo "active (${_dfuncs} functions)" || echo 'not applied')"
 
-    # [5.1] PHP-FPM Pools
+    # [5.1] PHP-FPM (hosted sites)
     echo ""
-    echo -e "  ${BOLD}[PHP-FPM]${NC} Status check"
-    _FPMSERVICE=""
-    # Auto-detect any active php-fpm service
-    while IFS= read -r _svc; do
-        svc_running "$_svc" 2>/dev/null \
-            && _FPMSERVICE="$_svc" && break
-    done < <({ systemctl list-units --type=service --state=active \
-                    --no-legend 2>/dev/null \
-                  | awk '{print $1}' \
-                  | grep -E "^php.*fpm"
-                echo "php-fpm"
-              } | sort -rV | sort -u || true)
-    [ -z "$_FPMSERVICE" ] && \
-        pgrep -x php-fpm &>/dev/null && _FPMSERVICE="php-fpm (process)"
-    if [ -n "$_FPMSERVICE" ]; then
-        echo -e "  ${GREEN}✓${NC} [5.1] PHP-FPM             — running (${_FPMSERVICE})"
+    _PHP_MODE=$(detect_php_mode)
+    _POOL_DIR=$(find_pool_dir)
+    _POOL_COUNT=0
+    [ -n "$_POOL_DIR" ] && \
+        _POOL_COUNT=$(find "$_POOL_DIR" -name "*.conf" \
+            ! -name "www.conf" 2>/dev/null | wc -l || echo 0)
+
+    if [ "$_PHP_MODE" = "fpm" ]; then
+        _FPMSERVICE=$(systemctl list-units --type=service \
+            --state=active --no-legend 2>/dev/null \
+            | awk '{print $1}' \
+            | grep -E "^php.*fpm" \
+            | sed 's/\.service//' \
+            | head -1 || true)
+        echo -e "  ${GREEN}✓${NC} [5.1] PHP-FPM (sites)    — running (${_FPMSERVICE:-php-fpm}) | ${_POOL_COUNT} pool(s)"
+    elif [ "$_PHP_MODE" = "cgi" ]; then
+        echo -e "  ${CYAN}✓${NC} [5.1] PHP mode            — CGI | ${_POOL_COUNT} pool(s)"
     else
-        echo -e "  ${YELLOW}!${NC} [5.1] PHP-FPM             — not running as standalone"
-        echo -e "    ${CYAN}(panel may manage PHP-FPM internally)${NC}"
+        echo -e "  ${CYAN}✓${NC} [5.1] PHP mode            — mod_php | ${_POOL_COUNT} pool(s)"
     fi
 
     # [5.2] Panel
-    local _panel="none"
-    { [ -d /usr/local/cwpsrv ] || [ -f /usr/local/cwp/php71/bin/php ]; } && _panel="CWP"
-    [ -d /usr/local/cpanel ]   && _panel="cPanel"
-    { [ -d /usr/local/psa ] || [ -d /opt/psa ]; } && _panel="Plesk"
-    [ -d /usr/local/directadmin ] && _panel="DirectAdmin"
-    { [ -d /usr/local/CyberPanel ] || [ -f /usr/bin/cyberpanel ]; } && _panel="CyberPanel"
-    { [ -d /usr/local/hestia ] || [ -f /usr/local/hestia/bin/v-list-users ]; } && _panel="HestiaCP"
-    [ "$_panel" != "none" ] && echo -e "  ${CYAN}i${NC} [5.2] Panel detected      — ${_panel}"
+    local _PANEL_INFO _PANEL_NAME _PANEL_SVC _panel_php_status
+        _PANEL_INFO=$(detect_panel)
+        _PANEL_NAME="${_PANEL_INFO%%:*}"
+        _PANEL_SVC="${_PANEL_INFO##*:}"
+
+    if [ "$_PANEL_NAME" != "none" ]; then
+        svc_running "$_PANEL_SVC" \
+            && _panel_php_status="running" \
+            || _panel_php_status="stopped"
+        [ "$_panel_php_status" = "running" ] \
+            && echo -e "  ${GREEN}✓${NC} [5.2] Panel               — (${_PANEL_NAME}) ${_panel_php_status}" \
+            || echo -e "  ${RED}✗${NC} [5.2] Panel               — (${_PANEL_NAME}) ${_panel_php_status}"
+    fi
 
     # [6] noexec
     mount 2>/dev/null | grep -q "on /tmp.*noexec" && _NX=0 || _NX=1
@@ -1260,17 +1307,6 @@ elif [ "$DRY_RUN" = false ]; then
     exec > >(tee -a "$LOG_FILE") 2>&1
 fi
 
-# ── Detect server timezone (shared function) ──────────────────────────────────
-_detect_timezone() {
-    local _tz=""
-    _tz=$(timedatectl 2>/dev/null | awk '/Time zone/{print $3}' | head -1 || true)
-    [ -z "$_tz" ] && \
-        _tz=$(cat /etc/timezone 2>/dev/null | head -1 | tr -d '[:space:]' || true)
-    [ -z "$_tz" ] && \
-        _tz=$(readlink /etc/localtime 2>/dev/null | sed 's|.*/zoneinfo/||' || true)
-    [ -z "$_tz" ] && _tz="UTC"
-    echo "$_tz"
-}
 PHP_TIMEZONE=$(_detect_timezone)
 
 if [[ "$RUN_MODE" == "interactive" ]] && [ "$DRY_RUN" = false ] && [ "$UNDO_MODE" = false ]; then
