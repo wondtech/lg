@@ -498,7 +498,7 @@ _lg_scan() {
     TS=$(date '+%Y-%m-%d %H:%M:%S')
     echo "# Linux Guardian Scan — ${TS}" >> "$LG_SCAN_LOG"
 
-    local PHP_PATTERNS=(
+local PHP_PATTERNS=(
         'eval[[:space:]]*\([[:space:]]*base64_decode'
         'eval[[:space:]]*\([[:space:]]*gzinflate'
         'eval[[:space:]]*\([[:space:]]*gzuncompress'
@@ -516,18 +516,28 @@ _lg_scan() {
         'popen[[:space:]]*\([[:space:]]*\$_(GET|POST|REQUEST|COOKIE)'
         'proc_open[[:space:]]*\([[:space:]]*\$_(GET|POST|REQUEST|COOKIE)'
         'assert[[:space:]]*\([[:space:]]*\$_(GET|POST|REQUEST|COOKIE)'
+        'function[[:space:]]+(execute|run|cmd|shell|do)[A-Za-z]*[[:space:]]*\([[:space:]]*\$'
+        'exec[[:space:]]*\([[:space:]]*\$(cmd|command|c|run|input|str|data)'
+        'shell_exec[[:space:]]*\([[:space:]]*\$(cmd|command|c|run|input)'
+        'system[[:space:]]*\([[:space:]]*\$(cmd|command|c|run|input)'
+        'passthru[[:space:]]*\([[:space:]]*\$(cmd|command|c|run|input)'
+        'function_exists[[:space:]]*\([[:space:]]*["\x27](exec|shell_exec|system|passthru|popen|proc_open)'
+        'function_exists.*exec.*function_exists.*shell_exec'
         'preg_replace[[:space:]]*\(.*\/e[[:space:],)]'
-        'FilesMan|b374k|c99shell|r57shell|WSO shell|indoxploit|webshell|w4rf4m3'
-        'MRLS_PASS|BYPASS_PASS|SHELL_PASS|define.*_PASS.*[a-zA-Z0-9]'
         '\$this->(exec|system|shell|run|cmd)[[:space:]]*\('
         'class[[:space:]]+\w+.*getcwd\(\)'
         'function[[:space:]]+(mrls_|wso_|c99_|r57_|shell_)\w+'
         "SHELL[[:space:]]*=>[[:space:]]*['\"]\/bin\/(bash|sh|csh)"
         'putenv[[:space:]]*\([[:space:]]*["\x27]SHELL='
         'chr\(99\)\.chr\(109\)\.chr\(100\)'
-        '\$[a-z]\([0-9]+\)\.[a-z]\([0-9]+\)'
-        '\$[a-zA-Z_]\w*[[:space:]]*=[[:space:]]*["\x27](system|exec|passthru|shell_exec)'
+        '\$[a-zA-Z_]\w*[[:space:]]*=[[:space:]]*["\x27](system|exec|passthru|shell_exec|popen)'
         '\$[a-zA-Z_]\w*[[:space:]]*\([[:space:]]*\$_(GET|POST|REQUEST|COOKIE)'
+        'getcwd\(\).*chdir|chdir.*getcwd\(\)'
+        'TERM.*xterm|xterm.*TERM'
+        'move_uploaded_file[[:space:]]*\(.*\$_(GET|POST|REQUEST|FILES)'
+        'file_put_contents[[:space:]]*\([[:space:]]*\$_(GET|POST|REQUEST)'
+        'chmod[[:space:]]*\([[:space:]]*\$_(GET|POST|REQUEST)'
+        'unlink[[:space:]]*\([[:space:]]*\$_(GET|POST|REQUEST)'
         'phpinfo[[:space:]]*\([[:space:]]*\)'
     )
 
