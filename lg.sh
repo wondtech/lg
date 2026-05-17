@@ -45,6 +45,7 @@ AUTO_ANALYZE_MODE=false
 INTEGRITY_MODE=false
 FORCE_MODE=false
 UPDATE_MODE=false
+HELP_MODE=false
 WATCH_MODE=false
 LG_STATE_FILE="/root/lg/.applied"
 LG_SCAN_LOG="/var/log/lg-scan.log"
