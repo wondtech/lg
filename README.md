@@ -109,7 +109,8 @@ After the first run, `sudo lg` automatically shows:
   ✓ [1] Binary Lockdown       — active
   ✓ [2] Kernel Hardening      — active
   ✓ [3] System Files          — hardened
-  ✓ [4] MySQL/MariaDB         — bound to 127.0.0.1
+  ✓ [4.1] Apache httpd.conf   — hardened
+  ✓ [4.2] MySQL/MariaDB       — bound to 127.0.0.1
   ✓ [5] PHP disable_functions — active (820 chars)
   i [5.1] PHP-FPM Pools       — 4 pool(s) active
   i [5.2] Panel php.ini       — CWP (tz: Asia/Riyadh)
