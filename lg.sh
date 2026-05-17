@@ -931,14 +931,38 @@ _lg_status() {
     [ "$_shperm" = "600" ] && _SYS=0 || _SYS=1
     _st "$_SYS" "[3] System Files          — $([ $_SYS -eq 0 ] && echo 'hardened' || echo 'not hardened')"
 
-    # [4] MySQL
+    # [4.1] Apache
+    local _httpd_ok=0 _httpd_total=0
+    while IFS= read -r _f; do
+        [ -f "$_f" ] || continue
+        _httpd_total=$((_httpd_total+1))
+        grep -q "ServerTokens Prod" "$_f" 2>/dev/null \
+            && _httpd_ok=$((_httpd_ok+1))
+    done < <(find /etc/httpd /etc/apache2 \
+                  /usr/local/apache2 /usr/local/apache \
+                  -maxdepth 3 \
+                  \( -name "httpd.conf" -o -name "apache2.conf" \) \
+                  ! -path "*/original/*" \
+                  ! -path "*/backup*/*" \
+                  ! -path "*/bak*/*" \
+                  2>/dev/null | sort -u)
+
+    if [ "$_httpd_total" -gt 0 ]; then
+        [ "$_httpd_ok" -eq "$_httpd_total" ] \
+            && echo -e "  ${GREEN}✓${NC} [4.1] Apache httpd.conf   — hardened"\
+            || echo -e "  ${RED}✗${NC} [4.1] Apache httpd.conf   — not hardened"
+    else
+        echo -e "  ${CYAN}—${NC} [4.1] Apache httpd.conf   — not found"
+    fi
+
+    # [4.2] MySQL
     if command -v mysql &>/dev/null || command -v mysqld &>/dev/null; then
         local _bind
         _bind=$(grep "bind-address" /etc/my.cnf /etc/mysql/my.cnf 2>/dev/null | grep "127.0.0.1" || true)
         [ -n "$_bind" ] && _DB=0 || _DB=1
-        _st "$_DB" "[4] MySQL/MariaDB         — $([ $_DB -eq 0 ] && echo 'bound to 127.0.0.1' || echo 'check bind-address')"
+        _st "$_DB" "[4.2] MySQL/MariaDB       — $([ $_DB -eq 0 ] && echo 'bound to 127.0.0.1' || echo 'check bind-address')"
     else
-        echo -e "  ${CYAN}—${NC} [4] MySQL/MariaDB         — not installed"
+        echo -e "  ${CYAN}—${NC} [4.2] MySQL/MariaDB       — not installed"
     fi
 
     # [5] PHP
@@ -968,9 +992,9 @@ _lg_status() {
             | head -1 || true)
         echo -e "  ${GREEN}✓${NC} [5.1] PHP-FPM (sites)    — running (${_FPMSERVICE:-php-fpm}) | ${_POOL_COUNT} pool(s)"
     elif [ "$_PHP_MODE" = "cgi" ]; then
-        echo -e "  ${CYAN}✓${NC} [5.1] PHP mode            — CGI | ${_POOL_COUNT} pool(s)"
+        echo -e "  ${GREEN}✓${NC} [5.1] PHP mode            — CGI | ${_POOL_COUNT} pool(s)"
     else
-        echo -e "  ${CYAN}✓${NC} [5.1] PHP mode            — mod_php | ${_POOL_COUNT} pool(s)"
+        echo -e "  ${GREEN}✓${NC} [5.1] PHP mode            — mod_php | ${_POOL_COUNT} pool(s)"
     fi
 
     # [5.2] Panel
@@ -1627,10 +1651,72 @@ done
 log_ok "Layer 3 complete"
 
 # ══════════════════════════════════════════════════════════════════════════════
-# LAYER 4 — MySQL / MariaDB Hardening
+# LAYER 4.1 — Apache Hardening
+# ══════════════════════════════════════════════════════════════════════════════
+section "LAYER 4.1: Apache / MariaDB Hardening"
+
+# Locate all httpd.conf files
+_HTTPD_CONFS=()
+while IFS= read -r _f; do
+    [ -f "$_f" ] && _HTTPD_CONFS+=("$_f")
+    done < <(find /etc/httpd /etc/apache2 /usr/local/apache2 \
+            /usr/local/apache /usr/local/cwpsrv/conf \
+            -maxdepth 3 \
+            \( -name "httpd.conf" -o -name "apache2.conf" \) \
+            2>/dev/null | sort -u)
+
+if [ ${#_HTTPD_CONFS[@]} -eq 0 ]; then
+    log_skip "httpd.conf not found — skipping"
+else
+    # Interactive mode — let user choose
+    if [ "$RUN_MODE" = "interactive" ] && [ ${#_HTTPD_CONFS[@]} -gt 1 ]; then
+        echo ""
+        echo -e "  ${BOLD}Select httpd.conf to harden:${NC}"
+        for i in "${!_HTTPD_CONFS[@]}"; do
+            echo "    [$((i+1))] ${_HTTPD_CONFS[$i]}"
+        done
+        echo "    [A] All"
+        echo ""
+        read -r -p "  Choice (default: A): " _HTTPD_CHOICE
+        case "${_HTTPD_CHOICE:-A}" in
+            [Aa]|"") _SELECTED_CONFS=("${_HTTPD_CONFS[@]}") ;;
+            [0-9]*)
+                _IDX=$((_HTTPD_CHOICE-1))
+                [ -n "${_HTTPD_CONFS[$_IDX]:-}" ] \
+                    && _SELECTED_CONFS=("${_HTTPD_CONFS[$_IDX]}") \
+                    || _SELECTED_CONFS=("${_HTTPD_CONFS[@]}")
+                ;;
+            *) _SELECTED_CONFS=("${_HTTPD_CONFS[@]}") ;;
+        esac
+    else
+        _SELECTED_CONFS=("${_HTTPD_CONFS[@]}")
+    fi
+
+    _HTTPD_SETTINGS=$'# Linux Guardian — Apache hardening\nServerTokens Prod\nServerSignature Off\nUseCanonicalName Off'
+
+    for _conf in "${_SELECTED_CONFS[@]}"; do
+        if [ "$DRY_RUN" = true ]; then
+            log_dry "Append hardening to: ${_conf}"
+            continue
+        fi
+        backup_file "$_conf" "httpd_conf"
+        # Skip if already applied
+        if grep -q "ServerTokens Prod" "$_conf" 2>/dev/null; then
+            log_skip "Already applied: ${_conf}"
+            continue
+        fi
+        # Ensure newline before appending
+        [ "$(tail -c1 "$_conf" | wc -l)" -eq 0 ] && echo "" >> "$_conf"
+        echo "$_HTTPD_SETTINGS" >> "$_conf"
+        log_ok "Hardened: ${_conf}"
+    done
+fi
+
+# ══════════════════════════════════════════════════════════════════════════════
+# LAYER 4.2 — MySQL / MariaDB Hardening
 # Harden database: bind to localhost only
 # ══════════════════════════════════════════════════════════════════════════════
-section "LAYER 4: MySQL / MariaDB Hardening"
+section "LAYER 4.2: MySQL / MariaDB Hardening"
 
 # ── Step 1: Check if service is installed ────────────────────────────────────
 if ! svc_installed mysqld mariadbd mysql mariadb; then
@@ -1688,7 +1774,7 @@ else
     fi
 fi
 
-log_ok "Layer 4 complete"
+log_ok "Layer 4.2 complete"
 
 # ══════════════════════════════════════════════════════════════════════════════
 # LAYER 5 — PHP Security Hardening (disable_functions)
@@ -1755,18 +1841,7 @@ fi
 
 if [ "$PHP_SKIP" = false ] && [ ${#SELECTED_FILES[@]} -gt 0 ]; then
 
-    DISABLE_FUNCTIONS="exec,passthru,shell_exec,system,popen,proc_open,proc_close,\
-    proc_get_status,proc_terminate,proc_nice,pcntl_exec,pcntl_fork,pcntl_signal,\
-    pcntl_waitpid,pcntl_wait,pcntl_wifexited,pcntl_wifstopped,pcntl_wifsignaled,\
-    pcntl_wexitstatus,pcntl_wstopsig,pcntl_signal_dispatch,pcntl_get_last_error,\
-    pcntl_strerror,pcntl_sigprocmask,pcntl_sigwaitinfo,pcntl_sigtimedwait,pcntl_alarm,\
-    pcntl_getpriority,pcntl_setpriority,pcntl_async_signals,posix_kill,posix_mkfifo,\
-    posix_setpgid,posix_setsid,posix_setuid,posix_setgid,posix_seteuid,posix_setegid,\
-    fsockopen,pfsockopen,stream_socket_client,stream_socket_server,socket_create,\
-    socket_connect,socket_bind,socket_listen,socket_accept,phpinfo,show_source,\
-    highlight_file,symlink,link,dl,assert,create_function,parse_ini_file,\
-    opcache_get_status,opcache_reset,putenv,apache_setenv"
-
+    DISABLE_FUNCTIONS="exec,passthru,shell_exec,system,popen,proc_open,proc_close,proc_get_status,proc_terminate,proc_nice,pcntl_exec,pcntl_fork,pcntl_signal,pcntl_waitpid,pcntl_wait,pcntl_wifexited,pcntl_wifstopped,pcntl_wifsignaled,pcntl_wexitstatus,pcntl_wstopsig,pcntl_signal_dispatch,pcntl_get_last_error,pcntl_strerror,pcntl_sigprocmask,pcntl_sigwaitinfo,pcntl_sigtimedwait,pcntl_alarm,pcntl_getpriority,pcntl_setpriority,pcntl_async_signals,posix_kill,posix_mkfifo,posix_setpgid,posix_setsid,posix_setuid,posix_setgid,posix_seteuid,posix_setegid,fsockopen,pfsockopen,stream_socket_client,stream_socket_server,socket_create,socket_connect,socket_bind,socket_listen,socket_accept,phpinfo,show_source,highlight_file,symlink,link,dl,assert,create_function,opcache_get_status,opcache_reset,apache_setenv,gethostname,gethostbyname,gethostbyaddr,dns_get_record,dns_get_mx,posix_getuid,posix_getgid,posix_getpwuid,get_current_user"
     # Declared once outside loop — avoids redeclaration and state leakage
     unset PHPSEC
     declare -A PHPSEC=(
@@ -1775,7 +1850,7 @@ if [ "$PHP_SKIP" = false ] && [ ${#SELECTED_FILES[@]} -gt 0 ]; then
         ["expose_php"]="Off"
         ["display_errors"]="Off"
         ["log_errors"]="On"
-        ["disable_classes"]="Imagick,gs"
+        ["disable_classes"]="Imagick,ImagickDraw,ImagickPixel,ImagickPixelIterator,Gmagick,ReflectionClass,ReflectionFunction,ReflectionMethod,ReflectionProperty,ReflectionExtension,ReflectionObject,Phar,PharData"
         ["file_uploads"]="On"
         ["upload_tmp_dir"]="/tmp"
         ["upload_max_filesize"]="2M"
