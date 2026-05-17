@@ -479,7 +479,6 @@ DOVEPOL
 # ══════════════════════════════════════════════════════════════════════════════
 _lg_scan() {
     local SCAN_PATH="${1:-}"
-    # Detect scan paths
     local PATHS=()
     if [ -n "$SCAN_PATH" ] && [ -d "$SCAN_PATH" ]; then
         PATHS=("$SCAN_PATH")
@@ -499,84 +498,102 @@ _lg_scan() {
     TS=$(date '+%Y-%m-%d %H:%M:%S')
     echo "# Linux Guardian Scan — ${TS}" >> "$LG_SCAN_LOG"
 
-    # PHP webshell patterns
     local PHP_PATTERNS=(
-        'eval\s*(\s*base64_decode'
-        'eval\s*(\s*gzinflate'
-        'eval\s*(\s*str_rot13'
-        'eval\s*(\s*gzuncompress'
-        '\$_\(GET\|POST\|REQUEST\|COOKIE\)\s*\[.*\]\s*('
-        'system\s*(\s*\$_'
-        'passthru\s*(\s*\$_'
-        'shell_exec\s*(\s*\$_'
-        'exec\s*(\s*\$_'
-        'popen\s*(\s*\$_'
-        'proc_open\s*(\s*\$_'
-        'assert\s*(\s*\$_'
-        'preg_replace.*\/e[^a-z]'
-        'base64_decode.*eval'
-        'FilesMan\|b374k\|c99shell\|r57shell\|WSO\|indoxploit'
-        'uname.*-a.*\$_\|id.*\$_.*whoami'
-        '@eval\|@system\|@exec\|@passthru'
-        'chr(99).chr(109).chr(100)'
-        'gzinflate.*base64_decode\|base64_decode.*gzinflate'
+        'eval[[:space:]]*\([[:space:]]*base64_decode'
+        'eval[[:space:]]*\([[:space:]]*gzinflate'
+        'eval[[:space:]]*\([[:space:]]*gzuncompress'
+        'eval[[:space:]]*\([[:space:]]*str_rot13'
+        'eval[[:space:]]*\([[:space:]]*strrev'
+        'eval[[:space:]]*\([[:space:]]*rawurldecode'
+        'base64_decode.*eval|eval.*base64_decode'
+        'gzinflate.*base64_decode|base64_decode.*gzinflate'
+        'str_rot13.*eval|eval.*str_rot13'
+        '@eval|@system|@exec|@passthru|@shell_exec|@popen|@proc_open'
+        'system[[:space:]]*\([[:space:]]*\$_(GET|POST|REQUEST|COOKIE|SERVER)'
+        'passthru[[:space:]]*\([[:space:]]*\$_(GET|POST|REQUEST|COOKIE)'
+        'shell_exec[[:space:]]*\([[:space:]]*\$_(GET|POST|REQUEST|COOKIE)'
+        'exec[[:space:]]*\([[:space:]]*\$_(GET|POST|REQUEST|COOKIE)'
+        'popen[[:space:]]*\([[:space:]]*\$_(GET|POST|REQUEST|COOKIE)'
+        'proc_open[[:space:]]*\([[:space:]]*\$_(GET|POST|REQUEST|COOKIE)'
+        'assert[[:space:]]*\([[:space:]]*\$_(GET|POST|REQUEST|COOKIE)'
+        'preg_replace[[:space:]]*\(.*\/e[[:space:],)]'
+        'FilesMan|b374k|c99shell|r57shell|WSO shell|indoxploit|webshell|w4rf4m3'
+        'MRLS_PASS|BYPASS_PASS|SHELL_PASS|define.*_PASS.*[a-zA-Z0-9]'
+        '\$this->(exec|system|shell|run|cmd)[[:space:]]*\('
+        'class[[:space:]]+\w+.*getcwd\(\)'
+        'function[[:space:]]+(mrls_|wso_|c99_|r57_|shell_)\w+'
+        "SHELL[[:space:]]*=>[[:space:]]*['\"]\/bin\/(bash|sh|csh)"
+        'putenv[[:space:]]*\([[:space:]]*["\x27]SHELL='
+        'chr\(99\)\.chr\(109\)\.chr\(100\)'
+        '\$[a-z]\([0-9]+\)\.[a-z]\([0-9]+\)'
+        '\$[a-zA-Z_]\w*[[:space:]]*=[[:space:]]*["\x27](system|exec|passthru|shell_exec)'
+        '\$[a-zA-Z_]\w*[[:space:]]*\([[:space:]]*\$_(GET|POST|REQUEST|COOKIE)'
+        'phpinfo[[:space:]]*\([[:space:]]*\)'
     )
 
-    # Perl/Python reverse shell patterns
+    # ── Perl/Python/Shell reverse shell patterns ──────────────────────────────
     local GENERAL_PATTERNS=(
-        'use\s*Socket.*connect.*STDOUT'
-        'import\s*socket.*subprocess\|subprocess.*import\s*socket'
-        'os\.system\|os\.popen\|subprocess\.call'
-        '/dev/tcp/\|/dev/udp/'
-        'bash\s*-i\s*>&\s*/dev/tcp'
-        'python.*socket.*connect\|perl.*socket.*connect'
-        'nc\s*-e\s*/bin\|ncat\s*-e\s*/bin'
-        'bash.*>.*&.*tcp\|sh.*>.*&.*tcp'
+        'use[[:space:]]+Socket.*connect.*STDOUT'
+        'import[[:space:]]+socket.*subprocess|subprocess.*import[[:space:]]+socket'
+        'os\.(system|popen|execve|execvp)[[:space:]]*\('
+        'subprocess\.(call|Popen|run)[[:space:]]*\('
+        '/dev/tcp/|/dev/udp/'
+        'bash[[:space:]]+-i[[:space:]]*>&[[:space:]]*/dev/tcp'
+        'python.*socket.*connect|perl.*socket.*connect'
+        'nc[[:space:]]+-e[[:space:]]*/bin|ncat[[:space:]]+-e[[:space:]]*/bin'
+        'bash.*>[[:space:]]*&.*tcp|sh.*>[[:space:]]*&.*tcp'
+        'socket\.connect\([[:space:]]*\([[:space:]]*["\x27][0-9]'
+        'IO::Socket::INET->new'
     )
-
     _scan_dir() {
         local dir="$1"
         [ -d "$dir" ] || return 0
-
-        # PHP files
         while IFS= read -r f; do
             [ -f "$f" ] || continue
             for pat in "${PHP_PATTERNS[@]}"; do
-                if grep -qsiE "$pat" "$f" 2>/dev/null; then
+                if grep -qiP "$pat" "$f" 2>/dev/null || \
+                   grep -qiE "$pat" "$f" 2>/dev/null; then
                     echo -e "  ${RED}[WARN]${NC} PHP webshell: $f"
                     echo -e "         Pattern: $pat"
-                    echo "[WARN] PHP webshell: $f | Pattern: $pat" >> "$LG_SCAN_LOG"
+                    echo "[WARN] PHP webshell: $f | Pattern: $pat" \
+                        >> "$LG_SCAN_LOG"
                     FOUND=$((FOUND+1))
                     break
                 fi
             done
-        done < <(find "$dir" -type f \( -name "*.php" -o -name "*.php5" \
-            -o -name "*.php7" -o -name "*.phtml" \) 2>/dev/null)
-
-        # Perl/Python/Shell files + hidden files
+        done < <(find "$dir" -type f \
+            \( -name "*.php" -o -name "*.php5" -o -name "*.php7" \
+               -o -name "*.php8" -o -name "*.phtml" -o -name "*.phar" \) \
+            -not -path "*/vendor/*" \
+            -not -path "*/.git/*" \
+            2>/dev/null)
         while IFS= read -r f; do
             [ -f "$f" ] || continue
             for pat in "${GENERAL_PATTERNS[@]}"; do
-                if grep -qsiE "$pat" "$f" 2>/dev/null; then
+                if grep -qiE "$pat" "$f" 2>/dev/null; then
                     echo -e "  ${RED}[WARN]${NC} Reverse shell: $f"
                     echo -e "         Pattern: $pat"
-                    echo "[WARN] Reverse shell: $f | Pattern: $pat" >> "$LG_SCAN_LOG"
+                    echo "[WARN] Reverse shell: $f | Pattern: $pat" \
+                        >> "$LG_SCAN_LOG"
                     FOUND=$((FOUND+1))
                     break
                 fi
             done
-        done < <(find "$dir" -type f \( -name "*.pl" -o -name "*.py" \
-            -o -name "*.sh" -o -name ".*" \) 2>/dev/null)
-
-        # Executable files in upload dirs
+        done < <(find "$dir" -type f \
+            \( -name "*.pl" -o -name "*.py" -o -name "*.sh" -o -name ".*" \) \
+            -not -path "*/vendor/*" \
+            -not -path "*/.git/*" \
+            2>/dev/null)
         while IFS= read -r f; do
             [ -f "$f" ] || continue
             echo -e "  ${YELLOW}[WARN]${NC} Executable in web dir: $f"
             echo "[WARN] Executable in web dir: $f" >> "$LG_SCAN_LOG"
             FOUND=$((FOUND+1))
-        done < <(find "$dir" -type f \( -name "*.sh" -o -name "*.pl" \
-            -o -name "*.py" -o -name "*.elf" \) \
-            -not -path "*/vendor/*" -not -path "*/.git/*" 2>/dev/null)
+        done < <(find "$dir" -type f \
+            \( -name "*.sh" -o -name "*.pl" -o -name "*.py" -o -name "*.elf" \) \
+            -not -path "*/vendor/*" \
+            -not -path "*/.git/*" \
+            2>/dev/null)
     }
 
     for p in "${PATHS[@]}"; do
@@ -587,12 +604,10 @@ _lg_scan() {
     echo ""
     if [ "$FOUND" -gt 0 ]; then
         echo -e "  ${RED}[ALERT]${NC} ${FOUND} suspicious file(s) found — review: ${LG_SCAN_LOG}"
-        # Send email alert
-        if command -v mail &>/dev/null; then
+        command -v mail &>/dev/null && \
             echo "Linux Guardian SCAN ALERT: ${FOUND} suspicious files on $(hostname)" \
-                | mail -s "[LG ALERT] Webshell scan: $(hostname)" "${ALERT_EMAIL:-root}" \
-                2>/dev/null || true
-        fi
+            | mail -s "[LG ALERT] Webshell scan: $(hostname)" \
+              "${ALERT_EMAIL:-root}" 2>/dev/null || true
     else
         echo -e "  ${GREEN}[OK]${NC}      No suspicious files found"
     fi
