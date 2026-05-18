@@ -1799,9 +1799,31 @@ else
     done
     echo ""
 
-    if [[ "$RUN_MODE" == "cron" || "$RUN_MODE" == "auto" || "$DRY_RUN" == "true" ]]; then
-        SELECTED_FILES=("${PHP_INI_FILES[@]}")
-        PHP_SKIP=false
+    iif [[ "$RUN_MODE" == "cron" || "$RUN_MODE" == "auto" || "$DRY_RUN" == "true" ]]; then
+    _PANEL_INFO=$(detect_panel)
+    _PANEL_NAME="${_PANEL_INFO%%:*}"
+
+    SELECTED_FILES=()
+    for _ini in "${PHP_INI_FILES[@]}"; do
+        case "$_PANEL_NAME" in
+            CWP)        [[ "$_ini" == /usr/local/cwp/* ]]     && continue ;;
+            cPanel)     [[ "$_ini" == /usr/local/cpanel/* ]]  && continue ;;
+            Plesk)      [[ "$_ini" == /opt/plesk/* ]] || \
+                        [[ "$_ini" == /usr/local/psa/* ]]      && continue ;;
+            CyberPanel) [[ "$_ini" == /usr/local/lsws/* ]]    && continue ;;
+            HestiaCP)   [[ "$_ini" == /etc/php/* ]]           && continue ;;
+            VestaCP)    [[ "$_ini" == /etc/php/* ]]           && continue ;;
+            ISPConfig)  [[ "$_ini" == /etc/php/* ]]           && continue ;;
+            aaPanel)    [[ "$_ini" == /www/server/php/* ]]    && continue ;;
+            Webmin)     [[ "$_ini" == /etc/php/* ]]           && continue ;;
+            InterWorx)  [[ "$_ini" == /usr/local/interworx/* ]] && continue ;;
+            Froxlor)    [[ "$_ini" == /etc/php/* ]]           && continue ;;
+            RunCloud)   [[ "$_ini" == /etc/php/* ]]           && continue ;;
+            CentminMod) [[ "$_ini" == /usr/local/lib/php* ]]  && continue ;;
+        esac
+        SELECTED_FILES+=("$_ini")
+    done
+    PHP_SKIP=false
     else
         echo "  Select php.ini files:  a=all  s=skip  1,3=specific"
         read -r -p "  Your choice: " choice
