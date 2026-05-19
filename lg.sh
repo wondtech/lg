@@ -823,7 +823,7 @@ _lg_auto_analyze() {
     local INTERVAL=300
     local PID_FILE="/var/run/lg-analyze.pid"
 
-    # Stop any existing instance
+    # Stop any existing instance via PID file only
     if [ -f "$PID_FILE" ]; then
         _OLD=$(cat "$PID_FILE" 2>/dev/null || true)
         if [ -n "$_OLD" ]; then
@@ -832,9 +832,6 @@ _lg_auto_analyze() {
         fi
         rm -f "$PID_FILE"
     fi
-    pgrep -f "lg --auto-analyze" | grep -v "^${$}$" | \
-        xargs kill 2>/dev/null || true
-    sleep 1
 
     section "AUTO-ANALYZE: Starting background monitoring (every ${INTERVAL}s)"
     log_info "PID file: ${PID_FILE}"
@@ -911,11 +908,9 @@ Description=Linux Guardian Auto-Analyze
 After=network.target
 
 [Service]
-Type=forking
-ExecStart=/usr/local/bin/lg --auto-analyze
-PIDFile=/var/run/lg-analyze.pid
-Restart=on-failure
-RestartSec=10
+Type=simple
+ExecStart=/bin/bash /usr/local/bin/lg --auto-analyze
+RemainAfterExit=yes
 
 [Install]
 WantedBy=multi-user.target
