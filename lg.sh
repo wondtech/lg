@@ -820,10 +820,10 @@ _lg_integrity() {
 # FUNCTION: _lg_auto_analyze — Background monitoring daemon
 # ══════════════════════════════════════════════════════════════════════════════
 _lg_auto_analyze() {
-    local INTERVAL=300  # 5 minutes
+    local INTERVAL=300
     local PID_FILE="/var/run/lg-analyze.pid"
 
-    # Clean PID file
+    # Stop any existing instance
     if [ -f "$PID_FILE" ]; then
         _OLD=$(cat "$PID_FILE" 2>/dev/null || true)
         if [ -n "$_OLD" ]; then
@@ -832,7 +832,8 @@ _lg_auto_analyze() {
         fi
         rm -f "$PID_FILE"
     fi
-    pgrep -f "lg --auto-analyze" | grep -v "^$$\$" | xargs kill 2>/dev/null || true
+    pgrep -f "lg --auto-analyze" | grep -v "^${$}$" | \
+        xargs kill 2>/dev/null || true
     sleep 1
 
     section "AUTO-ANALYZE: Starting background monitoring (every ${INTERVAL}s)"
@@ -848,29 +849,33 @@ _lg_auto_analyze() {
         while true; do
             {
                 echo "# ── Auto-analyze $(date '+%Y-%m-%d %H:%M:%S') ──"
-                # Quick checks only in daemon mode
                 # 1. Suspicious processes
-                ps aux 2>/dev/null | grep -E "/tmp/|/dev/shm" | grep -v grep | while read -r p; do
+                ps aux 2>/dev/null | grep -E "/tmp/|/dev/shm" | \
+                    grep -v grep | while read -r p; do
                     echo "[AUTO-WARN] Suspicious process: $p"
                     command -v mail &>/dev/null && \
-                        echo "$p" | mail -s "[LG AUTO-ALERT] Suspicious process: $(hostname)" \
-                        "${ALERT_EMAIL:-root}" 2>/dev/null || true
+                        echo "$p" | mail \
+                            -s "[LG AUTO-ALERT] Suspicious process: $(hostname)" \
+                            "${ALERT_EMAIL:-root}" 2>/dev/null || true
                 done
-                # 2. Executable files in /tmp
-                find /tmp /var/tmp -type f -perm /111 2>/dev/null | while read -r f; do
+                # 2. Executables in /tmp
+                find /tmp /var/tmp -type f -perm /111 2>/dev/null | \
+                    while read -r f; do
                     echo "[AUTO-WARN] Executable in /tmp: $f"
                     command -v mail &>/dev/null && \
-                        echo "$f" | mail -s "[LG AUTO-ALERT] Executable in /tmp: $(hostname)" \
-                        "${ALERT_EMAIL:-root}" 2>/dev/null || true
+                        echo "$f" | mail \
+                            -s "[LG AUTO-ALERT] Executable in /tmp: $(hostname)" \
+                            "${ALERT_EMAIL:-root}" 2>/dev/null || true
                 done
-                # 3. New SUID files
+                # 3. New SUID files vs baseline
                 find / -xdev -perm -4000 -type f 2>/dev/null | \
                     grep -vF "$(cat /root/lg/.suid_baseline 2>/dev/null || true)" | \
                     while read -r f; do
                         echo "[AUTO-WARN] New SUID file: $f"
                         command -v mail &>/dev/null && \
-                            echo "$f" | mail -s "[LG AUTO-ALERT] New SUID: $(hostname)" \
-                            "${ALERT_EMAIL:-root}" 2>/dev/null || true
+                            echo "$f" | mail \
+                                -s "[LG AUTO-ALERT] New SUID: $(hostname)" \
+                                "${ALERT_EMAIL:-root}" 2>/dev/null || true
                     done
             } >> "$LG_ANALYZE_LOG" 2>&1
             sleep "$INTERVAL"
@@ -879,14 +884,50 @@ _lg_auto_analyze() {
     local _DAEMON_PID=$!
     disown "$_DAEMON_PID" 2>/dev/null || true
     sleep 0.5
-    # Real PID written by $BASHPID inside the subshell
     local _REAL_PID
     _REAL_PID=$(cat "$PID_FILE" 2>/dev/null || echo "$_DAEMON_PID")
     log_ok "Background monitoring started (PID: ${_REAL_PID})"
 
     # Build SUID baseline
-    find / -xdev -perm -4000 -type f 2>/dev/null > /root/lg/.suid_baseline || true
+    find / -xdev -perm -4000 -type f 2>/dev/null \
+        > /root/lg/.suid_baseline || true
     log_ok "SUID baseline recorded"
+
+    # ── Optional: enable auto-start on reboot via systemd ─────────────────────
+    if [ "$RUN_MODE" = "interactive" ]; then
+        echo ""
+        read -r -t 15 \
+            -p "  Enable auto-analyze on reboot? [y/N] (auto-skip in 15s): " \
+            _REBOOT_CHOICE || true
+        echo ""
+    else
+        _REBOOT_CHOICE="n"
+    fi
+
+    if [[ "${_REBOOT_CHOICE:-n}" =~ ^[Yy]$ ]]; then
+        cat > /etc/systemd/system/lg-analyze.service << 'EOF'
+[Unit]
+Description=Linux Guardian Auto-Analyze
+After=network.target
+
+[Service]
+Type=forking
+ExecStart=/usr/local/bin/lg --auto-analyze
+PIDFile=/var/run/lg-analyze.pid
+Restart=on-failure
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target
+EOF
+        systemctl daemon-reload 2>/dev/null \
+            && systemctl enable lg-analyze 2>/dev/null \
+            && log_ok "lg-analyze enabled — starts automatically on reboot" \
+            || log_warn "Failed to enable systemd service"
+    else
+        log_info "Auto-start on reboot not enabled"
+        log_info "Run 'sudo lg --auto-analyze' after reboot to start manually"
+    fi
 }
 
 # ══════════════════════════════════════════════════════════════════════════════
