@@ -1740,15 +1740,22 @@ else
         backup_file "$MY_CNF" "mysql"
 
         if [ "$DRY_RUN" = true ]; then
-            log_dry "Set bind-address = 127.0.0.1 in $MY_CNF"
+            log_dry "Set bind-address=127.0.0.1 in $MY_CNF"
         else
             # ── Step 3: Apply change ─────────────────────────────────────────
-            if grep -q "^bind-address" "$MY_CNF" 2>/dev/null; then
-                sed -i 's/^bind-address.*/bind-address = 127.0.0.1/' "$MY_CNF"
+            
+            # Remove any existing bind-address lines to avoid duplicates
+            sed -i '/^bind-address/d' "$MY_CNF"
+            sed -i '/^# Linux Guardian/d' "$MY_CNF"
+
+            # Add bind-address under [mysqld] section, or create section if missing
+            if grep -q '^\[mysqld\]' "$MY_CNF" 2>/dev/null; then
+                sed -i '/^\[mysqld\]/a bind-address=127.0.0.1' "$MY_CNF"
             else
-                printf '\n# Linux Guardian\nbind-address = 127.0.0.1\n' >> "$MY_CNF"
+                printf '\n[mysqld]\n# Linux Guardian\nbind-address=127.0.0.1\n' >> "$MY_CNF"
             fi
-            log_ok "bind-address = 127.0.0.1"
+
+            log_ok "bind-address=127.0.0.1"
 
             # ── Step 4: Restart service ──────────────────────────────────────
             if systemctl restart mariadb 2>/dev/null; then
