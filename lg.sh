@@ -1149,7 +1149,128 @@ _lg_status() {
     # Restore original shell flags
     set -euo pipefail
 }
+# ══════════════════════════════════════════════════════════════════════════════
+# FUNCTION: watch_mode Monitors new sites and isolates them automatically
+# ══════════════════════════════════════════════════════════════════════════════
+watch_mode() {
+    local LOG_FILE="${LOG_FILE:-/var/log/lg-hardening.log}"
+    section "WATCH MODE — Sync open_basedir with hosted sites"
 
+    _W_PHP_MODE=$(detect_php_mode)
+
+    # ── Collect current site paths ────────────────────────────────────────────
+    _CURRENT_SITES=()
+    for d in /home/*/public_html/; do
+        [ -d "$d" ] && _CURRENT_SITES+=("${d%/}")
+    done
+    for d in /var/www/*/; do
+        [ -d "$d" ] && [[ "$d" != "/var/www/html/" ]] && \
+            _CURRENT_SITES+=("${d%/}")
+    done
+
+    log_info "Sites found: ${#_CURRENT_SITES[@]}"
+    for _s in "${_CURRENT_SITES[@]}"; do
+        log_info "  → ${_s}"
+    done
+    echo ""
+
+    # ── Apply noexec/nosuid/nodev to /tmp, /var/tmp, and all site dirs ────────
+    for _noexec_dir in /tmp /var/tmp "${_CURRENT_SITES[@]}"; do
+        [ -d "$_noexec_dir" ] || continue
+        if mount 2>/dev/null | grep -qE " on ${_noexec_dir} .*noexec"; then
+            log_skip "noexec already active: ${_noexec_dir}"
+        else
+            if mount --bind "$_noexec_dir" "$_noexec_dir" 2>/dev/null && \
+               mount -o remount,noexec,nosuid,nodev,bind \
+                   "$_noexec_dir" 2>/dev/null; then
+                log_ok "noexec/nosuid/nodev applied: ${_noexec_dir}"
+                echo "$(date '+%Y-%m-%d %H:%M:%S') [WATCH] noexec: ${_noexec_dir}" \
+                    >> "$LOG_FILE"
+            else
+                log_warn "noexec failed: ${_noexec_dir}"
+            fi
+        fi
+    done
+
+    echo ""
+
+    # ── Sync open_basedir (CGI/mod_php only) ──────────────────────────────────
+    if [[ "$_W_PHP_MODE" != "cgi" && "$_W_PHP_MODE" != "mod_php" ]]; then
+        log_info "PHP mode: ${_W_PHP_MODE} — open_basedir handled via PHP-FPM pools"
+        return 0
+    fi
+
+    # ── Find php.ini files ────────────────────────────────────────────────────
+    _PANEL_INFO=$(detect_panel)
+    _PANEL_NAME="${_PANEL_INFO%%:*}"
+    _W_TMPF=$(mktemp)
+    { find / -maxdepth 7 -type f -name "php.ini" 2>/dev/null || true; } \
+        | grep -v "/cli/" | sort -u > "$_W_TMPF"
+
+    _UPDATED=0
+    while IFS= read -r inifile; do
+        [ -f "$inifile" ] || continue
+        # Skip panel php.ini
+        case "$_PANEL_NAME" in
+            CWP)        [[ "$inifile" == /usr/local/cwp/* ]]    && continue ;;
+            cPanel)     [[ "$inifile" == /usr/local/cpanel/* ]] && continue ;;
+            Plesk)      [[ "$inifile" == /opt/plesk/* ]]        && continue ;;
+            DirectAdmin)[[ "$inifile" == /usr/local/php/* ]]    && continue ;;
+            CyberPanel) [[ "$inifile" == /usr/local/lsws/* ]]   && continue ;;
+            aaPanel)    [[ "$inifile" == /www/server/php/* ]]   && continue ;;
+        esac
+
+        # ── Read current open_basedir ─────────────────────────────────────────
+        _CURRENT_OBD=""
+        grep -qE "^\s*open_basedir\s*=" "$inifile" && \
+            _CURRENT_OBD=$(grep -E "^\s*open_basedir\s*=" \
+                "$inifile" | head -1 | sed 's/.*=\s*//' | tr -d ' ')
+
+        # ── Build new open_basedir ────────────────────────────────────────────
+        _NEW_OBD="/tmp:/usr/share/php:/usr/share/pear"
+        for _site in "${_CURRENT_SITES[@]}"; do
+            [ -d "$_site" ] && _NEW_OBD="${_NEW_OBD}:${_site}"
+        done
+
+        # ── Compare and update ────────────────────────────────────────────────
+        if [ "$_CURRENT_OBD" != "$_NEW_OBD" ]; then
+            TS=$(date '+%Y-%m-%d %H:%M:%S')
+            [ "$(tail -c1 "$inifile" | wc -l)" -eq 0 ] && echo "" >> "$inifile"
+            if grep -qE "^\s*open_basedir\s*=" "$inifile"; then
+                sed -i \
+                    "s|^\s*open_basedir\s*=.*|open_basedir = ${_NEW_OBD}|" \
+                    "$inifile"
+            else
+                echo "open_basedir = ${_NEW_OBD}" >> "$inifile"
+            fi
+            log_ok "open_basedir synced: $(basename "$inifile")"
+            echo "${TS} [WATCH] open_basedir synced: ${inifile}" >> "$LOG_FILE"
+            _UPDATED=$((_UPDATED+1))
+        else
+            log_skip "open_basedir already in sync: $(basename "$inifile")"
+        fi
+    done < "$_W_TMPF"
+    rm -f "$_W_TMPF"
+
+    # ── Restart web server if updated ─────────────────────────────────────────
+    if [ "$_UPDATED" -gt 0 ]; then
+        while IFS= read -r _svc; do
+            systemctl is-active --quiet "$_svc" 2>/dev/null && {
+                systemctl restart "$_svc" 2>/dev/null \
+                    && log_ok "Restarted: ${_svc}" || true
+                break
+            }
+        done < <(systemctl list-units --type=service --state=active \
+                     --no-legend 2>/dev/null \
+                 | awk '{print $1}' \
+                 | grep -E "^(nginx|apache2|httpd|lighttpd|caddy)\.service" \
+                 | sed 's/\.service//' \
+                 || echo "httpd")
+        log_ok "Watch complete — ${_UPDATED} file(s) updated"
+    else
+        log_ok "Watch complete — open_basedir already in sync"
+    fi
+}
 # ══════════════════════════════════════════════════════════════════════════════
 # FUNCTION: _lg_update — Download and install latest version
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1327,6 +1448,11 @@ fi
 print_banner
 
 # ── Second-run detection ──────────────────────────────────────────────────────
+# watch new sites and harden automatically
+if [ "$WATCH_MODE" = true ]; then
+    watch_mode
+    exit 0
+fi
 # If already applied AND not --force, show status dashboard
 if [ -f "$LG_STATE_FILE" ] && \
    [ "$FORCE_MODE" = false ] && \
@@ -3448,311 +3574,6 @@ EOF
 setup_snuffleupagus || log_warn "Part B: Snuffleupagus setup encountered an issue — check log for details"
 
 log_ok "Part B complete"
-
-# ══════════════════════════════════════════════════════════════════════════════
-# PART C — Watch Mode (auto-isolate new sites)
-# Monitors /var/www and /home for new sites and isolates them automatically
-# Usage: sudo lg --watch
-# ══════════════════════════════════════════════════════════════════════════════
-
-watch_mode() {
-    section "WATCH MODE — Auto-isolating new sites"
-
-    # ── Require inotifywait ───────────────────────────────────────────────────
-    if ! command -v inotifywait &>/dev/null; then
-        log_warn "inotifywait not found — attempting install..."
-        if command -v apt-get &>/dev/null; then
-            DEBIAN_FRONTEND=noninteractive apt-get install -y -qq inotify-tools 2>/dev/null
-        elif command -v dnf &>/dev/null; then
-            dnf install -y -q inotify-tools 2>/dev/null
-        elif command -v yum &>/dev/null; then
-            yum install -y -q inotify-tools 2>/dev/null
-        elif command -v apk &>/dev/null; then
-            apk add -q inotify-tools 2>/dev/null
-        elif command -v pacman &>/dev/null; then
-            pacman -S --noconfirm -q inotify-tools 2>/dev/null
-        fi
-
-        if ! command -v inotifywait &>/dev/null; then
-            log_error "Could not install inotify-tools — watch mode unavailable"
-            log_info "Install manually:"
-            log_info "  Debian/Ubuntu : apt install inotify-tools -y"
-            log_info "  CentOS/RHEL   : yum install inotify-tools -y"
-            log_info "  Fedora        : dnf install inotify-tools -y"
-            log_info "  Alpine        : apk add inotify-tools"
-            return 1
-        fi
-        log_ok "inotify-tools installed"
-    fi
-
-    # ── Collect already-isolated sites (skip on next detection) ──────────────
-    KNOWN_SITES=()
-    for d in /var/lib/lg-nspawn/*/; do
-        [ -d "$d" ] && KNOWN_SITES+=("$(basename "$d")")
-    done
-
-    log_ok "Watch mode started — monitoring for new sites"
-    log_info "Watching: /var/www  |  /home"
-    log_info "Log: ${LOG_FILE}"
-    log_info "Press Ctrl+C to stop"
-    echo ""
-
-    # ── Watch loop ────────────────────────────────────────────────────────────
-    # Disable exit-on-error for inotifywait pipe — exits non-zero on Ctrl+C
-    set +e
-    inotifywait \
-        --monitor \
-        --quiet \
-        --event create \
-        --event moved_to \
-        --format '%w%f' \
-        /var/www \
-        /home \
-        2>/dev/null | while IFS= read -r NEW_PATH; do
-    # restore inside pipe subshell is harmless but documents intent
-    set +e
-
-        # Only care about directories
-        [ -d "$NEW_PATH" ] || continue
-
-        # Normalise site name
-        SN=$(echo "$NEW_PATH" \
-            | sed 's|/var/www/||;s|/home/||;s|/public_html||;s|/$||;s|/||g' \
-            | tr -cd '[:alnum:]-_' \
-            | cut -c1-32)
-
-        # Skip if empty name
-        [ -z "$SN" ] && continue
-
-        # Skip known/already-isolated sites
-        ALREADY_KNOWN=false
-        for k in "${KNOWN_SITES[@]:-}"; do
-            [ "$k" = "$SN" ] && ALREADY_KNOWN=true && break
-        done
-        [ "$ALREADY_KNOWN" = true ] && continue
-
-        # Skip system directories
-        case "$SN" in
-            html|cgi-bin|lost+found|tmp|var|etc|bin|usr|lib|lib64|proc|sys|dev)
-                continue ;;
-        esac
-
-        # ── New site detected ─────────────────────────────────────────────────
-        TS=$(date '+%Y-%m-%d %H:%M:%S')
-        echo ""
-        echo -e "  ${GREEN}[${TS}]${NC} New site detected: ${BOLD}${SN}${NC}  (${NEW_PATH})"
-        echo "${TS} [WATCH] New site detected: ${SN} (${NEW_PATH})" >> "$LOG_FILE"
-
-        # Wait briefly for site files to be fully written
-        sleep 2
-
-        # ── Resolve actual site path ──────────────────────────────────────────
-        RESOLVED_PATH=""
-
-        # 1. Use the detected path if it exists
-        if [ -d "$NEW_PATH" ]; then
-            RESOLVED_PATH="$NEW_PATH"
-        fi
-
-        # 2. Try /var/www/<name>
-        if [ -z "$RESOLVED_PATH" ] && [ -d "/var/www/${SN}" ]; then
-            RESOLVED_PATH="/var/www/${SN}"
-            log_info "Resolved to /var/www/${SN}"
-        fi
-
-        # 3. Try /home/<name>/public_html
-        if [ -z "$RESOLVED_PATH" ] && [ -d "/home/${SN}/public_html" ]; then
-            RESOLVED_PATH="/home/${SN}/public_html"
-            log_info "Resolved to /home/${SN}/public_html"
-        fi
-
-        # 4. Search Apache/Nginx configs
-        if [ -z "$RESOLVED_PATH" ]; then
-            for conf in \
-                /etc/apache2/sites-enabled/*.conf \
-                /etc/httpd/conf.d/*.conf \
-                /etc/nginx/sites-enabled/* \
-                /etc/nginx/conf.d/*.conf; do
-                [ -f "$conf" ] || continue
-                docroot=$(grep -hEi '^\s*(DocumentRoot|root)\s+"?([^";\s]+)"?' "$conf" \
-                    2>/dev/null | awk '{print $NF}' | tr -d '"' \
-                    | grep -i "$SN" | head -1)
-                if [ -d "$docroot" ]; then
-                    RESOLVED_PATH="$docroot"
-                    log_info "Resolved from config ${conf}: ${RESOLVED_PATH}"
-                    break
-                fi
-            done
-        fi
-
-        if [ -z "$RESOLVED_PATH" ]; then
-            echo -e "  ${YELLOW}[WARN]${NC}    Cannot resolve site path for '${SN}'"
-            log_info "  Tried: /var/www/${SN}"
-            log_info "  Tried: /home/${SN}/public_html"
-            log_info "  Tried: Apache/Nginx configs"
-            echo "${TS} [WATCH] Cannot resolve path for ${SN} — skipped" >> "$LOG_FILE"
-            continue
-        fi
-
-        log_info "Site path resolved: ${RESOLVED_PATH}"
-        NEW_PATH="$RESOLVED_PATH"
-
-        # ── noexec on the new site directory ─────────────────────────────────
-        # Uses the same _apply_noexec_dir function from LAYER 6
-        if mount 2>/dev/null | grep -qE " on ${NEW_PATH} .*noexec"; then
-            echo -e "  ${GREEN}[OK]${NC}      ${NEW_PATH}  →  already noexec"
-            echo "${TS} [WATCH] ${NEW_PATH} already noexec" >> "$LOG_FILE"
-        else
-            # Try bind-mount on itself with noexec
-            if mount --bind "$NEW_PATH" "$NEW_PATH" 2>/dev/null && \
-               mount -o remount,noexec,nosuid,nodev,bind "$NEW_PATH" 2>/dev/null; then
-                echo -e "  ${GREEN}[OK]${NC}      ${NEW_PATH}  →  noexec applied"
-                echo "${TS} [WATCH] ${NEW_PATH} noexec applied" >> "$LOG_FILE"
-            else
-                echo -e "  ${YELLOW}[WARN]${NC}    ${NEW_PATH}  →  noexec failed (check mount permissions)"
-                echo "${TS} [WATCH] ${NEW_PATH} noexec failed" >> "$LOG_FILE"
-            fi
-        fi
-
-        # ── Apply open_basedir for new site ──────────────────────────────────
-        # FPM: handled via pool.conf below
-        # CGI/mod_php: must be set in php.ini
-        _W_PHP_MODE=$(detect_php_mode)
-        NEW_BASEDIR="${NEW_PATH}:/tmp:/usr/share/php:/usr/share/pear"
-        UPDATED_INI=0
-
-        if [[ "$_W_PHP_MODE" == "cgi" || "$_W_PHP_MODE" == "mod_php" ]]; then
-            while IFS= read -r inifile; do
-                [ -f "$inifile" ] || continue
-                [[ "$inifile" == *cli* ]] && continue
-                if grep -qE "^\s*open_basedir\s*=" "$inifile"; then
-                    CURRENT=$(grep -E "^\s*open_basedir\s*=" "$inifile" | head -1)
-                    if ! echo "$CURRENT" | grep -q "$NEW_PATH"; then
-                        sed -i "s|^\s*open_basedir\s*=.*|&:${NEW_PATH}|" "$inifile"
-                        echo "${TS} [WATCH] open_basedir updated for ${SN} in ${inifile}" >> "$LOG_FILE"
-                        UPDATED_INI=$((UPDATED_INI + 1))
-                    fi
-                else
-                    echo "open_basedir = ${NEW_BASEDIR}" >> "$inifile"
-                    echo "${TS} [WATCH] open_basedir added for ${SN} in ${inifile}" >> "$LOG_FILE"
-                    UPDATED_INI=$((UPDATED_INI + 1))
-                fi
-            done < <({ find / -maxdepth 7 -type f -name "php.ini" 2>/dev/null || true; } | sort -u)
-        else
-            log_info "[WATCH] FPM mode — open_basedir handled via pool.conf"
-        fi
-
-        # ── Create PHP-FPM pool for new site ──────────────────────────────────
-        # Use shared find_pool_dir helper
-        W_POOL_DIR=$(find_pool_dir)
-
-        POOL_CREATED=0
-        if [ -n "$W_POOL_DIR" ]; then
-            W_SITE_USER=$(stat -c '%U' "$NEW_PATH" 2>/dev/null || echo "www-data")
-            id "$W_SITE_USER" &>/dev/null || W_SITE_USER="www-data"
-            W_SITE_GROUP=$(id -gn "$W_SITE_USER" 2>/dev/null || echo "www-data")
-            W_SOCK_OWNER=$(detect_webserver_user)
-
-            W_POOL_CONF="${W_POOL_DIR}/${SN}.conf"
-            W_SESSION_PATH="/var/lib/php/sessions/${SN}"
-            W_OPEN_BASEDIR="${NEW_PATH}:/tmp:/usr/share/php:/usr/share/pear"
-
-            mkdir -p "$W_SESSION_PATH" 2>/dev/null
-            chown "${W_SITE_USER}:${W_SITE_GROUP}" "$W_SESSION_PATH" 2>/dev/null
-            chmod 700 "$W_SESSION_PATH" 2>/dev/null
-
-            cat > "$W_POOL_CONF" << POOLEOF
-            ; Linux Guardian — PHP-FPM Pool: ${SN}
-            ; Generated: ${TS}
-            ; Global settings inherited from php.ini
-            ; Per-site: open_basedir + session + logging
-
-            [${SN}]
-            user  = ${W_SITE_USER}
-            group = ${W_SITE_GROUP}
-
-            listen       = /run/php-fpm/${SN}.sock
-            listen.owner = ${W_SOCK_OWNER}
-            listen.group = ${W_SOCK_OWNER}
-            listen.mode  = 0660
-
-            pm                   = dynamic
-            pm.max_children      = 10
-            pm.start_servers     = 2
-            pm.min_spare_servers = 1
-            pm.max_spare_servers = 3
-            pm.max_requests      = 500
-
-            ; Per-site: open_basedir only
-            php_admin_value[open_basedir]   = ${W_OPEN_BASEDIR}
-
-            ; Per-site: session isolation
-            php_value[session.save_handler] = files
-            php_value[session.save_path]    = ${W_SESSION_PATH}
-
-            ; Per-site: logging
-            php_admin_value[error_log]      = /var/log/php-fpm/${SN}-error.log
-            access.log                      = /var/log/php-fpm/${SN}-access.log
-            slowlog                         = /var/log/php-fpm/${SN}-slow.log
-            request_slowlog_timeout         = 5s
-POOLEOF
-            chmod 640 "$W_POOL_CONF"
-
-            # Restart php-fpm using shared helper
-            _W_MODE=$(detect_php_mode)
-            if restart_php_services "$_W_MODE" 2>/dev/null; then
-                echo -e "  ${GREEN}[OK]${NC}      PHP-FPM pool created + service restarted"
-                echo "${TS} [WATCH] PHP-FPM pool created: ${W_POOL_CONF}" >> "$LOG_FILE"
-                POOL_CREATED=1
-            fi
-            [ "$POOL_CREATED" -eq 0 ] && {
-                echo -e "  ${GREEN}[OK]${NC}      PHP-FPM pool created: ${W_POOL_CONF}"
-                echo -e "  ${YELLOW}[WARN]${NC}    php-fpm service not running — restart manually"
-                echo "${TS} [WATCH] PHP-FPM pool created (fpm not running): ${W_POOL_CONF}" >> "$LOG_FILE"
-            }
-        fi
-
-        if [ "$UPDATED_INI" -gt 0 ]; then
-            echo -e "  ${GREEN}[OK]${NC}      open_basedir updated in ${UPDATED_INI} php.ini file(s)"
-            echo "${TS} [WATCH] open_basedir updated in ${UPDATED_INI} php.ini(s) for ${SN}" >> "$LOG_FILE"
-            # Auto-detect and restart active web server
-            while IFS= read -r _svc; do
-                systemctl is-active --quiet "$_svc" 2>/dev/null && {
-                    systemctl restart "$_svc" 2>/dev/null \
-                        && echo -e "  ${GREEN}[OK]${NC}      Restarted: ${_svc}" \
-                        || true
-                    break
-                }
-            done < <(systemctl list-units --type=service --state=active \
-                         --no-legend 2>/dev/null \
-                     | awk '{print $1}' \
-                     | grep -E "^(nginx|apache2|httpd|lighttpd|caddy)" \
-                     || echo "httpd")
-        fi
-
-        # ── Summary for this site ─────────────────────────────────────────────
-        echo ""
-        echo -e "  ${BOLD}${SN} hardening summary:${NC}"
-        mount 2>/dev/null | grep -qE " on ${NEW_PATH} .*noexec" \
-            && echo -e "    [6] noexec            →  active" \
-            || echo -e "    [6] noexec            →  failed"
-        echo -e "    [5] open_basedir      →  updated in ${UPDATED_INI} php.ini file(s)"
-        [ "$POOL_CREATED" -eq 1 ] \
-            && echo -e "    [5] PHP-FPM pool      →  created (${W_POOL_DIR}/${SN}.conf)" \
-            || echo -e "    [5] PHP-FPM pool      →  $([ -n "$W_POOL_DIR" ] && echo 'created (fpm not running)' || echo 'skipped (fpm not installed)')"
-        echo "${TS} [WATCH] ${SN} complete: noexec + open_basedir + PHP-FPM pool" >> "$LOG_FILE"
-
-        # Add to known sites so we don't process it again
-        KNOWN_SITES+=("$SN")
-        echo ""
-    done
-}
-
-# ── Entry point for --watch ───────────────────────────────────────────────────
-if [ "$WATCH_MODE" = true ]; then
-    watch_mode
-    exit 0
-fi
 
 # ── Entry point for --cron ────────────────────────────────────────────────────
 # In cron mode: also check for new users added since last run
