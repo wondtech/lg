@@ -909,7 +909,7 @@ After=network.target
 
 [Service]
 Type=simple
-ExecStart=/bin/bash /usr/local/bin/lg --auto-analyze
+ExecStart=/bin/bash -c "/usr/local/bin/lg --watch && /usr/local/bin/lg --auto-analyze"
 RemainAfterExit=yes
 
 [Install]
