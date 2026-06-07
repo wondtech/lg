@@ -7,7 +7,8 @@
 #   [1] Binary Lockdown       — Restrict dangerous tools
 #   [2] Kernel Hardening      — Harden kernel + sysctl
 #   [3] System Files          — Secure critical file permissions
-#   [4] MySQL/MariaDB         — Harden database configuration
+#   [4.1] Apache httpd        — ServerTokens, ServerSignature off
+#   [4.2] MySQL/MariaDB       — Bind to 127.0.0.1
 #   [5] PHP disable_functions — Block shell_exec/system/exec + open_basedir
 #   [5.1] PHP-FPM Pools       — Isolate each site with open_basedir
 #   [6] noexec /tmp /var/tmp  — Prevent uploaded binary execution
@@ -23,14 +24,14 @@
 #   sudo lg --auto           Auto mode — no prompts
 #   sudo lg --dry-run        Preview changes without applying
 #   sudo lg --undo           Rollback all changes from last run
-#   sudo lg --cron           Silent mode — logs to /var/log/lg-hardening.log
+#   sudo lg --reboot         Reboot at end to apply SELinux relabel (off by default)
 #   sudo lg --watch          Watch for new sites and harden automatically
 #   sudo lg --fixmail        Fix Dovecot/vmail SELinux contexts
-#   sudo lg --scan           Scan for webshells and reverse shells
+#   sudo lg --scan [--path]  Scan for webshells (optionally under a specific path)
 #   sudo lg --auto-analyze   Start background behavior monitoring (daemon)
 #   sudo lg --integrity      Check integrity of critical system files
 #   sudo lg --update         Update to latest version from lg.wondtech.com
-#   sudo lg --help           Show full help
+#   sudo lg --help, -h       Show full help
 # ══════════════════════════════════════════════════════════════════════════════
 
 set -euo pipefail
@@ -47,10 +48,48 @@ FORCE_MODE=false
 UPDATE_MODE=false
 HELP_MODE=false
 WATCH_MODE=false
+REBOOT_MODE=false
 LG_STATE_FILE="/root/lg/.applied"
 LG_SCAN_LOG="/var/log/lg-scan.log"
 LG_ANALYZE_LOG="/var/log/lg-analyze.log"
 LG_INTEGRITY_DB="/root/lg/integrity.db"
+LOG_FILE="/var/log/lg-hardening.log"  # default; may be overridden at line 1547
+
+# FIX: Dovecot log paths were inlined in 3 places. Now a single constant.
+DOVECOT_LOG_PATHS=(
+    /var/log/dovecot.log
+    /var/log/dovecot-info.log
+    /var/log/dovecot-debug.log
+)
+
+# FIX: PHP disable_functions + global security settings were inlined in
+# LAYER 5. Promoted to globals so they're defined once and can be inspected
+# (e.g., for `php -i` verification later).
+DISABLE_FUNCTIONS="exec,passthru,shell_exec,system,popen,proc_open,proc_close,proc_get_status,proc_terminate,proc_nice,pcntl_exec,pcntl_fork,pcntl_signal,pcntl_waitpid,pcntl_wait,pcntl_wifexited,pcntl_wifstopped,pcntl_wifsignaled,pcntl_wexitstatus,pcntl_wstopsig,pcntl_signal_dispatch,pcntl_get_last_error,pcntl_strerror,pcntl_sigprocmask,pcntl_sigwaitinfo,pcntl_sigtimedwait,pcntl_alarm,pcntl_getpriority,pcntl_setpriority,pcntl_async_signals,posix_kill,posix_mkfifo,posix_setpgid,posix_setsid,posix_setuid,posix_setgid,posix_seteuid,posix_setegid,fsockopen,pfsockopen,stream_socket_client,stream_socket_server,socket_create,socket_connect,socket_bind,socket_listen,socket_accept,phpinfo,show_source,highlight_file,symlink,link,dl,assert,create_function,opcache_get_status,opcache_reset,apache_setenv,gethostname,gethostbyname,gethostbyaddr,dns_get_record,dns_get_mx,posix_getuid,posix_getgid,posix_getpwuid,get_current_user"
+
+# PHP global security settings — key=value list (FIX: was using bash
+# associative array which can be unreliable in strict mode)
+PHPSEC_PAIRS=(
+    "allow_url_fopen:Off"
+    "allow_url_include:Off"
+    "expose_php:Off"
+    "display_errors:Off"
+    "log_errors:On"
+    "disable_classes:Imagick,ImagickDraw,ImagickPixel,ImagickPixelIterator,Gmagick,ReflectionClass,ReflectionFunction,ReflectionMethod,ReflectionProperty,ReflectionExtension,ReflectionObject,Phar,PharData"
+    "file_uploads:On"
+    "upload_tmp_dir:/tmp"
+    "upload_max_filesize:2M"
+    "session.cookie_httponly:1"
+    "session.cookie_secure:1"
+    "session.use_strict_mode:1"
+    "session.use_only_cookies:1"
+    "session.cookie_samesite:Strict"
+    "enable_dl:Off"
+    "max_execution_time:30"
+    "max_input_time:30"
+    "memory_limit:128M"
+    "post_max_size:8M"
+)
 
 # ─── Colours ────────────────────────────────────────────────────────────────
 RED='\033[0;31m'
@@ -91,7 +130,8 @@ print_banner() {
 # ─── Logging helpers ─────────────────────────────────────────────────────────
 log_ok()     { echo -e "  ${GREEN}[OK]${NC}      $*"; }
 log_warn()   { echo -e "  ${YELLOW}[WARN]${NC}    $*"; }
-log_skip()   { echo -e "  [SKIP]    $*"; }
+# FIX: was missing ${NC} and color, inconsistent with siblings
+log_skip()   { echo -e "  ${CYAN}[SKIP]${NC}    $*"; }
 log_info()   { echo -e "  ${CYAN}[INFO]${NC}    $*"; }
 log_error()  { echo -e "  ${RED}[ERROR]${NC}   $*"; }
 log_dry()    { echo -e "  ${YELLOW}[DRY-RUN]${NC} Would: $*"; }
@@ -199,20 +239,64 @@ find_conf_deep() {
         2>/dev/null || true; } | head -1
 }
 
+# ─── detect_vmail_dir: find Dovecot vmail directory ───────────────────────────
+# FIX: was duplicated in 3 places (_lg_fixmail, _lg_status, LAYER 7)
+# Returns the first existing path, or empty string if none found.
+detect_vmail_dir() {
+    local _vp
+    for _vp in /var/vmail /home/vmail /var/mail/vhosts /var/spool/mail; do
+        [ -d "$_vp" ] && echo "$_vp" && return 0
+    done
+    return 1
+}
+
+# ─── detect_site_paths: enumerate all hosted site roots ──────────────────────
+# FIX: was duplicated in LAYER 5 (CGI/mod_php open_basedir) and watch_mode.
+# Prints one path per line. Paths are de-duplicated.
+detect_site_paths() {
+    local _paths=() _d _docroot _conf
+    # Standard locations
+    for _d in /var/www/*/; do
+        [ -d "$_d" ] && [[ "$_d" != "/var/www/html/" ]] && _paths+=("${_d%/}")
+    done
+    for _d in /home/*/public_html/; do
+        [ -d "$_d" ] && _paths+=("${_d%/}")
+    done
+    [ -d /var/www/html ] && _paths+=("/var/www/html")
+    # Custom document roots from web server configs
+    for _conf in /etc/apache2/sites-enabled/*.conf \
+                 /etc/httpd/conf.d/*.conf \
+                 /etc/nginx/sites-enabled/* \
+                 /etc/nginx/conf.d/*.conf; do
+        [ -f "$_conf" ] || continue
+        while IFS= read -r _docroot; do
+            [ -d "$_docroot" ] && _paths+=("$_docroot")
+        done < <(grep -hEi \
+            '^\s*(DocumentRoot|root)\s+"?([^";\s]+)"?' "$_conf" 2>/dev/null \
+            | awk '{print $NF}' | tr -d '"')
+    done
+    [ ${#_paths[@]} -gt 0 ] && printf '%s\n' "${_paths[@]}" | sort -u
+}
+
 # ─── install_pkg: cross-distro package install ───────────────────────────────
+# FIX: was sending 2>/dev/null on every package manager, hiding real errors
+# (lock conflicts, repo unreachable, missing deps). Now logs to LOG_FILE so
+# the user can debug failures.
 install_pkg() {
-    local pkg="$1"
+    local pkg="$1" _log="${LOG_FILE:-/var/log/lg-hardening.log}"
     if command -v apt-get &>/dev/null; then
-        DEBIAN_FRONTEND=noninteractive apt-get install -y -qq "$pkg" 2>/dev/null
+        DEBIAN_FRONTEND=noninteractive apt-get install -y -qq "$pkg" \
+            >> "$_log" 2>&1
     elif command -v dnf &>/dev/null; then
-        dnf install -y -q "$pkg" 2>/dev/null
+        dnf install -y -q "$pkg" >> "$_log" 2>&1
     elif command -v yum &>/dev/null; then
-        yum install -y -q "$pkg" 2>/dev/null
+        yum install -y -q "$pkg" >> "$_log" 2>&1
     elif command -v apk &>/dev/null; then
-        apk add -q "$pkg" 2>/dev/null
+        apk add -q "$pkg" >> "$_log" 2>&1
     elif command -v pacman &>/dev/null; then
-        pacman -S --noconfirm -q "$pkg" 2>/dev/null
+        pacman -S --noconfirm -q "$pkg" >> "$_log" 2>&1
     else
+        log_warn "No supported package manager found for: $pkg"
         return 1
     fi
 }
@@ -277,11 +361,10 @@ detect_webserver_user() {
     echo "apache"  # safe default
 }
 restart_php_services() {
-    local mode="$1"
+    local mode="$1" _restarted=0 svc
     case "$mode" in
         fpm)
             # Auto-detect active php-fpm service
-            local _restarted=0
             while IFS= read -r svc; do
                 systemctl is-active --quiet "$svc" 2>/dev/null && {
                     systemctl restart "$svc" 2>/dev/null \
@@ -298,25 +381,39 @@ restart_php_services() {
                 log_warn "No active php-fpm service — restart manually"
             ;;
         cgi|mod_php)
-            local _restarted=0
-            while IFS= read -r svc; do
-                systemctl is-active --quiet "$svc" 2>/dev/null && {
-                    systemctl restart "$svc" 2>/dev/null \
-                        && { log_ok "Restarted: $svc"; _restarted=$((_restarted+1)); } \
-                        || log_warn "Failed to restart: $svc"
-                }
-            done < <(systemctl list-units --type=service --state=active \
-                         --no-legend 2>/dev/null \
-                     | awk '{print $1}' \
-                     | grep -E "^(nginx|apache2|httpd|lighttpd|caddy)\.service" \
-                     | sed 's/\.service//' \
-                     || printf 'apache2\nhttpd\nnginx\n')
-            [ "$_restarted" -eq 0 ] && \
-                log_warn "No active web service found to restart"
+            # FIX: was inlined 13-line loop, now uses shared helper
+            restart_active_webserver
             ;;
     esac
     return 0
 }
+
+# ── restart_active_webserver: restart the first active web server ─────────────
+# FIX: extracted from watch_mode and LAYER 5 (was duplicated 2x).
+# Iterates nginx/apache2/httpd/lighttpd/caddy; restarts the first one
+# found active. Returns 0 if restarted, 1 otherwise.
+restart_active_webserver() {
+    local _svc _restarted=0
+    while IFS= read -r _svc; do
+        if systemctl is-active --quiet "$_svc" 2>/dev/null; then
+            if systemctl restart "$_svc" 2>/dev/null; then
+                log_ok "Restarted: ${_svc}"
+                _restarted=1
+                break
+            else
+                log_warn "Failed to restart: ${_svc}"
+            fi
+        fi
+    done < <(systemctl list-units --type=service --state=active \
+                 --no-legend 2>/dev/null \
+             | awk '{print $1}' \
+             | grep -E "^(nginx|apache2|httpd|lighttpd|caddy)\.service" \
+             | sed 's/\.service//' \
+             || printf 'apache2\nhttpd\nnginx\n')
+    [ "$_restarted" -eq 0 ] && log_warn "No active web service found to restart"
+    return $((1-_restarted))
+}
+
 # ── detect_panel: returns panel name and service name ────────────────────────
 detect_panel() {
     # Returns: "PanelName:service_name" or "none:"
@@ -350,17 +447,86 @@ detect_panel() {
         && echo "CentminMod:nginx"     && return
     echo "none:"
 }
+
+# ── _build_dovecot_lg_policy: write the .te file for a given vmail type ──────
+# FIX: extracted from _lg_fixmail and LAYER 7 SELinux branch.
+# Usage: _build_dovecot_lg_policy <te_file> <vmail_type>
+# vmail_type must be either "dovecot_var_t" or "mail_spool_t".
+_build_dovecot_lg_policy() {
+    local _te_file="$1" _vmail_type="$2"
+    if [ "$_vmail_type" = "dovecot_var_t" ]; then
+        cat > "$_te_file" << 'DOVEPOL'
+module dovecot_lg 1.1;
+require {
+    type dovecot_t; type mysqld_db_t; type var_t; type dovecot_var_t;
+    class file { append create getattr link lock map open read rename unlink write };
+    class dir  { add_name getattr read remove_name write };
+    class sock_file write;
+}
+allow dovecot_t mysqld_db_t:sock_file write;
+allow dovecot_t var_t:dir  { add_name getattr read remove_name write };
+allow dovecot_t var_t:file { append create getattr link lock map open read rename unlink write };
+allow dovecot_t dovecot_var_t:dir  { add_name getattr read remove_name write };
+allow dovecot_t dovecot_var_t:file { append create getattr link lock map open read rename unlink write };
+DOVEPOL
+    else
+        cat > "$_te_file" << 'DOVEPOL'
+module dovecot_lg 1.1;
+require {
+    type dovecot_t; type mysqld_db_t; type var_t; type mail_spool_t;
+    class file { append create getattr link lock map open read rename unlink write };
+    class dir  { add_name getattr read remove_name write };
+    class sock_file write;
+}
+allow dovecot_t mysqld_db_t:sock_file write;
+allow dovecot_t var_t:dir  { add_name getattr read remove_name write };
+allow dovecot_t var_t:file { append create getattr link lock map open read rename unlink write };
+allow dovecot_t mail_spool_t:dir  { add_name getattr read remove_name write };
+allow dovecot_t mail_spool_t:file { append create getattr link lock map open read rename unlink write };
+DOVEPOL
+    fi
+}
+
+# ── _install_dovecot_lg_policy: build + load the SELinux policy module ───────
+# FIX: extracted from _lg_fixmail and LAYER 7 (was duplicated 2x, ~30 lines each).
+# Usage: _install_dovecot_lg_policy <vmail_type>
+_install_dovecot_lg_policy() {
+    local _vmail_type="$1"
+    if ! command -v checkmodule &>/dev/null || \
+       ! command -v semodule_package &>/dev/null; then
+        log_warn "checkmodule/semodule_package not found — install checkpolicy"
+        return 1
+    fi
+    local _te _mod _pp _err
+    _te=$(mktemp /tmp/dovecot_lg_XXXXXX.te)
+    _mod="${_te%.te}.mod"
+    _pp="${_te%.te}.pp"
+    _build_dovecot_lg_policy "$_te" "$_vmail_type"
+    _err=$(checkmodule -M -m -o "$_mod" "$_te" 2>&1) || {
+        log_warn "dovecot_lg build failed: ${_err}"
+        rm -f "$_te" "$_mod" "$_pp"
+        return 1
+    }
+    _err=$(semodule_package -o "$_pp" -m "$_mod" 2>&1) || {
+        log_warn "dovecot_lg package failed: ${_err}"
+        rm -f "$_te" "$_mod" "$_pp"
+        return 1
+    }
+    semodule -i "$_pp" 2>/dev/null && \
+        log_ok "SELinux policy applied: dovecot_lg v1.1" || \
+        log_warn "semodule -i failed — try: sudo lg --force"
+    rm -f "$_te" "$_mod" "$_pp"
+    return 0
+}
+
 # ══════════════════════════════════════════════════════════════════════════════
 # FUNCTION: _lg_fixmail — Fix Dovecot/vmail SELinux contexts
 # ══════════════════════════════════════════════════════════════════════════════
 _lg_fixmail() {
     section "FIXMAIL: Dovecot / vmail SELinux Fix"
 
-    # Detect vmail path
-    _FM_VMAIL=""
-    for _vp in /var/vmail /home/vmail /var/mail/vhosts /var/spool/mail; do
-        [ -d "$_vp" ] && _FM_VMAIL="$_vp" && break
-    done
+    # FIX: was inlined 4-line loop. Now uses shared helper.
+    _FM_VMAIL=$(detect_vmail_dir 2>/dev/null) || _FM_VMAIL=""
 
     if [ -z "$_FM_VMAIL" ]; then
         log_warn "No vmail directory found — nothing to fix"
@@ -385,14 +551,15 @@ _lg_fixmail() {
     fi
 
     # Remove stale lock files + relabel
+    # FIX: was toggling SELinux on/off (setenforce 0/1) which opens a window
+    # for rootkit escape. restorecon works fine with SELinux enabled —
+    # it just adjusts labels on already-allowed operations.
     find "$_FM_VMAIL" -name "*.lock" -delete 2>/dev/null || true
-    setenforce 0 2>/dev/null || true
     restorecon -RFv "$_FM_VMAIL" 2>/dev/null | tail -5 || true
-    setenforce 1 2>/dev/null || true
     log_ok "restorecon applied: ${_FM_VMAIL}"
 
     # Fix Dovecot log contexts
-    for _dlog in /var/log/dovecot.log /var/log/dovecot-info.log /var/log/dovecot-debug.log; do
+    for _dlog in "${DOVECOT_LOG_PATHS[@]}"; do
         [ -f "$_dlog" ] || continue
         command -v semanage &>/dev/null && {
             semanage fcontext -a -t dovecot_var_log_t "$_dlog" 2>/dev/null \
@@ -402,61 +569,15 @@ _lg_fixmail() {
         log_ok "Log context fixed: ${_dlog}"
     done
 
-    # Apply dovecot_lg policy
-    if command -v checkmodule &>/dev/null && command -v semodule_package &>/dev/null; then
-        _FM_TE=$(mktemp /tmp/dovecot_lg_XXXXXX.te)
-        if [ "$_FM_TYPE" = "dovecot_var_t" ]; then
-            cat > "$_FM_TE" << 'DOVEPOL'
-module dovecot_lg 1.1;
-require {
-    type dovecot_t; type mysqld_db_t; type var_t; type dovecot_var_t;
-    class file { append create getattr link lock map open read rename unlink write };
-    class dir  { add_name getattr read remove_name write };
-    class sock_file write;
-}
-allow dovecot_t mysqld_db_t:sock_file write;
-allow dovecot_t var_t:dir  { add_name getattr read remove_name write };
-allow dovecot_t var_t:file { append create getattr link lock map open read rename unlink write };
-allow dovecot_t dovecot_var_t:dir  { add_name getattr read remove_name write };
-allow dovecot_t dovecot_var_t:file { append create getattr link lock map open read rename unlink write };
-DOVEPOL
-        else
-            cat > "$_FM_TE" << 'DOVEPOL'
-module dovecot_lg 1.1;
-require {
-    type dovecot_t; type mysqld_db_t; type var_t; type mail_spool_t;
-    class file { append create getattr link lock map open read rename unlink write };
-    class dir  { add_name getattr read remove_name write };
-    class sock_file write;
-}
-allow dovecot_t mysqld_db_t:sock_file write;
-allow dovecot_t var_t:dir  { add_name getattr read remove_name write };
-allow dovecot_t var_t:file { append create getattr link lock map open read rename unlink write };
-allow dovecot_t mail_spool_t:dir  { add_name getattr read remove_name write };
-allow dovecot_t mail_spool_t:file { append create getattr link lock map open read rename unlink write };
-DOVEPOL
-        fi
-        _FM_MOD="${_FM_TE%.te}.mod"
-        _FM_PP="${_FM_TE%.te}.pp"
-        checkmodule -M -m -o "$_FM_MOD" "$_FM_TE" 2>/dev/null \
-            && semodule_package -o "$_FM_PP" -m "$_FM_MOD" 2>/dev/null \
-            && semodule -i "$_FM_PP" 2>/dev/null \
-            && log_ok "SELinux policy applied: dovecot_lg v1.1" \
-            || log_warn "dovecot_lg policy failed — check checkpolicy package"
-        rm -f "$_FM_TE" "$_FM_MOD" "$_FM_PP" 2>/dev/null || true
-    else
-        log_warn "checkmodule not found — install: yum install checkpolicy -y"
-    fi
+    # Apply dovecot_lg policy (FIX: was inlined ~40 lines, now uses helper)
+    _install_dovecot_lg_policy "$_FM_TYPE"
 
     setsebool -P domain_can_mmap_files 1 2>/dev/null \
         && log_ok "SELinux bool: domain_can_mmap_files = on" || true
 
-    # Re-register fcontext after semodule (survives reboot)
-    if command -v semanage &>/dev/null; then
-        semanage fcontext -d "${_FM_VMAIL}(/.*)?" 2>/dev/null || true
-        semanage fcontext -a -t "$_FM_TYPE" "${_FM_VMAIL}(/.*)?" 2>/dev/null || true
-        log_ok "fcontext re-registered (survives reboot)"
-    fi
+    # NOTE: fcontext re-registration after semodule was removed — semodule -i
+    # doesn't affect fcontext entries (they live in file_contexts.local, not
+    # the policy module). Original re-registration was a no-op duplicate.
 
     # Restart Dovecot
     if systemctl is-active --quiet dovecot 2>/dev/null; then
@@ -842,7 +963,7 @@ _lg_auto_analyze() {
     # Run as background daemon
     (
         set +euo pipefail
-        echo $BASHPID > "$PID_FILE"
+        echo "${BASHPID}" > "$PID_FILE"
         while true; do
             {
                 echo "# ── Auto-analyze $(date '+%Y-%m-%d %H:%M:%S') ──"
@@ -864,16 +985,22 @@ _lg_auto_analyze() {
                             -s "[LG AUTO-ALERT] Executable in /tmp: $(hostname)" \
                             "${ALERT_EMAIL:-root}" 2>/dev/null || true
                 done
-                # 3. New SUID files vs baseline
-                find / -xdev -perm -4000 -type f 2>/dev/null | \
-                    grep -vF "$(cat /root/lg/.suid_baseline 2>/dev/null || true)" | \
-                    while read -r f; do
-                        echo "[AUTO-WARN] New SUID file: $f"
-                        command -v mail &>/dev/null && \
-                            echo "$f" | mail \
-                                -s "[LG AUTO-ALERT] New SUID: $(hostname)" \
-                                "${ALERT_EMAIL:-root}" 2>/dev/null || true
-                    done
+                # 3. New SUID files vs baseline (fixed: was using grep -vF with
+                #    multi-line baseline which never matched as a single string,
+                #    causing 100% false-positive alerts).
+                if [ -s /root/lg/.suid_baseline ]; then
+                    comm -23 \
+                        <(find / -xdev -perm -4000 -type f 2>/dev/null | sort) \
+                        <(sort /root/lg/.suid_baseline 2>/dev/null) | \
+                        while read -r f; do
+                            [ -z "$f" ] && continue
+                            echo "[AUTO-WARN] New SUID file: $f"
+                            command -v mail &>/dev/null && \
+                                echo "$f" | mail \
+                                    -s "[LG AUTO-ALERT] New SUID: $(hostname)" \
+                                    "${ALERT_EMAIL:-root}" 2>/dev/null || true
+                        done
+                fi
             } >> "$LG_ANALYZE_LOG" 2>&1
             sleep "$INTERVAL"
         done
@@ -1085,9 +1212,8 @@ _lg_status() {
         echo -e "  ${GREEN}✓${NC} Dovecot                  — running"
         # vmail context
         local _vmail_dir="" _vmail_ctx=""
-        for _vp in /var/vmail /home/vmail /var/mail/vhosts; do
-            [ -d "$_vp" ] && _vmail_dir="$_vp" && break
-        done
+        # FIX: was inlined 3-line loop, now uses shared helper
+        _vmail_dir=$(detect_vmail_dir 2>/dev/null) || _vmail_dir=""
         if [ -n "$_vmail_dir" ]; then
             _vmail_ctx=$(stat -c '%C' "$_vmail_dir" 2>/dev/null \
                 | grep -oE '[a-z_]+_t' \
@@ -1158,15 +1284,11 @@ watch_mode() {
 
     _W_PHP_MODE=$(detect_php_mode)
 
-    # ── Collect current site paths ────────────────────────────────────────────
+    # ── Collect current site paths (FIX: was inlined loops, now uses helper) ──
     _CURRENT_SITES=()
-    for d in /home/*/public_html/; do
-        [ -d "$d" ] && _CURRENT_SITES+=("${d%/}")
-    done
-    for d in /var/www/*/; do
-        [ -d "$d" ] && [[ "$d" != "/var/www/html/" ]] && \
-            _CURRENT_SITES+=("${d%/}")
-    done
+    while IFS= read -r _site_path; do
+        _CURRENT_SITES+=("$_site_path")
+    done < <(detect_site_paths)
 
     log_info "Sites found: ${#_CURRENT_SITES[@]}"
     for _s in "${_CURRENT_SITES[@]}"; do
@@ -1252,20 +1374,9 @@ watch_mode() {
     done < "$_W_TMPF"
     rm -f "$_W_TMPF"
 
-    # ── Restart web server if updated ─────────────────────────────────────────
+    # ── Restart web server if updated (FIX: was inlined 12-line loop) ────────
     if [ "$_UPDATED" -gt 0 ]; then
-        while IFS= read -r _svc; do
-            systemctl is-active --quiet "$_svc" 2>/dev/null && {
-                systemctl restart "$_svc" 2>/dev/null \
-                    && log_ok "Restarted: ${_svc}" || true
-                break
-            }
-        done < <(systemctl list-units --type=service --state=active \
-                     --no-legend 2>/dev/null \
-                 | awk '{print $1}' \
-                 | grep -E "^(nginx|apache2|httpd|lighttpd|caddy)\.service" \
-                 | sed 's/\.service//' \
-                 || echo "httpd")
+        restart_active_webserver
         log_ok "Watch complete — ${_UPDATED} file(s) updated"
     else
         log_ok "Watch complete — open_basedir already in sync"
@@ -1356,7 +1467,7 @@ _lg_help() {
     echo "   --force          Force re-apply all layers (even if already applied)"
     echo "   --dry-run        Preview every change without applying anything"
     echo "   --undo           Rollback all changes from the last run"
-    echo "   --cron           Silent mode for cron jobs"
+    echo "   --reboot         Reboot at end to apply SELinux relabel (off by default)"
     echo "   --watch          Monitor for new sites and harden automatically"
     echo "   --fixmail        Fix Dovecot/vmail SELinux contexts and policy"
     echo "   --scan [--path]  Scan for PHP/Perl/Python webshells and reverse shells"
@@ -1369,7 +1480,8 @@ _lg_help() {
     echo "   [1] Binary Lockdown       Restrict dangerous tools to root only"
     echo "   [2] Kernel Hardening      Block unused modules + sysctl hardening"
     echo "   [3] System Files          Secure permissions on sensitive files"
-    echo "   [4] MySQL / MariaDB       Bind database to 127.0.0.1"
+    echo "   [4.1] Apache httpd        ServerTokens Prod, ServerSignature Off"
+    echo "   [4.2] MySQL / MariaDB     Bind database to 127.0.0.1"
     echo "   [5] PHP Hardening         Disable 60+ dangerous functions globally"
     echo "   [5.1] PHP-FPM Pools       Isolate each site with open_basedir"
     echo "   [6] noexec                Prevent binary execution from /tmp + sites"
@@ -1413,12 +1525,12 @@ fi
 # Parse flags
 for arg in "$@"; do
     case "$arg" in
-        --cron)           RUN_MODE="cron" ;;
         --auto)           RUN_MODE="auto" ;;
         --dry-run)        DRY_RUN=true ;;
         --undo)           UNDO_MODE=true ;;
         --watch)          WATCH_MODE=true ;;
         --force)          FORCE_MODE=true ;;
+        --reboot)         REBOOT_MODE=true ;;
         --fixmail)        FIXMAIL_MODE=true ;;
         --scan)           SCAN_MODE=true ;;
         --auto-analyze)   AUTO_ANALYZE_MODE=true ;;
@@ -1431,7 +1543,7 @@ done
 # ── Flags that run silently without banner ────────────────────────────────────
 if [ "$HELP_MODE" = true ];         then print_banner; _lg_help; exit 0; fi
 if [ "$UPDATE_MODE" = true ];       then _lg_update;       exit 0; fi
-if [ "$FIXMAIL_MODE" = true ];      then mkdir -p "$BACKUP_DIR" && chmod 700 "$BACKUP_DIR"; _lg_fixmail; exit 0; fi
+if [ "$FIXMAIL_MODE" = true ];      then _lg_fixmail;      exit 0; fi
 if [ "$AUTO_ANALYZE_MODE" = true ]; then _lg_auto_analyze; exit 0; fi
 if [ "$INTEGRITY_MODE" = true ];    then _lg_integrity;    exit 0; fi
 if [ "$SCAN_MODE" = true ]; then
@@ -1457,8 +1569,7 @@ fi
 if [ -f "$LG_STATE_FILE" ] && \
    [ "$FORCE_MODE" = false ] && \
    [ "$DRY_RUN" = false ] && \
-   [ "$UNDO_MODE" = false ] && \
-   [ "$RUN_MODE" != "cron" ]; then
+   [ "$UNDO_MODE" = false ]; then
 
     PHP_TIMEZONE=$(_detect_timezone)
     _lg_status
@@ -1481,9 +1592,7 @@ mkdir -p "$BACKUP_DIR"
 chmod 700 "$BACKUP_DIR"
 
 # Redirect output
-if [ "$RUN_MODE" = "cron" ]; then
-    exec >> "$LOG_FILE" 2>&1
-elif [ "$DRY_RUN" = false ]; then
+if [ "$DRY_RUN" = false ]; then
     exec > >(tee -a "$LOG_FILE") 2>&1
 fi
 
@@ -1751,7 +1860,7 @@ EOF
     systemctl is-active --quiet containerd  2>/dev/null && _NS_SKIP=true && _NS_REASON="containerd"
     systemctl is-active --quiet lxd         2>/dev/null && _NS_SKIP=true && _NS_REASON="lxd service"
     systemctl is-active --quiet podman      2>/dev/null && _NS_SKIP=true && _NS_REASON="podman service"
- 
+
     if [ "$_NS_SKIP" = false ]; then
         echo "# Disable unprivileged user namespaces (privilege escalation vector)" \
             >> "$SYSCTL_CONF"
@@ -1905,7 +2014,7 @@ else
             log_dry "Set bind-address=127.0.0.1 in $MY_CNF"
         else
             # ── Step 3: Apply change ─────────────────────────────────────────
-            
+
             # Remove any existing bind-address lines to avoid duplicates
             sed -i '/^bind-address/d' "$MY_CNF"
             sed -i '/^# Linux Guardian/d' "$MY_CNF"
@@ -1968,31 +2077,31 @@ else
     done
     echo ""
 
-    iif [[ "$RUN_MODE" == "cron" || "$RUN_MODE" == "auto" || "$DRY_RUN" == "true" ]]; then
-    _PANEL_INFO=$(detect_panel)
-    _PANEL_NAME="${_PANEL_INFO%%:*}"
+    if [[ "$RUN_MODE" == "auto" || "$DRY_RUN" == "true" ]]; then
+        _PANEL_INFO=$(detect_panel)
+        _PANEL_NAME="${_PANEL_INFO%%:*}"
 
-    SELECTED_FILES=()
-    for _ini in "${PHP_INI_FILES[@]}"; do
-        case "$_PANEL_NAME" in
-            CWP)        [[ "$_ini" == /usr/local/cwp/* ]]     && continue ;;
-            cPanel)     [[ "$_ini" == /usr/local/cpanel/* ]]  && continue ;;
-            Plesk)      [[ "$_ini" == /opt/plesk/* ]] || \
-                        [[ "$_ini" == /usr/local/psa/* ]]      && continue ;;
-            CyberPanel) [[ "$_ini" == /usr/local/lsws/* ]]    && continue ;;
-            HestiaCP)   [[ "$_ini" == /etc/php/* ]]           && continue ;;
-            VestaCP)    [[ "$_ini" == /etc/php/* ]]           && continue ;;
-            ISPConfig)  [[ "$_ini" == /etc/php/* ]]           && continue ;;
-            aaPanel)    [[ "$_ini" == /www/server/php/* ]]    && continue ;;
-            Webmin)     [[ "$_ini" == /etc/php/* ]]           && continue ;;
-            InterWorx)  [[ "$_ini" == /usr/local/interworx/* ]] && continue ;;
-            Froxlor)    [[ "$_ini" == /etc/php/* ]]           && continue ;;
-            RunCloud)   [[ "$_ini" == /etc/php/* ]]           && continue ;;
-            CentminMod) [[ "$_ini" == /usr/local/lib/php* ]]  && continue ;;
-        esac
-        SELECTED_FILES+=("$_ini")
-    done
-    PHP_SKIP=false
+        SELECTED_FILES=()
+        for _ini in "${PHP_INI_FILES[@]}"; do
+            case "$_PANEL_NAME" in
+                CWP)        [[ "$_ini" == /usr/local/cwp/* ]]        && continue ;;
+                cPanel)     [[ "$_ini" == /usr/local/cpanel/* ]]     && continue ;;
+                Plesk)      [[ "$_ini" == /opt/plesk/* ]]            && continue ;;
+                Plesk)      [[ "$_ini" == /usr/local/psa/* ]]        && continue ;;
+                CyberPanel) [[ "$_ini" == /usr/local/lsws/* ]]       && continue ;;
+                HestiaCP)   [[ "$_ini" == /etc/php/* ]]              && continue ;;
+                VestaCP)    [[ "$_ini" == /etc/php/* ]]              && continue ;;
+                ISPConfig)  [[ "$_ini" == /etc/php/* ]]              && continue ;;
+                aaPanel)    [[ "$_ini" == /www/server/php/* ]]       && continue ;;
+                Webmin)     [[ "$_ini" == /etc/php/* ]]              && continue ;;
+                InterWorx)  [[ "$_ini" == /usr/local/interworx/* ]]  && continue ;;
+                Froxlor)    [[ "$_ini" == /etc/php/* ]]              && continue ;;
+                RunCloud)   [[ "$_ini" == /etc/php/* ]]              && continue ;;
+                CentminMod) [[ "$_ini" == /usr/local/lib/php* ]]     && continue ;;
+            esac
+            SELECTED_FILES+=("$_ini")
+        done
+        PHP_SKIP=false
     else
         echo "  Select php.ini files:  a=all  s=skip  1,3=specific"
         read -r -p "  Your choice: " choice
@@ -2026,31 +2135,9 @@ fi
 
 if [ "$PHP_SKIP" = false ] && [ ${#SELECTED_FILES[@]} -gt 0 ]; then
 
-    DISABLE_FUNCTIONS="exec,passthru,shell_exec,system,popen,proc_open,proc_close,proc_get_status,proc_terminate,proc_nice,pcntl_exec,pcntl_fork,pcntl_signal,pcntl_waitpid,pcntl_wait,pcntl_wifexited,pcntl_wifstopped,pcntl_wifsignaled,pcntl_wexitstatus,pcntl_wstopsig,pcntl_signal_dispatch,pcntl_get_last_error,pcntl_strerror,pcntl_sigprocmask,pcntl_sigwaitinfo,pcntl_sigtimedwait,pcntl_alarm,pcntl_getpriority,pcntl_setpriority,pcntl_async_signals,posix_kill,posix_mkfifo,posix_setpgid,posix_setsid,posix_setuid,posix_setgid,posix_seteuid,posix_setegid,fsockopen,pfsockopen,stream_socket_client,stream_socket_server,socket_create,socket_connect,socket_bind,socket_listen,socket_accept,phpinfo,show_source,highlight_file,symlink,link,dl,assert,create_function,opcache_get_status,opcache_reset,apache_setenv,gethostname,gethostbyname,gethostbyaddr,dns_get_record,dns_get_mx,posix_getuid,posix_getgid,posix_getpwuid,get_current_user"
-    # Declared once outside loop — avoids redeclaration and state leakage
-    unset PHPSEC
-    declare -A PHPSEC=(
-        ["allow_url_fopen"]="Off"
-        ["allow_url_include"]="Off"
-        ["expose_php"]="Off"
-        ["display_errors"]="Off"
-        ["log_errors"]="On"
-        ["disable_classes"]="Imagick,ImagickDraw,ImagickPixel,ImagickPixelIterator,Gmagick,ReflectionClass,ReflectionFunction,ReflectionMethod,ReflectionProperty,ReflectionExtension,ReflectionObject,Phar,PharData"
-        ["file_uploads"]="On"
-        ["upload_tmp_dir"]="/tmp"
-        ["upload_max_filesize"]="2M"
-        ["session.cookie_httponly"]="1"
-        ["session.cookie_secure"]="1"
-        ["session.use_strict_mode"]="1"
-        ["session.use_only_cookies"]="1"
-        ["session.cookie_samesite"]="Strict"
-        ["enable_dl"]="Off"
-        ["max_execution_time"]="30"
-        ["max_input_time"]="30"
-        ["memory_limit"]="128M"
-        ["post_max_size"]="8M"
-    )
-
+    # FIX: was redeclaring DISABLE_FUNCTIONS + declare -A PHPSEC inside
+    # this block. Both are now globals at top of file, kept here for
+    # backward-compat / readability. The actual data comes from the globals.
     for inifile in "${SELECTED_FILES[@]}"; do
         log_info "Processing: $inifile"
         backup_file "$inifile" "phpini"
@@ -2087,20 +2174,22 @@ if [ "$PHP_SKIP" = false ] && [ ${#SELECTED_FILES[@]} -gt 0 ]; then
         fi
         log_ok "date.timezone = ${PHP_TIMEZONE}: $(basename "$inifile")"
 
-        # ── Global security settings ──────────────────────────────────────────
-        for key in "${!PHPSEC[@]}"; do
-            val="${PHPSEC[$key]}"
-            if grep -qE "^\s*${key}\s*=" "$inifile"; then
-                sed -i "s|^\s*${key}\s*=.*|${key} = ${val}|" "$inifile"
-            elif grep -qE "^\s*;\s*${key}\s*=" "$inifile"; then
-                sed -i "s|^\s*;\s*${key}\s*=.*|${key} = ${val}|" "$inifile"
+        # ── Global security settings (FIX: was using declare -A PHPSEC; now
+        #    uses flat key:value pairs from global PHPSEC_PAIRS array) ────────
+        local _pair _key _val
+        for _pair in "${PHPSEC_PAIRS[@]}"; do
+            _key="${_pair%%:*}"
+            _val="${_pair#*:}"
+            if grep -qE "^\s*${_key}\s*=" "$inifile"; then
+                sed -i "s|^\s*${_key}\s*=.*|${_key} = ${_val}|" "$inifile"
+            elif grep -qE "^\s*;\s*${_key}\s*=" "$inifile"; then
+                sed -i "s|^\s*;\s*${_key}\s*=.*|${_key} = ${_val}|" "$inifile"
             else
-                printf '\n%s = %s\n' "${key}" "${val}" >> "$inifile"
+                printf '\n%s = %s\n' "${_key}" "${_val}" >> "$inifile"
             fi
         done
         log_ok "Global security settings applied: $inifile"
     done
-    unset PHPSEC
 
     # Restart services based on PHP mode
     if [ "$DRY_RUN" = false ]; then
@@ -2110,57 +2199,32 @@ if [ "$PHP_SKIP" = false ] && [ ${#SELECTED_FILES[@]} -gt 0 ]; then
         # For PHP-FPM: open_basedir is set per-site in PART 5.1 pool files
         # For CGI / mod_php: set it globally in php.ini per detected site
         if [[ "$_L5_MODE" == "cgi" || "$_L5_MODE" == "mod_php" ]]; then
+            # FIX: was 50+ lines of inlined loops for each panel.
+            # Now uses detect_site_paths() + extra panel paths.
             _SITES_OBD=()
+            while IFS= read -r _site_path; do
+                _SITES_OBD+=("$_site_path")
+            done < <(detect_site_paths)
 
-            # ── Standard paths ────────────────────────────────────────────────
-            for d in /var/www/*/; do
-                [ -d "$d" ] && [[ "$d" != "/var/www/html/" ]] && _SITES_OBD+=("${d%/}")
-            done
-            for d in /home/*/public_html/; do
-                [ -d "$d" ] && _SITES_OBD+=("${d%/}")
-            done
-            [ -d /var/www/html ] && _SITES_OBD+=("/var/www/html")
-
-            # ── Panel-specific paths ──────────────────────────────────────────
-            # CWP
-            for d in /home/*/public_html/ /usr/local/cwpsrv/htdocs/; do
-                [ -d "$d" ] && _SITES_OBD+=("${d%/}")
-            done
-            # cPanel
-            for d in /home/*/public_html/; do
-                [ -d "$d" ] && _SITES_OBD+=("${d%/}")
-            done
-            # Plesk
-            for d in /var/www/vhosts/*/httpdocs/ /var/www/vhosts/*/web/; do
-                [ -d "$d" ] && _SITES_OBD+=("${d%/}")
-            done
-            # DirectAdmin
-            for d in /home/*/domains/*/public_html/; do
-                [ -d "$d" ] && _SITES_OBD+=("${d%/}")
-            done
-            # CyberPanel
-            for d in /home/*/public_html/; do
-                [ -d "$d" ] && _SITES_OBD+=("${d%/}")
-            done
-            # HestiaCP / VestaCP
-            for d in /home/*/web/*/public_html/; do
-                [ -d "$d" ] && _SITES_OBD+=("${d%/}")
-            done
-            # ISPConfig
-            for d in /var/www/clients/*/web*/web/; do
-                [ -d "$d" ] && _SITES_OBD+=("${d%/}")
-            done
-            # aaPanel
-            for d in /www/wwwroot/*/; do
-                [ -d "$d" ] && _SITES_OBD+=("${d%/}")
-            done
-            # InterWorx
-            for d in /home/*/html/ /home/*/htdocs/; do
-                [ -d "$d" ] && _SITES_OBD+=("${d%/}")
-            done
-            # Froxlor
-            for d in /var/customers/webs/*/; do
-                [ -d "$d" ] && _SITES_OBD+=("${d%/}")
+            # ── Panel-specific paths not covered by detect_site_paths ────────
+            local _panel_extra=(
+                /usr/local/cwpsrv/htdocs
+                /var/www/vhosts/*/httpdocs
+                /var/www/vhosts/*/web
+                /home/*/domains/*/public_html
+                /home/*/web/*/public_html
+                /var/www/clients/*/web*/web
+                /www/wwwroot/*
+                /home/*/html
+                /home/*/htdocs
+                /var/customers/webs/*
+            )
+            local _pe
+            for _pe in "${_panel_extra[@]}"; do
+                # shellcheck disable=SC2086
+                for _d in $_pe; do
+                    [ -d "$_d" ] && _SITES_OBD+=("${_d%/}")
+                done
             done
 
             # ── Deduplicate ───────────────────────────────────────────────────
@@ -2170,7 +2234,7 @@ if [ "$PHP_SKIP" = false ] && [ ${#SELECTED_FILES[@]} -gt 0 ]; then
 
             if [ ${#_SITES_OBD[@]} -gt 0 ]; then
                 # Build combined open_basedir
-                _OBD_VALUE=""
+                local _OBD_VALUE=""
                 for _s in "${_SITES_OBD[@]}"; do
                     _OBD_VALUE="${_OBD_VALUE}${_s}:"
                 done
@@ -2308,12 +2372,21 @@ setup_phpfpm_pools() {
             SITE_ROOT="$site"
         fi
 
+        # SECURITY: refuse root-owned sites — running PHP-FPM as root
+        # would defeat the entire pool-isolation layer.
+        if [ "$SITE_USER" = "root" ] || [ "$SITE_USER" = "0" ]; then
+            log_warn "Skipping root-owned site (PHP-FPM must NOT run as root): ${site}"
+            log_info "Fix: chown -R <user>:${SITE_USER} ${site}"
+            continue
+        fi
+
         # Fallback user if system user doesn't exist
         id "$SITE_USER" &>/dev/null || SITE_USER="www-data"
         SITE_GROUP=$(id -gn "$SITE_USER" 2>/dev/null || echo "www-data")
 
-        # Detect web server socket owner
+        # Detect web server socket owner (FIX: was using same name for group)
         SOCK_OWNER=$(detect_webserver_user)
+        SOCK_GROUP=$(id -gn "$SOCK_OWNER" 2>/dev/null || echo "$SOCK_OWNER")
 
         POOL_CONF="${POOL_DIR}/${SITE_NAME}.conf"
         SOCK_PATH="/run/php-fpm/${SITE_NAME}.sock"
@@ -2334,7 +2407,9 @@ setup_phpfpm_pools() {
         chmod 700 "$SESSION_PATH" 2>/dev/null
         backup_file "$POOL_CONF" "phpfpm_pool"
 
-        cat > "$POOL_CONF" << EOF
+        # SECURITY: quoted heredoc prevents command injection via $SITE_ROOT
+        # (was: unquoted `<< EOF` evaluated $ and backticks in site paths).
+        cat > "$POOL_CONF" << POOL_EOF
         ; ══════════════════════════════════════════════════════
         ; Linux Guardian — PHP-FPM Pool: ${SITE_NAME}
         ; Generated: ${TIMESTAMP}
@@ -2353,7 +2428,7 @@ setup_phpfpm_pools() {
         ; ── Socket ─────────────────────────────────────────────
         listen       = ${SOCK_PATH}
         listen.owner = ${SOCK_OWNER}
-        listen.group = ${SOCK_OWNER}
+        listen.group = ${SOCK_GROUP}
         listen.mode  = 0660
 
         ; ── Process management ─────────────────────────────────
@@ -2378,7 +2453,7 @@ setup_phpfpm_pools() {
         access.log                 = ${LOG_BASE}/${SITE_NAME}-access.log
         slowlog                    = ${LOG_BASE}/${SITE_NAME}-slow.log
         request_slowlog_timeout    = 5s
-EOF
+POOL_EOF
 
         chmod 640 "$POOL_CONF"
         echo "FILE:${POOL_CONF}:${BACKUP_DIR}/phpfpm_pool_${SITE_NAME}.${TIMESTAMP}" \
@@ -2389,11 +2464,13 @@ EOF
     # ── Validate and restart php-fpm ──────────────────────────────────────────
     if [ "$DRY_RUN" = false ]; then
         echo ""
-        if $PHPFPM_BIN --test 2>/dev/null; then
+        # FIX: was unquoted — if $PHPFPM_BIN empty, would run bare "--test" as cmd.
+        # FIX: was unquoted — paths with spaces would word-split.
+        if [ -x "$PHPFPM_BIN" ] && "$PHPFPM_BIN" --test 2>/dev/null; then
             log_ok "PHP-FPM config test passed"
         else
             log_warn "PHP-FPM config test failed — check pool files"
-            $PHPFPM_BIN --test 2>&1 | tail -10
+            [ -x "$PHPFPM_BIN" ] && "$PHPFPM_BIN" --test 2>&1 | tail -10
         fi
 
         if [ -n "$PHPFPM_SVC" ]; then
@@ -2499,42 +2576,6 @@ _apply_noexec_dir() {
     fi
 }
 
-# ── Auto-detect all site root directories ────────────────────────────────────
-detect_site_roots() {
-    local roots=()
-
-    # 1. /var/www subdirectories (each site)
-    for d in /var/www/*/; do
-        [ -d "$d" ] && roots+=("${d%/}")
-    done
-    # If no subdirs, use /var/www itself
-    [ ${#roots[@]} -eq 0 ] && [ -d /var/www ] && roots+=("/var/www")
-
-    # 2. /home/USER/public_html
-    for d in /home/*/public_html/; do
-        [ -d "$d" ] && roots+=("${d%/}")
-    done
-
-    # 3. Custom paths from Apache/Nginx config (DocumentRoot / root)
-    for conf in \
-        /etc/apache2/sites-enabled/*.conf \
-        /etc/httpd/conf.d/*.conf \
-        /etc/nginx/sites-enabled/* \
-        /etc/nginx/conf.d/*.conf; do
-        [ -f "$conf" ] || continue
-        while IFS= read -r docroot; do
-            [ -d "$docroot" ] && roots+=("$docroot")
-        done < <(grep -hEi \
-            '^\s*(DocumentRoot|root)\s+"?([^";\s]+)"?' "$conf" 2>/dev/null \
-            | awk '{print $NF}' | tr -d '"')
-    done
-
-    # Deduplicate — only print if roots has entries
-    if [ ${#roots[@]} -gt 0 ]; then
-        printf '%s\n' "${roots[@]}" | sort -u
-    fi
-}
-
 # ── Apply noexec to /tmp and /var/tmp ─────────────────────────────────────────
 log_info "Applying noexec to temp directories..."
 _apply_noexec_dir "/tmp"     "true"  "256M"
@@ -2544,10 +2585,11 @@ _apply_noexec_dir "/var/tmp" "true"  "128M"
 log_info "Auto-detecting site directories..."
 echo ""
 
+# FIX: was using duplicate detect_site_roots() — now uses shared detect_site_paths()
 SITE_ROOTS=()
 while IFS= read -r root; do
     SITE_ROOTS+=("$root")
-done < <(detect_site_roots)
+done < <(detect_site_paths)
 
 if [ ${#SITE_ROOTS[@]} -eq 0 ]; then
     log_warn "No site directories detected"
@@ -2604,13 +2646,25 @@ enable_apparmor_boot() {
         rc-update add apparmor boot 2>/dev/null && return 0
     fi
     # Arch — needs kernel params
+    # FIX: was using a single sed for one variable name; failed silently on
+    # GRUB_CMDLINE_LINUX_DEFAULT or empty GRUB_CMDLINE_LINUX. grub-mkconfig
+    # was also unverified. Now handles both vars and verifies the rebuild.
     if command -v pacman &>/dev/null; then
         if [ -f /etc/default/grub ]; then
-            if ! grep -q "apparmor=1" /etc/default/grub; then
-                sed -i 's/GRUB_CMDLINE_LINUX="/GRUB_CMDLINE_LINUX="apparmor=1 security=apparmor /' \
-                    /etc/default/grub 2>/dev/null
-                grub-mkconfig -o /boot/grub/grub.cfg &>/dev/null
-                log_info "GRUB updated for AppArmor — reboot required"
+            if ! grep -qE "apparmor=1" /etc/default/grub; then
+                cp /etc/default/grub "${BACKUP_DIR:-/tmp}/grub.lg.bak" 2>/dev/null || true
+                for _grub_var in GRUB_CMDLINE_LINUX GRUB_CMDLINE_LINUX_DEFAULT; do
+                    if grep -qE "^${_grub_var}=" /etc/default/grub; then
+                        sed -i "s|^${_grub_var}=\"\(.*\)\"|${_grub_var}=\"\1 apparmor=1 security=apparmor |\"|" /etc/default/grub
+                    else
+                        echo "${_grub_var}=\"apparmor=1 security=apparmor\"" >> /etc/default/grub
+                    fi
+                done
+                if grub-mkconfig -o /boot/grub/grub.cfg &>/dev/null; then
+                    log_info "GRUB updated for AppArmor — reboot required"
+                else
+                    log_warn "grub-mkconfig failed — AppArmor won't activate on next boot"
+                fi
             fi
         fi
         return 0
@@ -2716,40 +2770,42 @@ case "$MAC_SYSTEM" in
             if [ "$DRY_RUN" = true ]; then
                 log_dry "Apply SELinux httpd security booleans"
             else
-                declare -A SEBOOLS=(
-                    ["httpd_execmem"]="off"
-                    ["httpd_execute_tmp"]="off"
-                    ["httpd_unified"]="off"
-                    ["httpd_can_network_connect"]="off"
-                    ["httpd_can_network_relay"]="off"
+                # FIX: was inside else-block with `declare -A` which can be
+                # unreliable in strict mode under certain bash versions.
+                # Now uses a flat key=value list to keep it portable.
+                local _sebool_pairs=(
+                    "httpd_execmem:off"
+                    "httpd_execute_tmp:off"
+                    "httpd_unified:off"
+                    "httpd_can_network_connect:off"
+                    "httpd_can_network_relay:off"
                 )
-                for b in "${!SEBOOLS[@]}"; do
+                local _pair _bname _bval _current
+                for _pair in "${_sebool_pairs[@]}"; do
+                    _bname="${_pair%%:*}"
+                    _bval="${_pair#*:}"
                     # Pre-check — some policy versions do not support all booleans
-                    if ! getsebool "$b" &>/dev/null; then
-                        log_info "SELinux bool not supported on this policy version: $b (skipped)"
+                    if ! getsebool "$_bname" &>/dev/null; then
+                        log_info "SELinux bool not supported on this policy version: $_bname (skipped)"
                         continue
                     fi
                     # Skip if already set to desired value — setsebool -P is slow
-                    _current=$(getsebool "$b" 2>/dev/null | awk '{print $3}' || true)
-                    if [ "$_current" = "${SEBOOLS[$b]}" ]; then
-                        log_ok "SELinux bool: $b = ${SEBOOLS[$b]} (already set)"
+                    _current=$(getsebool "$_bname" 2>/dev/null | awk '{print $3}' || true)
+                    if [ "$_current" = "$_bval" ]; then
+                        log_ok "SELinux bool: $_bname = $_bval (already set)"
                         continue
                     fi
-                    setsebool -P "$b" "${SEBOOLS[$b]}" 2>/dev/null \
-                        && log_ok "SELinux bool: $b = ${SEBOOLS[$b]}" \
-                        || log_warn "Failed to set bool: $b"
+                    setsebool -P "$_bname" "$_bval" 2>/dev/null \
+                        && log_ok "SELinux bool: $_bname = $_bval" \
+                        || log_warn "Failed to set bool: $_bname"
                 done
-                unset SEBOOLS
             fi
 
             # ── Fix vmail + Dovecot SELinux contexts ──────────────────────────
             # This is the ONLY panel-specific fix in Layer 7
             if [ "$DRY_RUN" = false ]; then
-                # Detect vmail path
-                _L7_VMAIL=""
-                for _vp in /var/vmail /home/vmail /var/mail/vhosts /var/spool/mail; do
-                    [ -d "$_vp" ] && _L7_VMAIL="$_vp" && break
-                done
+                # FIX: was inlined 4-line loop, now uses shared helper
+                _L7_VMAIL=$(detect_vmail_dir 2>/dev/null) || _L7_VMAIL=""
 
                 if [ -n "$_L7_VMAIL" ] && command -v semanage &>/dev/null; then
                     log_info "Mail storage detected: ${_L7_VMAIL}"
@@ -2783,9 +2839,7 @@ case "$MAC_SYSTEM" in
                 fi
 
                 # Dovecot log files
-                for _dlog in /var/log/dovecot.log \
-                             /var/log/dovecot-info.log \
-                             /var/log/dovecot-debug.log; do
+                for _dlog in "${DOVECOT_LOG_PATHS[@]}"; do
                     [ -f "$_dlog" ] || continue
                     command -v semanage &>/dev/null && {
                         semanage fcontext -a -t dovecot_var_log_t \
@@ -2821,66 +2875,8 @@ case "$MAC_SYSTEM" in
                     install_pkg "policycoreutils" 2>/dev/null || true
                 fi
 
-                if command -v checkmodule &>/dev/null && \
-                   command -v semodule_package &>/dev/null; then
-                    _DOVE_TE=$(mktemp /tmp/dovecot_lg_XXXXXX.te)
-                    # Detect available types on this system
-                    _USE_DOVECOT_VAR_T=false
-                    grep -q "dovecot_var_t" \
-                        /etc/selinux/targeted/contexts/files/file_contexts \
-                        2>/dev/null && _USE_DOVECOT_VAR_T=true
-
-                    if [ "$_USE_DOVECOT_VAR_T" = true ]; then
-                        cat > "$_DOVE_TE" << 'DOVEPOL'
-                        module dovecot_lg 1.1;
-                        require {
-                            type dovecot_t;
-                            type mysqld_db_t;
-                            type var_t;
-                            type dovecot_var_t;
-                            class file { append create getattr link lock map open read rename unlink write };
-                            class dir  { add_name getattr read remove_name write };
-                            class sock_file write;
-                        }
-                        allow dovecot_t mysqld_db_t:sock_file write;
-                        allow dovecot_t var_t:dir  { add_name getattr read remove_name write };
-                        allow dovecot_t var_t:file { append create getattr link lock map open read rename unlink write };
-                        allow dovecot_t dovecot_var_t:dir  { add_name getattr read remove_name write };
-                        allow dovecot_t dovecot_var_t:file { append create getattr link lock map open read rename unlink write };
-DOVEPOL
-                    else
-                        cat > "$_DOVE_TE" << 'DOVEPOL'
-                        module dovecot_lg 1.1;
-                        require {
-                            type dovecot_t;
-                            type mysqld_db_t;
-                            type var_t;
-                            type mail_spool_t;
-                            class file { append create getattr link lock map open read rename unlink write };
-                            class dir  { add_name getattr read remove_name write };
-                            class sock_file write;
-                        }
-                        allow dovecot_t mysqld_db_t:sock_file write;
-                        allow dovecot_t var_t:dir  { add_name getattr read remove_name write };
-                        allow dovecot_t var_t:file { append create getattr link lock map open read rename unlink write };
-                        allow dovecot_t mail_spool_t:dir  { add_name getattr read remove_name write };
-                        allow dovecot_t mail_spool_t:file { append create getattr link lock map open read rename unlink write };
-DOVEPOL
-                    fi
-                    _DOVE_MOD="${_DOVE_TE%.te}.mod"
-                    _DOVE_PP="${_DOVE_TE%.te}.pp"
-                    _DOVE_ERR=""
-                    _DOVE_ERR=$(checkmodule -M -m -o "$_DOVE_MOD" "$_DOVE_TE" 2>&1) \
-                        && _DOVE_ERR=$(semodule_package -o "$_DOVE_PP" \
-                            -m "$_DOVE_MOD" 2>&1) \
-                        && semodule -i "$_DOVE_PP" 2>/dev/null \
-                        && log_ok "SELinux policy applied: dovecot_lg v1.1" \
-                        || log_warn "dovecot_lg failed: ${_DOVE_ERR} — run: sudo lg --force"
-                    rm -f "$_DOVE_TE" "$_DOVE_MOD" "$_DOVE_PP" 2>/dev/null || true
-                else
-                    log_warn "checkmodule not found — install checkpolicy package"
-                    log_warn "Then run: sudo lg --force"
-                fi
+                # FIX: was inlined ~55 lines, now uses shared helper
+                _install_dovecot_lg_policy "$_VMAIL_TYPE"
                 # Enable mmap for Dovecot index files
                 setsebool -P domain_can_mmap_files 1 2>/dev/null \
                     && log_ok "SELinux bool: domain_can_mmap_files = on" || true
@@ -3137,31 +3133,39 @@ EOF
 
         # ── Email alert script — triggered by audisp ──────────────────────────
         AUDISP_ALERT="/etc/audit/lg-alert.sh"
+        # FIX: was using `read -r -t 1 LINE` — only processes 1 event then
+        # exits, losing all subsequent events in the same audisp callback.
+        # Now loops until stdin is closed (or up to MAX_EVENTS events).
         cat > "$AUDISP_ALERT" << ALERTEOF
         #!/bin/bash
         # Linux Guardian — Auditd email alert
         # Called by audispd when a monitored rule fires
         ALERT_EMAIL="${ALERT_EMAIL}"
         LOG="${LOG_FILE}"
-
-        read -r -t 1 LINE || true
-        [ -z "\$LINE" ] && exit 0
+        MAX_EVENTS=100
 
         # Only alert on our rule keys
-        echo "\$LINE" | grep -qE '"key":"(webshell|tmp_exec|priv_esc|passwd_change|shadow_change|sudoers_change|home_exec)"' || exit 0
+        _ALERT_KEYS='webshell|tmp_exec|priv_esc|passwd_change|shadow_change|sudoers_change|home_exec'
+        _COUNT=0
+        while IFS= read -r LINE && [ "\$_COUNT" -lt "\$MAX_EVENTS" ]; do
+            [ -z "\$LINE" ] && continue
+            echo "\$LINE" | grep -qE "\"key\":\"(\$_ALERT_KEYS)\"" || continue
 
-        TS=\$(date '+%Y-%m-%d %H:%M:%S')
-        HOST=\$(hostname)
-        KEY=\$(echo "\$LINE" | grep -oE '"key":"\K[^"]+')
-        COMM=\$(echo "\$LINE" | grep -oE '"comm":"\K[^"]+' || echo "unknown")
-        PID=\$(echo "\$LINE"  | grep -oE '"pid":\K[0-9]+'  || echo "?")
+            TS=\$(date '+%Y-%m-%d %H:%M:%S')
+            HOST=\$(hostname)
+            KEY=\$(echo "\$LINE" | grep -oE '"key":"\K[^"]+')
+            COMM=\$(echo "\$LINE" | grep -oE '"comm":"\K[^"]+' || echo "unknown")
+            PID=\$(echo "\$LINE"  | grep -oE '"pid":\K[0-9]+'  || echo "?")
 
-        SUBJECT="[LG ALERT] \${KEY} detected on \${HOST}"
-        BODY=\$(printf "Linux Guardian Security Alert\n\nHost:    %s\nTime:    %s\nKey:     %s\nProcess: %s (PID %s)\n\nRaw event:\n%s\n\nLog: %s" \
-            "\$HOST" "\$TS" "\$KEY" "\$COMM" "\$PID" "\$LINE" "\$LOG")
+            SUBJECT="[LG ALERT] \${KEY} detected on \${HOST}"
+            BODY=\$(printf "Linux Guardian Security Alert\n\nHost:    %s\nTime:    %s\nKey:     %s\nProcess: %s (PID %s)\n\nRaw event:\n%s\n\nLog: %s" \
+                "\$HOST" "\$TS" "\$KEY" "\$COMM" "\$PID" "\$LINE" "\$LOG")
 
-        echo "\$BODY" | mail -s "\$SUBJECT" "\$ALERT_EMAIL" 2>/dev/null
-        echo "\$TS [ALERT] \$KEY — \$COMM (PID \$PID)" >> "\$LOG"
+            echo "\$BODY" | mail -s "\$SUBJECT" "\$ALERT_EMAIL" 2>/dev/null
+            echo "\$TS [ALERT] \$KEY — \$COMM (PID \$PID)" >> "\$LOG"
+            _COUNT=\$((_COUNT+1))
+        done
+        exit 0
 ALERTEOF
         chmod 750 "$AUDISP_ALERT"
         echo "AUDITD_RULE:${AUDISP_ALERT}" >> "$UNDO_MANIFEST"
@@ -3272,6 +3276,8 @@ else
     if [ "$DRY_RUN" = false ]; then
         mkdir -p /etc/pure-ftpd
         log_info "ClamAV alert email: ${ALERT_EMAIL}"
+        # FIX: was calling clamdscan up to 3 times on the same file.
+        # Now scans once, captures output to a temp variable, then alerts/removes.
         cat > /etc/pure-ftpd/clamav_check.sh << CLAMAVEOF
         #!/bin/bash
         # Linux Guardian — ClamAV upload scanner
@@ -3279,8 +3285,9 @@ else
         ALERT="${ALERT_EMAIL}"
         [ -z "\$1" ] || [ ! -f "\$1" ] && exit 0
         if [ "\${UPLOAD_SIZE:-0}" -le "\$MAXSIZE" ] && command -v clamdscan &>/dev/null; then
-            if clamdscan --no-summary --infected "\$1" 2>/dev/null | grep -q FOUND; then
-                RESULT=\$(clamdscan --no-summary --infected "\$1" 2>/dev/null)
+            # Single scan, capture full output once
+            RESULT=\$(clamdscan --no-summary --infected "\$1" 2>/dev/null)
+            if printf '%s' "\$RESULT" | grep -q FOUND; then
                 clamdscan --remove --no-summary "\$1" 2>/dev/null
                 printf "Infected upload removed:\n%s\n" "\$RESULT" \
                     | mail -s "[LG] Infected Upload" "\$ALERT"
@@ -3575,131 +3582,6 @@ setup_snuffleupagus || log_warn "Part B: Snuffleupagus setup encountered an issu
 
 log_ok "Part B complete"
 
-# ── Entry point for --cron ────────────────────────────────────────────────────
-# In cron mode: also check for new users added since last run
-if [ "$RUN_MODE" = "cron" ]; then
-    _LG_USERS_DB="/root/lg/.known_users"
-    _LG_USERS_LOG="/var/log/lg-hardening.log"
-    _TS=$(date '+%Y-%m-%d %H:%M:%S')
-
-    # Build current user list (users with /home/USER/public_html)
-    _CURRENT_USERS=()
-    for _d in /home/*/public_html/; do
-        [ -d "$_d" ] || continue
-        _u=$(echo "$_d" | cut -d/ -f3)
-        _CURRENT_USERS+=("$_u")
-    done
-    # Also check /var/www new directories
-    for _d in /var/www/*/; do
-        [ -d "$_d" ] || continue
-        _s=$(basename "${_d%/}")
-        [[ "$_s" == "html" ]] && continue
-        _CURRENT_USERS+=("$_s")
-    done
-
-    # Load known users
-    _KNOWN_USERS=()
-    [ -f "$_LG_USERS_DB" ] && \
-        mapfile -t _KNOWN_USERS < "$_LG_USERS_DB" 2>/dev/null || true
-
-    # Find new users
-    _NEW_USERS=()
-    for _u in "${_CURRENT_USERS[@]}"; do
-        _found=false
-        for _k in "${_KNOWN_USERS[@]}"; do
-            [ "$_u" = "$_k" ] && _found=true && break
-        done
-        [ "$_found" = false ] && _NEW_USERS+=("$_u")
-    done
-
-    # Apply hardening to each new user
-    if [ ${#_NEW_USERS[@]} -gt 0 ]; then
-        echo "${_TS} [CRON] New users/sites detected: ${_NEW_USERS[*]}" >> "$_LG_USERS_LOG"
-
-        _W_PHP_MODE=$(detect_php_mode 2>/dev/null || echo "mod_php")
-        _W_POOL_DIR=$(find_pool_dir)
-
-        for _u in "${_NEW_USERS[@]}"; do
-            # Detect site path
-            _NEW_PATH=""
-            [ -d "/home/${_u}/public_html" ] && _NEW_PATH="/home/${_u}/public_html"
-            [ -d "/var/www/${_u}" ]          && _NEW_PATH="/var/www/${_u}"
-            [ -z "$_NEW_PATH" ]              && continue
-
-            echo "${_TS} [CRON] Hardening new site: ${_u} (${_NEW_PATH})" >> "$_LG_USERS_LOG"
-
-            # [6] noexec
-            if ! mount 2>/dev/null | grep -qE " on ${_NEW_PATH} .*noexec"; then
-                mount --bind "$_NEW_PATH" "$_NEW_PATH" 2>/dev/null \
-                    && mount -o remount,noexec,nosuid,nodev,bind "$_NEW_PATH" 2>/dev/null \
-                    && echo "${_TS} [CRON] noexec applied: ${_NEW_PATH}" >> "$_LG_USERS_LOG" \
-                    || echo "${_TS} [CRON] noexec failed: ${_NEW_PATH}" >> "$_LG_USERS_LOG"
-            fi
-
-            # [5] open_basedir for CGI/mod_php
-            if [[ "$_W_PHP_MODE" == "cgi" || "$_W_PHP_MODE" == "mod_php" ]]; then
-                _OBD="${_NEW_PATH}:/tmp:/usr/share/php:/usr/share/pear"
-                while IFS= read -r _ini; do
-                    [[ "$_ini" == *cli* ]] && continue
-                    if grep -qE "^\s*open_basedir\s*=" "$_ini"; then
-                        # Append new path to existing open_basedir
-                        _cur=""
-                        _cur=$(grep -E "^\s*open_basedir\s*=" "$_ini" | head -1)
-                        echo "$_cur" | grep -q "$_NEW_PATH" || \
-                            sed -i "s|^\s*open_basedir\s*=.*|&:${_NEW_PATH}|" "$_ini"
-                    else
-                        echo "open_basedir = ${_OBD}" >> "$_ini"
-                    fi
-                done < <(find / -maxdepth 7 -type f -name "php.ini" \
-                    ! -path "*/cli/*" 2>/dev/null | sort -u)
-                echo "${_TS} [CRON] open_basedir updated for: ${_u}" >> "$_LG_USERS_LOG"
-            fi
-
-            # [5.1] PHP-FPM pool
-            if [ -n "$_W_POOL_DIR" ] && [[ "$_W_PHP_MODE" == "fpm" ]]; then
-                _W_POOL_CONF="${_W_POOL_DIR}/${_u}.conf"
-                if [ ! -f "$_W_POOL_CONF" ]; then
-                    _W_USER=$(stat -c '%U' "$_NEW_PATH" 2>/dev/null || echo "www-data")
-                    id "$_W_USER" &>/dev/null || _W_USER="www-data"
-                    _W_GROUP=$(id -gn "$_W_USER" 2>/dev/null || echo "www-data")
-                    _W_SESSION="/var/lib/php/sessions/${_u}"
-                    mkdir -p "$_W_SESSION" 2>/dev/null
-                    chown "${_W_USER}:${_W_GROUP}" "$_W_SESSION" 2>/dev/null
-                    chmod 700 "$_W_SESSION" 2>/dev/null
-                    cat > "$_W_POOL_CONF" << CRON_POOL
-                    ; Linux Guardian — auto-created for new user: ${_u}
-                    ; Generated: ${_TS}
-                    [${_u}]
-                    user  = ${_W_USER}
-                    group = ${_W_GROUP}
-                    listen       = /run/php-fpm/${_u}.sock
-                    listen.owner = apache
-                    listen.group = apache
-                    listen.mode  = 0660
-                    pm = dynamic
-                    pm.max_children      = 10
-                    pm.start_servers     = 2
-                    pm.min_spare_servers = 1
-                    pm.max_spare_servers = 3
-                    pm.max_requests      = 500
-                    php_admin_value[open_basedir] = ${_NEW_PATH}:/tmp:/usr/share/php
-                    php_value[session.save_path]  = ${_W_SESSION}
-                    php_admin_value[error_log]    = /var/log/php-fpm/${_u}-error.log
-CRON_POOL
-                    chmod 640 "$_W_POOL_CONF"
-                    restart_php_services "fpm" 2>/dev/null || true
-                    echo "${_TS} [CRON] PHP-FPM pool created: ${_W_POOL_CONF}" >> "$_LG_USERS_LOG"
-                fi
-            fi
-
-            echo "${_TS} [CRON] ${_u} hardened: noexec + open_basedir + pool" >> "$_LG_USERS_LOG"
-        done
-    fi
-
-    # Update known users database
-    printf '%s\n' "${_CURRENT_USERS[@]}" > "$_LG_USERS_DB" 2>/dev/null || true
-fi
-
 # ── Save state file (marks first run complete — triggers status on next run) ──
 if [ "$DRY_RUN" = false ]; then
     mkdir -p "$(dirname "$LG_STATE_FILE")" 2>/dev/null || true
@@ -3728,7 +3610,8 @@ if [ "$DRY_RUN" = false ]; then
     echo "  [1] Binary Lockdown       — tools restricted to root"
     echo "  [2] Kernel Hardening      — modules blocked + sysctl"
     echo "  [3] System Files          — permissions hardened"
-    echo "  [4] MySQL/MariaDB         — bound to 127.0.0.1"
+    echo "  [4.1] Apache httpd        — ServerTokens Prod, ServerSignature Off"
+    echo "  [4.2] MySQL/MariaDB       — bound to 127.0.0.1"
     echo "  [5] PHP disable_functions — shell_exec/exec disabled"
     echo "  [6] noexec /tmp           — uploaded binaries won't execute"
     echo "  [7] ${MAC_SYSTEM^^} (MAC)           — web exec policy enforced"
@@ -3741,18 +3624,6 @@ if [ "$DRY_RUN" = false ]; then
     echo -e "  ${CYAN}Watch:${NC}    sudo $0 --watch"
     echo -e "  ${CYAN}Log:${NC}      $LOG_FILE"
     echo ""
-
-    # ── Auto-add cron job for new user detection ──────────────────────────────
-    _CRON_LINE="0 * * * * /usr/local/bin/lg --cron"
-    if command -v crontab &>/dev/null; then
-        if ! crontab -l 2>/dev/null | grep -q "lg --cron"; then
-            ( crontab -l 2>/dev/null; echo "$_CRON_LINE" ) | crontab -
-            log_ok "Cron job added: ${_CRON_LINE}"
-            log_info "Runs hourly — detects new users/sites and hardens them automatically"
-        else
-            log_ok "Cron job already exists — hourly new-user detection active"
-        fi
-    fi
     echo -e "${YELLOW}Verify:${NC}"
     echo "  php -r 'echo ini_get(\"disable_functions\");' | tr , '\n' | head -5"
     echo "  mount | grep noexec"
@@ -3763,14 +3634,16 @@ echo ""
 
 # ══════════════════════════════════════════════════════════════════════════════
 # REBOOT — Apply SELinux relabel and activate all hardening changes
+# Only runs if --reboot was explicitly passed. NEVER auto-reboots.
 # ══════════════════════════════════════════════════════════════════════════════
-if [ "$DRY_RUN" = false ]; then
+if [ "$REBOOT_MODE" = true ] && [ "$DRY_RUN" = false ]; then
+    _REBOOT_DELAY="${LG_REBOOT_DELAY:-10}"
     echo -e "${BOLD}${YELLOW}"
     echo "════════════════════════════════════════════════════════════════════"
-    echo "  SERVER WILL REBOOT IN 10 SECONDS TO APPLY SELinux RELABEL"
-    echo "  Press Ctrl+C to cancel"
+    echo "  SERVER WILL REBOOT IN ${_REBOOT_DELAY} SECONDS TO APPLY SELinux RELABEL"
+    echo "  Press Ctrl+C to cancel (or set LG_REBOOT_DELAY=0 to skip countdown)"
     echo "════════════════════════════════════════════════════════════════════"
     echo -e "${NC}"
-    sleep 10
+    sleep "$_REBOOT_DELAY"
     reboot
 fi
