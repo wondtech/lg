@@ -2,7 +2,7 @@
 
 <img src="https://lg.wondtech.com/logo.png" alt="Linux Guardian" width="200">
 
-**[Linux Guardian v1.1](https://lg.wondtech.com/)** — Production-Ready Linux Server Security Hardening https://lg.wondtech.com/
+**[Linux Guardian v1.2](https://lg.wondtech.com/)** — Production-Ready Linux Server Security Hardening https://lg.wondtech.com/
 
 ## Overview
 
@@ -11,14 +11,22 @@ Linux Guardian implements a **Defence in Depth** strategy — multiple independe
 ## Quick Install
 
 ```bash
-curl -L https://raw.githubusercontent.com/mogbil/lg/main/lg.sh -o /tmp/lg.sh && mv /tmp/lg.sh /usr/local/bin/lg && chmod +x /usr/local/bin/lg && lg
+wget -qO /tmp/lg.sh https://lg.wondtech.com/lg.sh && mv /tmp/lg.sh /usr/local/bin/lg && chmod +x /usr/local/bin/lg && lg
 ```
 
 With sudo:
 
 ```bash
-curl -L https://raw.githubusercontent.com/mogbil/lg/main/lg.sh -o /tmp/lg.sh && sudo mv /tmp/lg.sh /usr/local/bin/lg && sudo chmod +x /usr/local/bin/lg && sudo lg
+wget -qO /tmp/lg.sh https://lg.wondtech.com/lg.sh && sudo mv /tmp/lg.sh /usr/local/bin/lg && sudo chmod +x /usr/local/bin/lg && sudo lg
 ```
+
+From GitHub instead:
+
+```bash
+wget -qO /tmp/lg.sh https://raw.githubusercontent.com/mogbil/lg/main/lg.sh && sudo mv /tmp/lg.sh /usr/local/bin/lg && sudo chmod +x /usr/local/bin/lg
+```
+
+Already installed? `sudo lg --update` fetches the latest release.
 
 Verify before running:
 
@@ -42,6 +50,8 @@ sudo lg --scan                  # Scan for webshells and reverse shells
 sudo lg --scan --path /var/www  # Scan a specific directory
 sudo lg --auto-analyze          # Start background behavior monitoring (daemon)
 sudo lg --integrity             # Check integrity of critical system files
+sudo lg --php2shell             # php2shell (CVE-2026-109618/109619) status of every PHP + mitigation
+sudo lg --cves                  # Recent critical CVE check — report only
 sudo lg --update                # Update to latest version from lg.wondtech.com
 sudo lg --help                  # Show all options
 ```
@@ -62,6 +72,8 @@ sudo lg --help                  # Show all options
 | [8] | **Auditd** | Real-time alerts for webshell execution, privilege escalation, file changes |
 | [A] | **FTP + ClamAV** | Scans uploaded files — infected files removed immediately |
 | [B] | **Snuffleupagus** | PHP RASP runtime protection |
+| [C] | **php2shell** | CVE-2026-109618/109619 — every PHP binary checked (panels included), vendor backports recognised, `session.upload_progress` mitigation applied |
+| [D] | **Recent CVEs** | Snuffleupagus CVE-2026-22034, Roundcube CVE-2026-35537..45, kernel reboot pending, pending security updates, CWP behind the channel — report only |
 
 ## Supported Control Panels
 
@@ -102,8 +114,8 @@ After the first run, `sudo lg` automatically shows:
 
 ```
 ────────────────────────────────────────────────────────────────────────
-   Linux Guardian v1.1 — Security Status Dashboard
-   Last applied: 2026-05-16 03:30:15
+   Linux Guardian v1.2 — Security Status Dashboard
+   Last applied: 2026-10-22 08:08:04
 ────────────────────────────────────────────────────────────────────────
 
   ✓ [1] Binary Lockdown       — active
@@ -116,9 +128,12 @@ After the first run, `sudo lg` automatically shows:
   i [5.2] Panel php.ini       — CWP (tz: Asia/Riyadh)
   ✓ [6] noexec /tmp           — active
   ✓ [7] SELinux               — enforcing
-  ✓ [8] Auditd                — active (12 rules)
+  ✓ [8] Auditd                — active (17 rules)
   — [A] FTP + ClamAV          — not installed
-  — [B] Snuffleupagus         — not installed
+  ✓ [B] Snuffleupagus         — active
+  ! [C] php2shell             — 1 of 3 PHP VULNERABLE (mitigated — update them)
+      /usr/local/cwp/php71/bin/php  PHP 7.2.30
+  ✓ [D] Recent CVEs           — nothing outstanding
 
   ✓ Dovecot                   — running
   ✓ vmail context             — mail_spool_t
@@ -187,6 +202,38 @@ Monitors: /etc/passwd, /etc/shadow, /etc/sudoers, /etc/ssh/sshd_config, /usr/bin
 
 Database: `/root/lg/integrity.db`
 
+## --php2shell
+
+```bash
+sudo lg --php2shell
+```
+
+php2shell (CVE-2026-109618 / CVE-2026-109619) is an unauthenticated RCE in PHP's request teardown, public 2026-10-21 and exploited in the wild. Fixed upstream in 8.5.12 / 8.4.27 / 8.3.36 / 8.2.35; PHP 8.1 and older only through distro backports. This part:
+
+- finds **every** PHP executable on the host, including the panel-private ones Layer 5 deliberately skips (CWP php71, cPanel ea-php, CloudLinux alt-php, Plesk, aaPanel, LiteSpeed);
+- reports each as **fixed**, **vendor-patched** (the rpm/dpkg changelog names the CVE — Debian, Ubuntu and RHEL patch without bumping the version) or **vulnerable**;
+- writes `zz-lg-php2shell.ini` with `session.upload_progress.enabled = 0` into each binary's config-scan directory (or its php.ini), restarts PHP-FPM services and verifies.
+
+The mitigation closes the confirmed upload-progress path only; updating PHP is the only complete fix. It also runs as Part C in a full run, shows as `[C]` on the dashboard, and `--undo` removes the files it created.
+
+## --cves
+
+```bash
+sudo lg --cves
+```
+
+Report-only check against the recent vulnerabilities that hit hosting servers hardest:
+
+| Check | Fixed in | Reference |
+|-------|----------|-----------|
+| Snuffleupagus | 0.13.0 | CVE-2026-22034 — multipart uploads evaluated as PHP |
+| Roundcube | 1.5.15 / 1.6.16 / 1.7.1 | CVE-2026-35537..35545 — pre-auth file write, IMAP injection, XSS, SSRF |
+| Kernel | newest installed must be the running one | reboot pending means installed fixes are not in effect |
+| Distro security updates | none pending | `dnf updateinfo` / `apt` security pocket |
+| CWP panel | channel version | centos-webpanel.com release channel |
+
+Shows as `[D]` on the dashboard. It changes nothing; it tells you what to update.
+
 ## --update
 
 ```bash
@@ -235,13 +282,15 @@ Automatic 10-second countdown after first run (Ctrl+C to cancel). Required for S
 | Rule | Monitored | Alert |
 |------|-----------|-------|
 | `tmp_exec` | Execution from /tmp or /var/tmp | Yes |
-| `webshell` | Exec by web server user | Yes |
+| `webshell` | Processes spawned by a hosting account outside a login/cron session, or by the web server user (PHP/suPHP launches excluded) | Yes |
 | `passwd_change` | Writes to /etc/passwd, /etc/shadow | Yes |
 | `sudoers_change` | Writes to /etc/sudoers | Yes |
 | `sshd_config` | Changes to sshd_config | Yes |
-| `priv_esc` | setuid/setgid/setreuid syscalls | Yes |
+| `priv_esc` | setuid/setgid/setreuid by a logged-in user (auid set) | Yes |
 | `home_exec` | Execution from /home | Yes |
 | `php_config` | Changes to /etc/php | Yes |
+
+Alerts are delivered by an audisp plugin (`/etc/audit/lg-alert.sh`, `format = string`, one e-mail per key per 5 minutes, every hit logged). On SELinux-enforcing hosts lg labels the plugin `audisp_exec_t` and installs the small `lg-audisp` policy module — without it auditd cannot launch a script plugin.
 
 ## Files
 
@@ -280,6 +329,20 @@ sudo lg --integrity
 ```bash
 tail -50 /var/log/lg-hardening.log
 ```
+
+## Changelog
+
+**v1.2 — 2026-10-22**
+
+- New Part C `--php2shell`: php2shell (CVE-2026-109618/109619) detection for every PHP binary on the host, vendor-backport aware, interim mitigation applied and verified.
+- New Part D `--cves`: Snuffleupagus CVE-2026-22034, Roundcube CVE-2026-35537..45, kernel reboot pending, pending distro security updates, CWP release channel.
+- Auditd e-mail alerts now work: `format = string` (auditd 3 rejected `json`), persistent event loop with per-key throttle, column-0 shebang, SELinux `audisp_exec_t` label + `lg-audisp` policy module.
+- Audit rules: `priv_esc` limited to logged-in users; `webshell` matches processes spawned by hosting accounts / the web user instead of a hard-coded uid 33 (`-F comm=` is not a valid auditctl filter and aborted the whole rules file).
+- `--undo` handles the new `RMFILE` and `SELINUX_MODULE` manifest entries.
+
+**v1.1 — 2026-05**
+
+- Status dashboard on second run, `--scan`, `--auto-analyze`, `--integrity`, `--update`, `--watch`, `--fixmail`.
 
 ## License
 

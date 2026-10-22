@@ -1,6 +1,6 @@
 #!/bin/bash
 # ══════════════════════════════════════════════════════════════════════════════
-# Linux Guardian v1.1 — Production-Ready Server Security Hardening
+# Linux Guardian v1.2 — Production-Ready Server Security Hardening
 # By Mogbil Sourketti WondTech.com | info@wondtech.com
 #
 # Security Layers (Defence in Depth):
@@ -16,6 +16,8 @@
 #   [8] Auditd                — Real-time monitoring and alerting
 #   [A] FTP + ClamAV          — Scan uploaded files for malware
 #   [B] Snuffleupagus         — PHP RASP
+#   [C] php2shell             — CVE-2026-109618/109619: find every PHP, report fixed/vulnerable, apply mitigation
+#   [D] Recent CVEs           — Snuffleupagus, Roundcube, kernel reboot, pending security updates, CWP version
 #
 # Usage:
 #   sudo lg                  Interactive — recommended for first run
@@ -28,6 +30,8 @@
 #   sudo lg --watch          Watch for new sites and harden automatically
 #   sudo lg --fixmail        Fix Dovecot/vmail SELinux contexts
 #   sudo lg --scan [--path]  Scan for webshells (optionally under a specific path)
+#   sudo lg --php2shell      Part C only — php2shell status of every PHP on the host + mitigation
+#   sudo lg --cves           Part D only — check the host against the recent critical CVEs (report only)
 #   sudo lg --auto-analyze   Start background behavior monitoring (daemon)
 #   sudo lg --integrity      Check integrity of critical system files
 #   sudo lg --update         Update to latest version from lg.wondtech.com
@@ -41,6 +45,8 @@ RUN_MODE="interactive"
 DRY_RUN=false
 UNDO_MODE=false
 FIXMAIL_MODE=false
+PHP2SHELL_MODE=false
+CVES_MODE=false
 SCAN_MODE=false
 AUTO_ANALYZE_MODE=false
 INTEGRITY_MODE=false
@@ -120,7 +126,7 @@ print_banner() {
     echo "   ▐▙▄▄▖▗▄█▄▖▐▌  ▐▌▝▚▄▞▘▗▞▘▝▚▖  ▝▚▄▞▘▝▚▄▞▘▐▌ ▐▌▐▌ ▐▌▐▙▄▄▀▗▄█▄▖▐▌ ▐▌▐▌"
     echo ""
     echo "   ╔══════════════════════════════════════════════════════════════════╗"
-    echo "   ║  Linux Server Security Hardening  v1.1  |  WondTech.com          ║"
+    echo "   ║  Linux Server Security Hardening  v1.2  |  WondTech.com          ║"
     echo "   ║  One Script · Defence in Depth · Zero Compromise                 ║"
     echo "   ╚══════════════════════════════════════════════════════════════════╝"
     echo "────────────────────────────────────────────────────────────────────────"
@@ -1055,6 +1061,291 @@ EOF
 # ══════════════════════════════════════════════════════════════════════════════
 # FUNCTION: _lg_status — Security status dashboard
 # ══════════════════════════════════════════════════════════════════════════════
+# ══════════════════════════════════════════════════════════════════════════════
+# PART C — php2shell (CVE-2026-109618 / CVE-2026-109619)
+# ══════════════════════════════════════════════════════════════════════════════
+# Unauthenticated RCE in PHP's request teardown, public 2026-10-21 and exploited
+# in the wild. Fixed upstream in 8.5.12 / 8.4.27 / 8.3.36 / 8.2.35; 8.1 and
+# older get no upstream release — only distro backports, which Debian/Ubuntu/
+# RHEL ship WITHOUT bumping the version, so the vendor changelog is consulted.
+# Layer 5 deliberately skips panel-private PHP (CWP php71, cPanel ea-php*,
+# CloudLinux alt-php, Plesk); this part covers every PHP executable found.
+# The mitigation closes the confirmed session-upload-progress path only;
+# updating PHP is the only complete fix.
+PHP2SHELL_FIXED="8.5:8.5.12 8.4:8.4.27 8.3:8.3.36 8.2:8.2.35"
+PHP2SHELL_INI="zz-lg-php2shell.ini"
+
+# every PHP executable on the host (resolved, de-duplicated)
+_php2shell_bins() {
+    local b
+    for b in /usr/bin/php /usr/bin/php-cgi /usr/sbin/php-fpm /usr/bin/php[5-8]* /usr/sbin/php-fpm[5-8]* \
+             /usr/local/bin/php /usr/local/bin/php-cgi /usr/local/sbin/php-fpm /usr/local/php*/bin/php \
+             /usr/local/cwp/php*/bin/php /opt/alt/php*/usr/bin/php /opt/cpanel/ea-php*/root/usr/bin/php \
+             /opt/plesk/php/*/bin/php /opt/php*/bin/php /www/server/php/*/bin/php /opt/remi/php*/root/usr/bin/php \
+             /usr/local/lsws/lsphp*/bin/php /usr/local/lsws/lsphp*/bin/lsphp; do
+        [ -f "$b" ] && [ -x "$b" ] && readlink -f "$b"
+    done 2>/dev/null | sort -u
+}
+
+# phpinfo as plain text (php-cgi prints HTML when not in a CGI request)
+_php2shell_info() { "$1" -i 2>/dev/null | sed 's/<[^>]*>/ /g'; }
+
+# prints "<version>|<state>"; state = fixed | vendor-patched | vulnerable | unknown
+_php2shell_state() {
+    local bin="$1" ver br fixed pkg
+    ver=$("$bin" -n -v 2>/dev/null | sed -n 's/^PHP \([0-9][0-9.]*\).*/\1/p' | head -1)
+    [ -n "$ver" ] || { echo "?|unknown"; return 0; }
+    if command -v rpm >/dev/null 2>&1 && pkg=$(rpm -qf "$bin" 2>/dev/null) && [[ "$pkg" != *"not owned"* ]]; then
+        rpm -q --changelog "$pkg" 2>/dev/null | grep -q "CVE-2026-10961[89]" \
+            && { echo "$ver|vendor-patched"; return 0; }
+    elif command -v dpkg >/dev/null 2>&1 && pkg=$(dpkg -S "$bin" 2>/dev/null | head -1 | cut -d: -f1) && [ -n "$pkg" ]; then
+        zgrep -q "CVE-2026-10961[89]" "/usr/share/doc/${pkg}/changelog.Debian.gz" 2>/dev/null \
+            && { echo "$ver|vendor-patched"; return 0; }
+    fi
+    br="${ver%.*}"
+    for fixed in $PHP2SHELL_FIXED; do
+        [ "${fixed%%:*}" = "$br" ] || continue
+        if [ "$(printf '%s\n%s\n' "${fixed#*:}" "$ver" | sort -V | head -1)" = "${fixed#*:}" ]; then
+            echo "$ver|fixed"
+        else
+            echo "$ver|vulnerable"
+        fi
+        return 0
+    done
+    echo "$ver|vulnerable"        # 8.1 and older: no upstream fix exists
+}
+
+# the release that fixes this binary's branch, for the advice line
+_php2shell_fixed_for() {
+    local br="${1%.*}" fixed
+    for fixed in $PHP2SHELL_FIXED; do [ "${fixed%%:*}" = "$br" ] && { echo "${fixed#*:}"; return 0; }; done
+    echo "a supported branch (8.2.35+) or a vendor-patched package"
+}
+
+# where this binary reads extra .ini files ("dir|path"), else its php.ini ("ini|path")
+_php2shell_target() {
+    local bin="$1" info scan ini
+    info=$(_php2shell_info "$bin")
+    scan=$(printf '%s\n' "$info" | grep -m1 "Scan this dir for additional .ini files" | sed -E 's/.*\.ini files[ =>]*//; s/[[:space:]]*$//')
+    if [ -n "$scan" ] && [ "$scan" != "(none)" ] && [ -d "$scan" ]; then echo "dir|$scan"; return 0; fi
+    ini=$(printf '%s\n' "$info" | grep -m1 "Loaded Configuration File" | sed -E 's/.*Configuration File[ =>]*//; s/[[:space:]]*$//')
+    if [ -n "$ini" ] && [ "$ini" != "(none)" ] && [ -f "$ini" ]; then echo "ini|$ini"; return 0; fi
+    echo "none|"
+}
+
+# is the mitigation live for this binary?
+_php2shell_mitigated() {
+    # capture first, then test: with pipefail an early-closing grep -q makes
+    # the whole pipeline report failure even when it matched
+    local _line
+    _line=$(_php2shell_info "$1" | grep -m1 "session.upload_progress.enabled" || true)
+    printf '%s' "$_line" | grep -qiE 'enabled[ =>]*(off|0)'
+}
+
+_lg_php2shell() {
+    local bins bin ver st kind path vuln=0 fixed=0 applied=0 seen=" " svc
+    # standalone (--php2shell) runs before the main initialisation block
+    TIMESTAMP="${TIMESTAMP:-$(date +%Y%m%d_%H%M%S)}"
+    BACKUP_DIR="${BACKUP_DIR:-/root/lg/backups}"
+    UNDO_MANIFEST="${UNDO_MANIFEST:-${BACKUP_DIR}/undo_manifest_${TIMESTAMP}.txt}"
+    [ "$DRY_RUN" = true ] || mkdir -p "$BACKUP_DIR" 2>/dev/null || true
+
+    mapfile -t bins < <(_php2shell_bins)
+    if [ ${#bins[@]} -eq 0 ]; then log_warn "No PHP executable found — nothing to do"; return 0; fi
+    log_info "php2shell (CVE-2026-109618 / CVE-2026-109619) — ${#bins[@]} PHP executable(s):"
+    for bin in "${bins[@]}"; do
+        IFS='|' read -r ver st <<< "$(_php2shell_state "$bin")"
+        case "$st" in
+            fixed|vendor-patched) fixed=$((fixed+1)); log_ok "  ${bin}  PHP ${ver}  (${st})" ;;
+            *) vuln=$((vuln+1)); log_warn "  ${bin}  PHP ${ver}  VULNERABLE — update to $(_php2shell_fixed_for "$ver")" ;;
+        esac
+    done
+    echo ""
+    log_info "Mitigation: session.upload_progress.enabled = 0 — closes the confirmed upload-progress path; updating is the only complete fix"
+
+    if [ "$DRY_RUN" = true ]; then
+        for bin in "${bins[@]}"; do
+            IFS='|' read -r kind path <<< "$(_php2shell_target "$bin")"
+            case "$kind" in
+                dir) log_dry "  ${path}/${PHP2SHELL_INI}  (for $bin)" ;;
+                ini) log_dry "  ${path}: session.upload_progress.enabled = 0  (for $bin)" ;;
+                *)   log_dry "  ${bin}: no scan dir / php.ini — manual" ;;
+            esac
+        done
+        return 0
+    fi
+    if [ "$RUN_MODE" != "auto" ] && [ -t 0 ]; then
+        read -r -p "  Apply the mitigation to all ${#bins[@]} PHP install(s)? [Y/n]: " -n 1; echo ""
+        [[ $REPLY =~ ^[Nn]$ ]] && { log_skip "php2shell mitigation skipped"; return 0; }
+    fi
+
+    for bin in "${bins[@]}"; do
+        IFS='|' read -r kind path <<< "$(_php2shell_target "$bin")"
+        case "$kind" in
+            dir)
+                [[ "$seen" == *" ${path} "* ]] && continue; seen="${seen}${path} "
+                if [ -f "${path}/${PHP2SHELL_INI}" ] && grep -q "upload_progress.enabled *= *0" "${path}/${PHP2SHELL_INI}"; then
+                    log_info "  already present: ${path}/${PHP2SHELL_INI}"; continue
+                fi
+                printf '; Linux Guardian — php2shell (CVE-2026-109618 / CVE-2026-109619) mitigation\n; Closes the confirmed session-upload-progress path. Updating PHP is the fix.\nsession.upload_progress.enabled = 0\n' \
+                    > "${path}/${PHP2SHELL_INI}"
+                chmod 644 "${path}/${PHP2SHELL_INI}"
+                echo "RMFILE:${path}/${PHP2SHELL_INI}" >> "$UNDO_MANIFEST"
+                applied=$((applied+1)); log_ok "  ${path}/${PHP2SHELL_INI}"
+                ;;
+            ini)
+                [[ "$seen" == *" ${path} "* ]] && continue; seen="${seen}${path} "
+                backup_file "$path" "php2shell"
+                if grep -qE '^\s*;?\s*session\.upload_progress\.enabled\s*=' "$path"; then
+                    sed -i -E 's|^\s*;?\s*session\.upload_progress\.enabled\s*=.*|session.upload_progress.enabled = 0|' "$path"
+                else
+                    printf '\n; Linux Guardian — php2shell (CVE-2026-109618 / CVE-2026-109619) mitigation\nsession.upload_progress.enabled = 0\n' >> "$path"
+                fi
+                applied=$((applied+1)); log_ok "  ${path}: session.upload_progress.enabled = 0"
+                ;;
+            *) log_warn "  ${bin}: no scan dir and no php.ini — set session.upload_progress.enabled = 0 by hand" ;;
+        esac
+    done
+
+    # the setting is read at process start: restart every FPM (sites and panels);
+    # CGI/suPHP picks it up on the next request, mod_php needs the web server
+    if [ "$applied" -gt 0 ]; then
+        while IFS= read -r svc; do
+            [ -n "$svc" ] || continue
+            systemctl restart "$svc" 2>/dev/null && log_ok "  restarted: $svc" || log_warn "  restart failed: $svc"
+        done < <(systemctl list-units --type=service --state=active --no-legend 2>/dev/null \
+                   | awk '{print $1}' | grep -Ei 'php.*fpm|phpfpm|lshttpd|lsws' || true)
+        [ "$(detect_php_mode 2>/dev/null || true)" = "mod_php" ] && restart_active_webserver
+    fi
+
+    echo ""
+    for bin in "${bins[@]}"; do
+        _php2shell_mitigated "$bin" && log_ok "  verified off: $bin" || log_warn "  NOT applied (check scan dir / php.ini): $bin"
+    done
+    log_info "php2shell: ${fixed} fixed, ${vuln} vulnerable, mitigation written to ${applied} target(s)"
+    [ "$vuln" -gt 0 ] && log_warn "Vulnerable PHP remains — the mitigation is interim only; update or rebuild those binaries"
+    return 0
+}
+
+# ══════════════════════════════════════════════════════════════════════════════
+# PART D — Recent critical CVEs (report only)
+# ══════════════════════════════════════════════════════════════════════════════
+# Checks the host against the 2026 vulnerabilities that hit hosting servers
+# hardest, beyond php2shell (Part C). It only reports and says what to update;
+# it never swaps packages or binaries behind your back.
+#   Snuffleupagus < 0.13.0            CVE-2026-22034       multipart uploads evaluated as PHP
+#   Roundcube < 1.5.15/1.6.16/1.7.1   CVE-2026-35537..45   pre-auth file write, IMAP injection, XSS, SSRF
+#   Kernel newest != running          reboot pending       installed fixes are not in effect
+#   Pending distro security updates   dnf/yum/apt          e.g. openssl, apr-util, kernel
+#   CWP panel behind the channel      centos-webpanel.com  panel RCE/auth fixes ship this way
+CVE_ISSUES=0
+CVE_LIST=""
+
+# $1 < $2 (dotted versions)
+_cve_lt() { [ "$1" != "$2" ] && [ "$(printf '%s\n%s\n' "$1" "$2" | sort -V | head -1)" = "$1" ]; }
+
+# _cve_report <ok|warn|info> <text>  — quiet mode (dashboard) only counts and collects
+_cve_report() {
+    local lvl="$1"; shift
+    case "$lvl" in
+        warn) CVE_ISSUES=$((CVE_ISSUES+1)); CVE_LIST="${CVE_LIST}      $*\\n"
+              [ "${_CVE_QUIET:-0}" = 1 ] || log_warn "  $*" ;;
+        ok)   [ "${_CVE_QUIET:-0}" = 1 ] || log_ok   "  $*" ;;
+        *)    [ "${_CVE_QUIET:-0}" = 1 ] || log_info "  $*" ;;
+    esac
+}
+
+_lg_cves() {
+    local _q="${1:-}" bin v p ver br need inst latest run newest n names pkg
+    [ "$_q" = quiet ] && _CVE_QUIET=1 || _CVE_QUIET=0
+    CVE_ISSUES=0; CVE_LIST=""
+
+    # ── Snuffleupagus — CVE-2026-22034 (fixed in 0.13.0) ───────────────────────
+    local _sp_seen=0
+    while IFS= read -r bin; do
+        [ -n "$bin" ] || continue
+        "$bin" -r 'exit(0);' >/dev/null 2>&1 || continue            # php-fpm has no -r
+        v=$("$bin" -r 'echo phpversion("snuffleupagus") ?: "";' 2>/dev/null)
+        [ -n "$v" ] || continue
+        _sp_seen=1
+        if _cve_lt "$v" "0.13.0"; then
+            _cve_report warn "Snuffleupagus ${v} on ${bin} — CVE-2026-22034, rebuild/upgrade to 0.13.0+"
+        else
+            _cve_report ok "Snuffleupagus ${v} on ${bin} — CVE-2026-22034 fixed"
+        fi
+    done < <(_php2shell_bins)
+    [ "$_sp_seen" = 1 ] || _cve_report info "Snuffleupagus not loaded in any PHP — CVE-2026-22034 not applicable"
+
+    # ── Roundcube — CVE-2026-35537..35545 ───────────────────────────────────────
+    local _rc_seen=0
+    for p in /usr/local/cwpsrv/var/services/roundcube /usr/share/roundcube /usr/share/roundcubemail \
+             /var/www/roundcube /var/www/html/roundcube /var/lib/roundcube /usr/local/cpanel/base/3rdparty/roundcube \
+             /usr/share/psa-roundcube /www/server/roundcube /opt/roundcube /var/www/roundcubemail; do
+        [ -f "$p/program/include/iniset.php" ] || continue
+        _rc_seen=1
+        ver=$(grep -m1 -oE "RCMAIL_VERSION'?,?\s*'[0-9][0-9.]*" "$p/program/include/iniset.php" | grep -oE '[0-9][0-9.]*$')
+        br="${ver%.*}"
+        case "$br" in
+            1.5) need=1.5.15 ;; 1.6) need=1.6.16 ;; 1.7) need=1.7.1 ;; *) need=1.6.16 ;;
+        esac
+        if [ -z "$ver" ] || _cve_lt "$ver" "$need"; then
+            _cve_report warn "Roundcube ${ver:-?} at ${p} — CVE-2026-35537..35545, update to ${need}+"
+        else
+            _cve_report ok "Roundcube ${ver} at ${p} — fixed (${need}+)$([ "$br" = 1.5 ] && echo '; 1.5 branch is end-of-life, plan the move to 1.6')"
+        fi
+    done
+    [ "$_rc_seen" = 1 ] || _cve_report info "Roundcube not found — CVE-2026-3553x not applicable"
+
+    # ── Kernel: newest installed vs running ─────────────────────────────────────
+    run=$(uname -r); newest=""
+    if command -v rpm >/dev/null 2>&1; then
+        newest=$(rpm -q kernel --last 2>/dev/null | head -1 | awk '{print $1}' | sed 's/^kernel-//')
+    fi
+    [ -n "$newest" ] || newest=$(ls /boot/vmlinuz-* 2>/dev/null | sed 's|.*/vmlinuz-||' | grep -v rescue | sort -V | tail -1)
+    if [ -f /var/run/reboot-required ] || { [ -n "$newest" ] && [ "$newest" != "$run" ]; }; then
+        _cve_report warn "Kernel ${newest:-?} installed but ${run} running — reboot to activate the fixes"
+    else
+        _cve_report ok "Kernel ${run} — newest installed is running"
+    fi
+
+    # ── Pending distro security updates ─────────────────────────────────────────
+    n=0; names=""
+    if command -v dnf >/dev/null 2>&1; then
+        names=$(dnf -q updateinfo list --security 2>/dev/null | awk '/\/Sec\.|Security/ {print $NF}' | sed -E 's/-[0-9][^ ]*$//' | sort -u | head -8 | tr '\n' ' ')
+    elif command -v yum >/dev/null 2>&1; then
+        names=$(yum -q updateinfo list security 2>/dev/null | awk '/\/Sec\.|Security/ {print $NF}' | sed -E 's/-[0-9][^ ]*$//' | sort -u | head -8 | tr '\n' ' ')
+    elif command -v apt-get >/dev/null 2>&1; then
+        names=$(apt-get -s upgrade 2>/dev/null | awk '/^Inst / && /-security/ {print $2}' | sort -u | head -8 | tr '\n' ' ')
+    fi
+    n=$(printf '%s' "$names" | wc -w)
+    if [ "$n" -gt 0 ]; then
+        _cve_report warn "${n} pending security update(s): ${names}— apply them"
+    else
+        _cve_report ok "No pending distro security updates"
+    fi
+
+    # ── CWP panel version vs the live channel ───────────────────────────────────
+    if [ -f /usr/local/cwpsrv/htdocs/resources/admin/include/version.php ]; then
+        inst=$(grep -oE '[0-9]+\.[0-9]+(\.[0-9]+)*' /usr/local/cwpsrv/htdocs/resources/admin/include/version.php | head -1)
+        latest=$(curl -s --max-time 6 http://centos-webpanel.com/webpanel/versions/el7.txt 2>/dev/null | tr -d '\r' | tail -1 | awk '{print $1}')
+        case "$latest" in
+            ''|*[!0-9.]*) _cve_report info "CWP ${inst:-?} — version channel unreachable, could not compare" ;;
+            *) if [ -n "$inst" ] && _cve_lt "$inst" "$latest"; then
+                   _cve_report warn "CWP ${inst} installed, ${latest} available — panel updates carry security fixes"
+               else
+                   _cve_report ok "CWP ${inst} — up to date (channel: ${latest})"
+               fi ;;
+        esac
+    fi
+
+    if [ "$_CVE_QUIET" = 0 ]; then
+        echo ""
+        if [ "$CVE_ISSUES" -eq 0 ]; then log_ok "Recent CVEs: nothing outstanding"
+        else log_warn "Recent CVEs: ${CVE_ISSUES} item(s) need attention (see above)"; fi
+    fi
+    return 0
+}
+
 _lg_status() {
     local _lg_status_old_flags="$-"
     set +euo pipefail
@@ -1064,7 +1355,7 @@ _lg_status() {
     echo ""
     echo -e "${BOLD}${CYAN}"
     echo "────────────────────────────────────────────────────────────────────────"
-    echo "   Linux Guardian v1.1 — Security Status Dashboard"
+    echo "   Linux Guardian v1.2 — Security Status Dashboard"
     printf "   Last applied: %s\n" "$LAST_RUN"
     echo "────────────────────────────────────────────────────────────────────────"
     echo -e "${NC}"
@@ -1204,6 +1495,39 @@ _lg_status() {
         echo -e "  ${GREEN}✓${NC} [B] Snuffleupagus         — active"
     else
         echo -e "  ${CYAN}—${NC} [B] Snuffleupagus         — not installed"
+    fi
+
+    # [C] php2shell — every PHP executable, panels included
+    local _c_total=0 _c_bad=0 _c_mit=0 _c_list="" _cb _cv _cs
+    while IFS= read -r _cb; do
+        [ -n "$_cb" ] || continue
+        _c_total=$((_c_total+1))
+        IFS='|' read -r _cv _cs <<< "$(_php2shell_state "$_cb")"
+        case "$_cs" in
+            fixed|vendor-patched) ;;
+            *) _c_bad=$((_c_bad+1)); _c_list="${_c_list}      ${_cb}  PHP ${_cv}\n" ;;
+        esac
+        _php2shell_mitigated "$_cb" && _c_mit=$((_c_mit+1))
+    done < <(_php2shell_bins)
+    if [ "$_c_total" -eq 0 ]; then
+        echo -e "  ${CYAN}—${NC} [C] php2shell             — no PHP found"
+    elif [ "$_c_bad" -eq 0 ]; then
+        echo -e "  ${GREEN}✓${NC} [C] php2shell             — all ${_c_total} PHP fixed · mitigation on ${_c_mit}/${_c_total}"
+    elif [ "$_c_mit" -eq "$_c_total" ]; then
+        echo -e "  ${YELLOW}!${NC} [C] php2shell             — ${_c_bad} of ${_c_total} PHP VULNERABLE (mitigated — update them)"
+        printf "%b" "$_c_list"
+    else
+        echo -e "  ${RED}✗${NC} [C] php2shell             — ${_c_bad} of ${_c_total} PHP VULNERABLE, mitigation on ${_c_mit}/${_c_total} — run: lg --php2shell"
+        printf "%b" "$_c_list"
+    fi
+
+    # [D] Recent CVEs (report only)
+    _lg_cves quiet
+    if [ "$CVE_ISSUES" -eq 0 ]; then
+        echo -e "  ${GREEN}✓${NC} [D] Recent CVEs           — nothing outstanding"
+    else
+        echo -e "  ${RED}✗${NC} [D] Recent CVEs           — ${CVE_ISSUES} item(s) need attention — run: lg --cves"
+        printf "%b" "$CVE_LIST"
     fi
 
     # Dovecot status
@@ -1489,10 +1813,14 @@ _lg_help() {
     echo "   [8] Auditd                Real-time alerts for webshells + privesc"
     echo "   [A] FTP + ClamAV          Scan uploaded files for malware"
     echo "   [B] Snuffleupagus         PHP RASP runtime protection"
+    echo "   [C] php2shell             CVE-2026-109618/109619 — every PHP checked, mitigation applied"
+    echo "   [D] Recent CVEs           Snuffleupagus, Roundcube, kernel reboot, security updates, CWP version"
     echo ""
     echo -e "${BOLD}EXAMPLES:${NC}"
     echo "   sudo lg                  # First run — interactive"
     echo "   sudo lg --dry-run        # Preview changes safely"
+    echo "   sudo lg --php2shell      # php2shell status of every PHP + mitigation only"
+    echo "   sudo lg --cves           # recent critical CVE check only (report, no changes)"
     echo "   sudo lg --auto           # Apply all layers without prompts"
     echo "   sudo lg --force          # Re-apply all layers"
     echo "   sudo lg --fixmail        # Fix Dovecot/vmail SELinux only"
@@ -1533,6 +1861,8 @@ for arg in "$@"; do
         --reboot)         REBOOT_MODE=true ;;
         --fixmail)        FIXMAIL_MODE=true ;;
         --scan)           SCAN_MODE=true ;;
+        --php2shell)      PHP2SHELL_MODE=true ;;
+        --cves)           CVES_MODE=true ;;
         --auto-analyze)   AUTO_ANALYZE_MODE=true ;;
         --integrity)      INTEGRITY_MODE=true ;;
         --update)         UPDATE_MODE=true ;;
@@ -1544,6 +1874,8 @@ done
 if [ "$HELP_MODE" = true ];         then print_banner; _lg_help; exit 0; fi
 if [ "$UPDATE_MODE" = true ];       then _lg_update;       exit 0; fi
 if [ "$FIXMAIL_MODE" = true ];      then _lg_fixmail;      exit 0; fi
+if [ "$PHP2SHELL_MODE" = true ];    then print_banner; _lg_php2shell; exit 0; fi
+if [ "$CVES_MODE" = true ];         then print_banner; _lg_cves;      exit 0; fi
 if [ "$AUTO_ANALYZE_MODE" = true ]; then _lg_auto_analyze; exit 0; fi
 if [ "$INTEGRITY_MODE" = true ];    then _lg_integrity;    exit 0; fi
 if [ "$SCAN_MODE" = true ]; then
@@ -1607,7 +1939,9 @@ if [[ "$RUN_MODE" == "interactive" ]] && [ "$DRY_RUN" = false ] && [ "$UNDO_MODE
     echo -e "  ${CYAN}[INFO]${NC}    PHP date.timezone — detected: ${BOLD}${PHP_TIMEZONE}${NC}"
     echo -e "  ${CYAN}[INFO]${NC}    Examples: Asia/Riyadh  Asia/Dubai  UTC  America/New_York"
     echo ""
-    read -r -p "  Enter timezone (press Enter to keep [${PHP_TIMEZONE}]): " _INPUT_TZ
+    if [ "$RUN_MODE" = "auto" ] || [ "$DRY_RUN" = true ] || [ ! -t 0 ]; then _INPUT_TZ=""; else
+        read -r -p "  Enter timezone (press Enter to keep [${PHP_TIMEZONE}]): " _INPUT_TZ
+    fi
     if [ -n "$_INPUT_TZ" ]; then
         if [ -f "/usr/share/zoneinfo/${_INPUT_TZ}" ]; then
             PHP_TIMEZONE="$_INPUT_TZ"
@@ -1693,6 +2027,12 @@ if [ "$UNDO_MODE" = true ]; then
                 rm -f "$REST" || true
                 systemctl restart auditd 2>/dev/null || service auditd restart 2>/dev/null || true
                 log_ok "Removed audit rules: $REST"
+                ;;
+            SELINUX_MODULE)
+                semodule -r "$REST" 2>/dev/null && log_ok "Removed SELinux module: $REST" || true
+                ;;
+            RMFILE)
+                rm -f "$REST" 2>/dev/null && log_ok "Removed: $REST" || true
                 ;;
             NSPAWN_SERVICE)
                 systemctl stop    "$REST" 2>/dev/null || true
@@ -1942,7 +2282,9 @@ else
         done
         echo "    [A] All"
         echo ""
-        read -r -p "  Choice (default: A): " _HTTPD_CHOICE
+        if [ "$RUN_MODE" = "auto" ] || [ "$DRY_RUN" = true ] || [ ! -t 0 ]; then _HTTPD_CHOICE=A; else
+            read -r -p "  Choice (default: A): " _HTTPD_CHOICE
+        fi
         case "${_HTTPD_CHOICE:-A}" in
             [Aa]|"") _SELECTED_CONFS=("${_HTTPD_CONFS[@]}") ;;
             [0-9]*)
@@ -2104,7 +2446,9 @@ else
         PHP_SKIP=false
     else
         echo "  Select php.ini files:  a=all  s=skip  1,3=specific"
-        read -r -p "  Your choice: " choice
+        if [ "$RUN_MODE" = "auto" ] || [ "$DRY_RUN" = true ] || [ ! -t 0 ]; then choice=a; else
+            read -r -p "  Your choice: " choice
+        fi
         echo ""
         if [[ "$choice" =~ ^[sS]$ ]]; then
             PHP_SKIP=true
@@ -3093,9 +3437,26 @@ else
     else
         mkdir -p /etc/audit/rules.d
 
-        WWWUID=$(id -u www-data 2>/dev/null \
-              || id -u apache   2>/dev/null \
-              || echo "33")
+        # ── webshell rule inputs ──────────────────────────────────────────
+        # auditctl has no comm= filter, the exe= field of an execve event is
+        # the NEW image, and a rule may carry only ONE exe filter. So:
+        #  (A) a hosting account (uid>=1000) running anything outside a login /
+        #      cron session (auid=unset) — i.e. spawned by the web server —
+        #      except the PHP interpreter launch itself (suPHP/CGI do that
+        #      on every request);
+        #  (B) the web server user (nobody / www-data / apache) running
+        #      anything except suPHP (or the PHP binary where there is no suPHP).
+        WWWUSER=$(ps -eo user=,comm= 2>/dev/null | awk '$2 ~ /^(httpd|apache2|nginx|litespeed|lshttpd)$/ && $1 != "root" {print $1; exit}')
+        WWWUID=$( { [ -n "$WWWUSER" ] && id -u "$WWWUSER" 2>/dev/null; } \
+              || id -u www-data 2>/dev/null || id -u apache 2>/dev/null || id -u nobody 2>/dev/null || echo 65534)
+        PHP_CGI=""; for b in /usr/local/bin/php-cgi /usr/bin/php-cgi /opt/alt/php*/usr/bin/php-cgi /usr/local/bin/php /usr/bin/php; do
+            [ -x "$b" ] && { PHP_CGI=$(readlink -f "$b"); break; }; done
+        SUPHP="";   for b in /usr/local/sbin/suphp /usr/sbin/suphp /usr/lib/apache2/suexec /usr/sbin/suexec; do
+            [ -x "$b" ] && { SUPHP=$(readlink -f "$b"); break; }; done
+        WEB_EXCL=${SUPHP:-$PHP_CGI}
+        WEBSHELL_RULES="        -a always,exit -F arch=b64 -S execve -F auid=unset -F uid>=1000 -F uid!=${WWWUID}${PHP_CGI:+ -F exe!=$PHP_CGI} -k webshell
+        -a always,exit -F arch=b64 -S execve -F auid=unset -F uid=${WWWUID}${WEB_EXCL:+ -F exe!=$WEB_EXCL} -k webshell
+"
 
         cat > "$AUDIT_RULES" << EOF
         ## Linux Guardian Audit Rules — ${TIMESTAMP}
@@ -3105,8 +3466,9 @@ else
         -a always,exit -F arch=b32 -S execve -F dir=/tmp     -k tmp_exec
         -a always,exit -F arch=b64 -S execve -F dir=/var/tmp -k tmp_exec
 
-        # PHP/Apache exec (web user uid=${WWWUID})
-        -a always,exit -F arch=b64 -S execve -F uid=${WWWUID} -k webshell
+        # PHP/web spawning a process (webshell / RCE) — see "webshell rule
+        # inputs" above. PHP mail() execs sendmail and will show up here too.
+${WEBSHELL_RULES}
 
         # Critical file modifications
         -w /etc/passwd          -p wa -k passwd_change
@@ -3117,10 +3479,11 @@ else
         -w /etc/crontab         -p wa -k cron_change
         -w /etc/cron.d          -p wa -k cron_change
 
-        # Privilege escalation
-        -a always,exit -F arch=b64 -S setuid   -k priv_esc
-        -a always,exit -F arch=b64 -S setgid   -k priv_esc
-        -a always,exit -F arch=b64 -S setreuid -k priv_esc
+        # Privilege escalation by a logged-in user (auid set). Without the
+        # auid filter every setuid(2) by dbus/sshd/cron/suPHP fires an alert.
+        -a always,exit -F arch=b64 -S setuid   -F auid>=1000 -F auid!=unset -k priv_esc
+        -a always,exit -F arch=b64 -S setgid   -F auid>=1000 -F auid!=unset -k priv_esc
+        -a always,exit -F arch=b64 -S setreuid -F auid>=1000 -F auid!=unset -k priv_esc
 
         # Exec from home directories
         -a always,exit -F arch=b64 -S execve -F dir=/home -k home_exec
@@ -3132,44 +3495,123 @@ EOF
         echo "AUDITD_RULE:${AUDIT_RULES}" >> "$UNDO_MANIFEST"
 
         # ── Email alert script — triggered by audisp ──────────────────────────
+        # auditd execs this path directly, so the shebang must be at column 0
+        # (the heredoc body is deliberately NOT indented). auditd starts it once
+        # and streams every event to stdin in "string" format, e.g.
+        #   type=SYSCALL msg=audit(…): … pid=123 … comm="php-cgi" … key="webshell"
+        # so it must loop for the lifetime of auditd — exiting makes auditd
+        # disable the plugin. Emails are throttled per key (THROTTLE seconds);
+        # every hit is still written to the log.
         AUDISP_ALERT="/etc/audit/lg-alert.sh"
-        # FIX: was using `read -r -t 1 LINE` — only processes 1 event then
-        # exits, losing all subsequent events in the same audisp callback.
-        # Now loops until stdin is closed (or up to MAX_EVENTS events).
         cat > "$AUDISP_ALERT" << ALERTEOF
-        #!/bin/bash
-        # Linux Guardian — Auditd email alert
-        # Called by audispd when a monitored rule fires
-        ALERT_EMAIL="${ALERT_EMAIL}"
-        LOG="${LOG_FILE}"
-        MAX_EVENTS=100
+#!/bin/bash
+# Linux Guardian — auditd email alert (audisp plugin, format = string)
+ALERT_EMAIL="${ALERT_EMAIL}"
+LOG="${LOG_FILE}"
+THROTTLE=300
+STATE=/run/lg-alert; mkdir -p "\$STATE" 2>/dev/null
+_ALERT_KEYS='webshell|tmp_exec|priv_esc|passwd_change|shadow_change|sudoers_change|home_exec'
 
-        # Only alert on our rule keys
-        _ALERT_KEYS='webshell|tmp_exec|priv_esc|passwd_change|shadow_change|sudoers_change|home_exec'
-        _COUNT=0
-        while IFS= read -r LINE && [ "\$_COUNT" -lt "\$MAX_EVENTS" ]; do
-            [ -z "\$LINE" ] && continue
-            echo "\$LINE" | grep -qE "\"key\":\"(\$_ALERT_KEYS)\"" || continue
-
-            TS=\$(date '+%Y-%m-%d %H:%M:%S')
-            HOST=\$(hostname)
-            KEY=\$(echo "\$LINE" | grep -oE '"key":"\K[^"]+')
-            COMM=\$(echo "\$LINE" | grep -oE '"comm":"\K[^"]+' || echo "unknown")
-            PID=\$(echo "\$LINE"  | grep -oE '"pid":\K[0-9]+'  || echo "?")
-
-            SUBJECT="[LG ALERT] \${KEY} detected on \${HOST}"
-            BODY=\$(printf "Linux Guardian Security Alert\n\nHost:    %s\nTime:    %s\nKey:     %s\nProcess: %s (PID %s)\n\nRaw event:\n%s\n\nLog: %s" \
-                "\$HOST" "\$TS" "\$KEY" "\$COMM" "\$PID" "\$LINE" "\$LOG")
-
-            echo "\$BODY" | mail -s "\$SUBJECT" "\$ALERT_EMAIL" 2>/dev/null
-            echo "\$TS [ALERT] \$KEY — \$COMM (PID \$PID)" >> "\$LOG"
-            _COUNT=\$((_COUNT+1))
-        done
-        exit 0
+while IFS= read -r LINE; do
+    case "\$LINE" in *type=SYSCALL*) ;; *) continue ;; esac
+    KEY=\$(printf '%s' "\$LINE" | sed -n 's/.* key="\([^"]*\)".*/\1/p')
+    # several keys on one rule are hex-encoded, \001-separated
+    [ -z "\$KEY" ] && KEY=\$(printf '%s' "\$LINE" | sed -n 's/.* key=\([0-9A-F][0-9A-F]*\).*/\1/p' | perl -pe 's/([0-9A-F]{2})/chr(hex(\$1))/ge' | tr '\001' ',')
+    printf '%s' "\$KEY" | grep -qE "(^|,)(\$_ALERT_KEYS)(,|\$)" || continue
+    TS=\$(date '+%Y-%m-%d %H:%M:%S')
+    COMM=\$(printf '%s' "\$LINE" | sed -n 's/.* comm="\([^"]*\)".*/\1/p'); COMM=\${COMM:-unknown}
+    PID=\$(printf '%s' "\$LINE" | sed -n 's/.* pid=\([0-9]*\).*/\1/p'); PID=\${PID:-?}
+    echo "\$TS [ALERT] \$KEY — \$COMM (PID \$PID)" >> "\$LOG"
+    STAMP="\$STATE/\$(printf '%s' "\$KEY" | tr -c 'A-Za-z0-9_,' '_')"
+    NOW=\$(date +%s); LAST=\$(cat "\$STAMP" 2>/dev/null || echo 0)
+    [ \$(( NOW - LAST )) -ge "\$THROTTLE" ] || continue
+    echo "\$NOW" > "\$STAMP"
+    printf 'Linux Guardian Security Alert\n\nHost:    %s\nTime:    %s\nKey:     %s\nProcess: %s (PID %s)\n\nRaw event:\n%s\n\nLog: %s\n' \\
+        "\$(hostname)" "\$TS" "\$KEY" "\$COMM" "\$PID" "\$LINE" "\$LOG" \\
+        | mail -s "[LG ALERT] \$KEY detected on \$(hostname)" "\$ALERT_EMAIL" 2>/dev/null
+done
+exit 0
 ALERTEOF
         chmod 750 "$AUDISP_ALERT"
         echo "AUDITD_RULE:${AUDISP_ALERT}" >> "$UNDO_MANIFEST"
         log_ok "Alert script: ${AUDISP_ALERT}  (email: ${ALERT_EMAIL})"
+
+        # SELinux: auditd (auditd_t) can only launch plugins labelled
+        # audisp_exec_t; with the default /etc/audit label the plugin is
+        # killed at start ("plugin ... terminated unexpectedly", 10x, then
+        # disabled). Persist the label so restorecon/relabels keep it.
+        if command -v getenforce >/dev/null 2>&1 && [ "$(getenforce 2>/dev/null)" != "Disabled" ]; then
+            if command -v semanage >/dev/null 2>&1; then
+                semanage fcontext -a -t audisp_exec_t "${AUDISP_ALERT//./\\.}" 2>/dev/null \
+                  || semanage fcontext -m -t audisp_exec_t "${AUDISP_ALERT//./\\.}" 2>/dev/null
+                restorecon "$AUDISP_ALERT" 2>/dev/null
+            else
+                chcon -t audisp_exec_t "$AUDISP_ALERT" 2>/dev/null
+            fi
+            log_ok "SELinux label: $(ls -Z "$AUDISP_ALERT" 2>/dev/null | awk '{print $1}' | cut -d: -f3)"
+
+            # The stock policy lets auditd_t *execute* an audisp_exec_t file but
+            # does not let the resulting audisp_t process *read* it — and a
+            # shell script must be read by its interpreter (bash exits 126,
+            # auditd logs "terminated unexpectedly" and disables the plugin).
+            # One allow rule, shipped as a tiny policy module.
+            if command -v semodule >/dev/null 2>&1; then
+                command -v checkmodule >/dev/null 2>&1 || { command -v dnf >/dev/null 2>&1 && dnf -q -y install checkpolicy >/dev/null 2>&1; }
+                if command -v checkmodule >/dev/null 2>&1; then
+                    _SPD=$(mktemp -d /tmp/lg-audisp.XXXXXX)
+                    cat > "$_SPD/lg-audisp.te" << SEEOF
+module lg-audisp 1.3;
+require {
+    type audisp_t;
+    type audisp_exec_t;
+    type auditd_etc_t;
+    type hostname_exec_t;
+    type postfix_etc_t;
+    type postfix_postdrop_exec_t;
+    type postfix_public_t;
+    type postfix_spool_t;
+    type sendmail_exec_t;
+    type tmp_t;
+    type var_log_t;
+    type var_run_t;
+    class capability setgid;
+    class dir { add_name remove_name write search getattr };
+    class fifo_file { getattr open write };
+    class file { create execute execute_no_trans getattr open read rename setattr unlink write };
+}
+# read its own script (the interpreter must open it) and traverse /etc/audit
+allow audisp_t audisp_exec_t:file { read open getattr };
+allow audisp_t auditd_etc_t:dir { search getattr };
+# hostname(1) in the mail subject
+allow audisp_t hostname_exec_t:file { execute execute_no_trans getattr open read };
+# append to the hardening log and keep per-key throttle stamps under /run
+allow audisp_t var_log_t:file open;
+allow audisp_t var_run_t:file { create open read write };
+# mail(1) -> sendmail -> postdrop (postfix); mail(1) also uses a temp file
+allow audisp_t sendmail_exec_t:file { execute execute_no_trans open read };
+allow audisp_t postfix_etc_t:file { getattr open read };
+allow audisp_t postfix_postdrop_exec_t:file { execute execute_no_trans open read };
+allow audisp_t postfix_public_t:fifo_file { getattr open write };
+allow audisp_t postfix_spool_t:dir { add_name remove_name write };
+allow audisp_t postfix_spool_t:file { create getattr open read rename setattr write };
+allow audisp_t self:capability setgid;
+allow audisp_t tmp_t:dir { add_name remove_name write };
+allow audisp_t tmp_t:file { create setattr unlink };
+SEEOF
+                    if checkmodule -M -m -o "$_SPD/lg-audisp.mod" "$_SPD/lg-audisp.te" >/dev/null 2>&1 \
+                       && semodule_package -o "$_SPD/lg-audisp.pp" -m "$_SPD/lg-audisp.mod" >/dev/null 2>&1 \
+                       && semodule -i "$_SPD/lg-audisp.pp" >/dev/null 2>&1; then
+                        log_ok "SELinux module lg-audisp installed (audisp_t may read the plugin)"
+                        echo "SELINUX_MODULE:lg-audisp" >> "$UNDO_MANIFEST"
+                    else
+                        log_warn "could not build/install the lg-audisp policy module — the alert plugin will NOT start under SELinux enforcing"
+                    fi
+                    rm -rf "$_SPD"
+                else
+                    log_warn "checkmodule unavailable — alert plugin needs: allow audisp_t audisp_exec_t:file { read open getattr }"
+                fi
+            fi
+        fi
 
         # ── Register alert script with audisp ─────────────────────────────────
         AUDISP_PLUGIN_DIR=""
@@ -3178,11 +3620,11 @@ ALERTEOF
 
         if [ -n "$AUDISP_PLUGIN_DIR" ]; then
             cat > "${AUDISP_PLUGIN_DIR}/lg-alert.conf" << PLUGEOF
-            active = yes
-            direction = out
-            path = ${AUDISP_ALERT}
-            type = always
-            format = json
+active = yes
+direction = out
+path = ${AUDISP_ALERT}
+type = always
+format = string
 PLUGEOF
             log_ok "Audisp plugin registered: ${AUDISP_PLUGIN_DIR}/lg-alert.conf"
             echo "AUDITD_RULE:${AUDISP_PLUGIN_DIR}/lg-alert.conf" >> "$UNDO_MANIFEST"
@@ -3279,20 +3721,20 @@ else
         # FIX: was calling clamdscan up to 3 times on the same file.
         # Now scans once, captures output to a temp variable, then alerts/removes.
         cat > /etc/pure-ftpd/clamav_check.sh << CLAMAVEOF
-        #!/bin/bash
-        # Linux Guardian — ClamAV upload scanner
-        MAXSIZE=10485760
-        ALERT="${ALERT_EMAIL}"
-        [ -z "\$1" ] || [ ! -f "\$1" ] && exit 0
-        if [ "\${UPLOAD_SIZE:-0}" -le "\$MAXSIZE" ] && command -v clamdscan &>/dev/null; then
-            # Single scan, capture full output once
-            RESULT=\$(clamdscan --no-summary --infected "\$1" 2>/dev/null)
-            if printf '%s' "\$RESULT" | grep -q FOUND; then
-                clamdscan --remove --no-summary "\$1" 2>/dev/null
-                printf "Infected upload removed:\n%s\n" "\$RESULT" \
-                    | mail -s "[LG] Infected Upload" "\$ALERT"
-            fi
-        fi
+#!/bin/bash
+# Linux Guardian — ClamAV upload scanner
+MAXSIZE=10485760
+ALERT="${ALERT_EMAIL}"
+[ -z "\$1" ] || [ ! -f "\$1" ] && exit 0
+if [ "\${UPLOAD_SIZE:-0}" -le "\$MAXSIZE" ] && command -v clamdscan &>/dev/null; then
+    # Single scan, capture full output once
+    RESULT=\$(clamdscan --no-summary --infected "\$1" 2>/dev/null)
+    if printf '%s' "\$RESULT" | grep -q FOUND; then
+        clamdscan --remove --no-summary "\$1" 2>/dev/null
+        printf "Infected upload removed:\n%s\n" "\$RESULT" \
+            | mail -s "[LG] Infected Upload" "\$ALERT"
+    fi
+fi
 CLAMAVEOF
         chmod 750 /etc/pure-ftpd/clamav_check.sh
         log_ok "ClamAV scanner: /etc/pure-ftpd/clamav_check.sh"
@@ -3581,6 +4023,26 @@ EOF
 setup_snuffleupagus || log_warn "Part B: Snuffleupagus setup encountered an issue — check log for details"
 
 log_ok "Part B complete"
+
+# ══════════════════════════════════════════════════════════════════════════════
+# PART C — php2shell (CVE-2026-109618 / CVE-2026-109619)
+# Every PHP executable on the host (panel-private ones included), fixed-version
+# check with vendor-backport awareness, interim mitigation. Helpers above.
+# ══════════════════════════════════════════════════════════════════════════════
+section "PART C: php2shell — CVE-2026-109618 / CVE-2026-109619"
+
+_lg_php2shell || log_warn "Part C: php2shell check encountered an issue — check log for details"
+
+log_ok "Part C complete"
+
+# ══════════════════════════════════════════════════════════════════════════════
+# PART D — Recent critical CVEs (report only). Helpers above.
+# ══════════════════════════════════════════════════════════════════════════════
+section "PART D: Recent critical CVEs — Snuffleupagus, Roundcube, kernel, updates, CWP"
+
+_lg_cves || log_warn "Part D: CVE check encountered an issue — check log for details"
+
+log_ok "Part D complete"
 
 # ── Save state file (marks first run complete — triggers status on next run) ──
 if [ "$DRY_RUN" = false ]; then
