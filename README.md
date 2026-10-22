@@ -23,7 +23,7 @@ wget -qO /tmp/lg.sh https://lg.wondtech.com/lg.sh && sudo mv /tmp/lg.sh /usr/loc
 From GitHub instead:
 
 ```bash
-wget -qO /tmp/lg.sh https://raw.githubusercontent.com/mogbil/lg/main/lg.sh && sudo mv /tmp/lg.sh /usr/local/bin/lg && sudo chmod +x /usr/local/bin/lg
+wget -qO /tmp/lg.sh https://raw.githubusercontent.com/wondtech/lg/main/lg.sh && sudo mv /tmp/lg.sh /usr/local/bin/lg && sudo chmod +x /usr/local/bin/lg
 ```
 
 Already installed? `sudo lg --update` fetches the latest release.
