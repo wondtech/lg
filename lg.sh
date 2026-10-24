@@ -1,6 +1,6 @@
 #!/bin/bash
 # ══════════════════════════════════════════════════════════════════════════════
-# Linux Guardian v1.2.1 — Production-Ready Server Security Hardening
+# Linux Guardian v1.3 — Production-Ready Server Security Hardening
 # By Mogbil Sourketti WondTech.com | info@wondtech.com
 #
 # Security Layers (Defence in Depth):
@@ -9,7 +9,7 @@
 #   [3] System Files          — Secure critical file permissions
 #   [4.1] Apache httpd        — ServerTokens, ServerSignature off
 #   [4.2] MySQL/MariaDB       — Bind to 127.0.0.1
-#   [5] PHP disable_functions — Block shell_exec/system/exec + open_basedir
+#   [5] PHP disable_functions — Block shell_exec/system/exec + open_basedir (--php-strict adds limits/strict cookies)
 #   [5.1] PHP-FPM Pools       — Isolate each site with open_basedir
 #   [6] noexec /tmp /var/tmp  — Prevent uploaded binary execution
 #   [7] AppArmor / SELinux    — MAC + Dovecot/vmail context fixes
@@ -72,31 +72,45 @@ DOVECOT_LOG_PATHS=(
 # FIX: PHP disable_functions + global security settings were inlined in
 # LAYER 5. Promoted to globals so they're defined once and can be inspected
 # (e.g., for `php -i` verification later).
-DISABLE_FUNCTIONS="exec,passthru,shell_exec,system,popen,proc_open,proc_close,proc_get_status,proc_terminate,proc_nice,pcntl_exec,pcntl_fork,pcntl_signal,pcntl_waitpid,pcntl_wait,pcntl_wifexited,pcntl_wifstopped,pcntl_wifsignaled,pcntl_wexitstatus,pcntl_wstopsig,pcntl_signal_dispatch,pcntl_get_last_error,pcntl_strerror,pcntl_sigprocmask,pcntl_sigwaitinfo,pcntl_sigtimedwait,pcntl_alarm,pcntl_getpriority,pcntl_setpriority,pcntl_async_signals,posix_kill,posix_mkfifo,posix_setpgid,posix_setsid,posix_setuid,posix_setgid,posix_seteuid,posix_setegid,fsockopen,pfsockopen,stream_socket_client,stream_socket_server,socket_create,socket_connect,socket_bind,socket_listen,socket_accept,phpinfo,show_source,highlight_file,symlink,link,dl,assert,create_function,opcache_get_status,opcache_reset,apache_setenv,gethostname,gethostbyname,gethostbyaddr,dns_get_record,dns_get_mx,posix_getuid,posix_getgid,posix_getpwuid,get_current_user"
+DISABLE_FUNCTIONS="exec,passthru,shell_exec,system,popen,proc_open,proc_close,proc_get_status,proc_terminate,proc_nice,pcntl_exec,pcntl_fork,pcntl_signal,pcntl_waitpid,pcntl_wait,pcntl_wifexited,pcntl_wifstopped,pcntl_wifsignaled,pcntl_wexitstatus,pcntl_wstopsig,pcntl_signal_dispatch,pcntl_get_last_error,pcntl_strerror,pcntl_sigprocmask,pcntl_sigwaitinfo,pcntl_sigtimedwait,pcntl_alarm,pcntl_getpriority,pcntl_setpriority,pcntl_async_signals,posix_kill,posix_mkfifo,posix_setpgid,posix_setsid,posix_setuid,posix_setgid,posix_seteuid,posix_setegid,stream_socket_server,socket_bind,socket_listen,socket_accept,phpinfo,show_source,highlight_file,symlink,link,dl,assert,create_function,opcache_get_status,opcache_reset,apache_setenv,posix_getuid,posix_getgid,posix_getpwuid,get_current_user"
 
 # PHP global security settings — key=value list (FIX: was using bash
 # associative array which can be unreliable in strict mode)
+#
+# These are hosting-grade: they close real attack surface without breaking
+# Composer, Laravel/Symfony, WordPress plugins, PHPMailer or payment returns.
+# Not here on purpose: Reflection*/Phar classes (Composer and every modern
+# framework need them), socket/DNS functions (mail and HTTP libraries),
+# allow_url_fopen, SameSite=Strict, cookie_secure and size/time limits —
+# those live in PHPSEC_STRICT_PAIRS and are applied only with --php-strict.
 PHPSEC_PAIRS=(
-    "allow_url_fopen:Off"
     "allow_url_include:Off"
     "expose_php:Off"
     "display_errors:Off"
     "log_errors:On"
-    "disable_classes:Imagick,ImagickDraw,ImagickPixel,ImagickPixelIterator,Gmagick,ReflectionClass,ReflectionFunction,ReflectionMethod,ReflectionProperty,ReflectionExtension,ReflectionObject,Phar,PharData"
+    "disable_classes:Imagick,ImagickDraw,ImagickPixel,ImagickPixelIterator,Gmagick"
     "file_uploads:On"
-    "upload_tmp_dir:/tmp"
-    "upload_max_filesize:2M"
     "session.cookie_httponly:1"
-    "session.cookie_secure:1"
     "session.use_strict_mode:1"
     "session.use_only_cookies:1"
-    "session.cookie_samesite:Strict"
+    "session.cookie_samesite:Lax"
     "enable_dl:Off"
+)
+# --php-strict: single-purpose boxes where you control every application.
+# Never written into a CLI php.ini (Composer, WP-CLI, Drush need the room).
+PHPSEC_STRICT_PAIRS=(
+    "allow_url_fopen:Off"
+    "disable_classes:Imagick,ImagickDraw,ImagickPixel,ImagickPixelIterator,Gmagick,Phar,PharData"
+    "session.cookie_secure:1"
+    "session.cookie_samesite:Strict"
+    "upload_tmp_dir:/tmp"
+    "upload_max_filesize:2M"
+    "post_max_size:8M"
+    "memory_limit:128M"
     "max_execution_time:30"
     "max_input_time:30"
-    "memory_limit:128M"
-    "post_max_size:8M"
 )
+PHP_STRICT=false
 
 # ─── Colours ────────────────────────────────────────────────────────────────
 RED='\033[0;31m'
@@ -125,7 +139,7 @@ print_banner() {
     echo "   ▐▙▄▄▖▗▄█▄▖▐▌  ▐▌▝▚▄▞▘▗▞▘▝▚▖  ▝▚▄▞▘▝▚▄▞▘▐▌ ▐▌▐▌ ▐▌▐▙▄▄▀▗▄█▄▖▐▌ ▐▌▐▌"
     echo ""
     echo "   ╔══════════════════════════════════════════════════════════════════╗"
-    echo "   ║  Linux Server Security Hardening  v1.2.1 |  WondTech.com          ║"
+    echo "   ║  Linux Server Security Hardening  v1.3  |  WondTech.com          ║"
     echo "   ║  One Script · Defence in Depth · Zero Compromise                 ║"
     echo "   ╚══════════════════════════════════════════════════════════════════╝"
     echo "────────────────────────────────────────────────────────────────────────"
@@ -1412,7 +1426,7 @@ _lg_status() {
     echo ""
     echo -e "${BOLD}${CYAN}"
     echo "────────────────────────────────────────────────────────────────────────"
-    echo "   Linux Guardian v1.2.1 — Security Status Dashboard"
+    echo "   Linux Guardian v1.3 — Security Status Dashboard"
     printf "   Last applied: %s\n" "$LAST_RUN"
     echo "────────────────────────────────────────────────────────────────────────"
     echo -e "${NC}"
@@ -1879,7 +1893,7 @@ _lg_help() {
     echo "   [3] System Files          Secure permissions on sensitive files"
     echo "   [4.1] Apache httpd        ServerTokens Prod, ServerSignature Off"
     echo "   [4.2] MySQL / MariaDB     Bind database to 127.0.0.1"
-    echo "   [5] PHP Hardening         Disable 60+ dangerous functions globally"
+    echo "   [5] PHP Hardening         Disable 50+ dangerous functions globally (--php-strict: limits, Phar, Strict cookies)"
     echo "   [5.1] PHP-FPM Pools       Isolate each site with open_basedir"
     echo "   [6] noexec                Prevent binary execution from /tmp + sites"
     echo "   [7] AppArmor / SELinux    Enforce MAC + fix vmail/Dovecot contexts"
@@ -1894,6 +1908,8 @@ _lg_help() {
     echo "   sudo lg --dry-run        # Preview changes safely"
     echo "   sudo lg --php2shell      # php2shell status of every PHP + mitigation only"
     echo "   sudo lg --cves           # recent critical CVE check only (report, no changes)"
+    echo "   sudo lg --auto --php-strict      # single-app box: also apply size/time limits + Strict cookies"
+    echo "   sudo lg --auto --upgrade-packages # also run the distro package upgrade first"
     echo "   sudo lg --auto           # Apply all layers without prompts"
     echo "   sudo lg --force          # Re-apply all layers"
     echo "   sudo lg --fixmail        # Fix Dovecot/vmail SELinux only"
@@ -1940,6 +1956,7 @@ for arg in "$@"; do
         --integrity)      INTEGRITY_MODE=true ;;
         --update)         UPDATE_MODE=true ;;
         --analyze)        ANALYZE_MODE=true ;;
+        --php-strict)     PHP_STRICT=true ;;
         --version|-V)     grep -m1 "^# Linux Guardian v" "$0" | grep -oE 'v[0-9]+(\.[0-9]+)+'; exit 0 ;;
         --help|-h)        HELP_MODE=true ;;
         --cron|--setup-auto|--upgrade-packages|--path|--path=*) ;;   # handled elsewhere / positional
@@ -2452,14 +2469,32 @@ else
         /etc/mysql/mariadb.conf.d/50-server.cnf \
         /usr/local/etc/my.cnf) || true
 
-    # fallback: deep filesystem search
+    # fallback: system config dirs only (never a user's ~/.my.cnf under /home)
     if [ -z "$MY_CNF" ]; then
-        log_info "Searching filesystem for my.cnf..."
-        MY_CNF=$(find_conf_deep "my.cnf") || true
+        MY_CNF=$(find /etc /usr/local/etc -maxdepth 3 -type f \( -name my.cnf -o -name server.cnf -o -name mariadb-server.cnf -o -name 50-server.cnf \) 2>/dev/null | head -1 || true)
+    fi
+
+    # already listening on loopback only? then there is nothing to edit and
+    # nothing to restart — re-running lg must not bounce the database
+    _DB_LISTEN=$(ss -Htln 2>/dev/null | awk '{print $4}' | grep -E ':3306$' | sed -E 's/:3306$//' | sort -u | tr '\n' ' ')
+    _DB_PUBLIC=$(printf '%s' "$_DB_LISTEN" | tr ' ' '\n' | grep -vE '^(127\.0\.0\.1|\[::1\]|::1)$' | grep -v '^$' || true)
+    if [ -n "$_DB_LISTEN" ] && [ -z "$_DB_PUBLIC" ]; then
+        log_ok "MySQL/MariaDB already bound to localhost (${_DB_LISTEN}) — nothing to do"
+        MY_CNF=""
+    elif [ -z "$_DB_LISTEN" ]; then
+        log_info "MySQL/MariaDB is not listening on TCP (socket only, or stopped) — bind-address left untouched"
+        MY_CNF=""
+    else
+        log_warn "MySQL/MariaDB listens on ${_DB_LISTEN}— remote clients/replication will lose access once bound to 127.0.0.1"
+        if [ "$DRY_RUN" = false ] && [ "$RUN_MODE" != "auto" ] && [ -t 0 ]; then
+            read -r -p "  Bind the database to 127.0.0.1 and restart it now? [y/N]: " -n 1 _DBQ || _DBQ=""
+            echo ""
+            [[ "$_DBQ" =~ ^[Yy]$ ]] || { log_skip "Database bind-address left as is"; MY_CNF=""; }
+        fi
     fi
 
     if [ -z "$MY_CNF" ]; then
-        log_warn "MySQL/MariaDB installed but config file not found — skipping"
+        :
     else
         log_info "Config: $MY_CNF"
         backup_file "$MY_CNF" "mysql"
@@ -2655,7 +2690,12 @@ if [ "$PHP_SKIP" = false ] && [ ${#SELECTED_FILES[@]} -gt 0 ]; then
         # ── Global security settings (FIX: was using declare -A PHPSEC; now
         #    uses flat key:value pairs from global PHPSEC_PAIRS array) ────────
         _pair=""; _key=""; _val=""
-        for _pair in "${PHPSEC_PAIRS[@]}"; do
+        _PAIRS_NOW=("${PHPSEC_PAIRS[@]}")
+        if [ "$PHP_STRICT" = true ] && [[ "$inifile" != *cli* ]]; then
+            _PAIRS_NOW+=("${PHPSEC_STRICT_PAIRS[@]}")
+            log_info "--php-strict: limits and strict cookie flags applied to $(basename "$(dirname "$inifile")")/$(basename "$inifile")"
+        fi
+        for _pair in "${_PAIRS_NOW[@]}"; do
             _key="${_pair%%:*}"
             _val="${_pair#*:}"
             if grep -qE "^\s*${_key}\s*=" "$inifile"; then
@@ -3276,39 +3316,29 @@ case "$MAC_SYSTEM" in
             fi
 
             # Harden httpd booleans
-            if [ "$DRY_RUN" = true ]; then
-                log_dry "Apply SELinux httpd security booleans"
-            else
-                # FIX: was inside else-block with `declare -A` which can be
-                # unreliable in strict mode under certain bash versions.
-                # Now uses a flat key=value list to keep it portable.
-                _sebool_pairs=(
-                    "httpd_execmem:off"
-                    "httpd_execute_tmp:off"
-                    "httpd_unified:off"
-                    "httpd_can_network_connect:off"
-                    "httpd_can_network_relay:off"
-                )
-                _pair=""; _bname=""; _bval=""; _current=""
-                for _pair in "${_sebool_pairs[@]}"; do
-                    _bname="${_pair%%:*}"
-                    _bval="${_pair#*:}"
-                    # Pre-check — some policy versions do not support all booleans
-                    if ! getsebool "$_bname" &>/dev/null; then
-                        log_info "SELinux bool not supported on this policy version: $_bname (skipped)"
-                        continue
-                    fi
-                    # Skip if already set to desired value — setsebool -P is slow
-                    _current=$(getsebool "$_bname" 2>/dev/null | awk '{print $3}' || true)
-                    if [ "$_current" = "$_bval" ]; then
-                        log_ok "SELinux bool: $_bname = $_bval (already set)"
-                        continue
-                    fi
-                    setsebool -P "$_bname" "$_bval" 2>/dev/null \
-                        && log_ok "SELinux bool: $_bname = $_bval" \
-                        || log_warn "Failed to set bool: $_bname"
-                done
-            fi
+            # httpd booleans are REPORTED, never changed: turning them off
+            # silently breaks WordPress updates/SMTP (can_network_connect),
+            # ionCube and opcache.jit (execmem) and panel writes (unified).
+            # The admin set them for a reason; lg shows what is on and why
+            # it matters.
+            _sebool_pairs=(
+                "httpd_execmem:off:ionCube/opcache.jit need it on"
+                "httpd_execute_tmp:off:nothing legitimate executes from /tmp"
+                "httpd_unified:off:lets httpd write everything it can read"
+                "httpd_can_network_connect:off:WordPress updates, SMTP, payment APIs need it on"
+                "httpd_can_network_relay:off:only reverse proxies need it on"
+            )
+            _pair=""; _bname=""; _bval=""; _bwhy=""; _current=""
+            for _pair in "${_sebool_pairs[@]}"; do
+                _bname="${_pair%%:*}"; _rest="${_pair#*:}"; _bval="${_rest%%:*}"; _bwhy="${_rest#*:}"
+                getsebool "$_bname" &>/dev/null || continue
+                _current=$(getsebool "$_bname" 2>/dev/null | awk '{print $3}' || true)
+                if [ "$_current" = "$_bval" ]; then
+                    log_ok "SELinux bool: $_bname = $_current"
+                else
+                    log_info "SELinux bool: $_bname = $_current (hardened value: $_bval — $_bwhy; change by hand: setsebool -P $_bname $_bval)"
+                fi
+            done
 
             # ── Fix vmail + Dovecot SELinux contexts ──────────────────────────
             # This is the ONLY panel-specific fix in Layer 7

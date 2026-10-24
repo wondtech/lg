@@ -2,7 +2,7 @@
 
 <img src="https://lg.wondtech.com/logo.png" alt="Linux Guardian" width="200">
 
-**[Linux Guardian v1.2.1](https://lg.wondtech.com/)** — Production-Ready Linux Server Security Hardening https://lg.wondtech.com/
+**[Linux Guardian v1.3](https://lg.wondtech.com/)** — Production-Ready Linux Server Security Hardening https://lg.wondtech.com/
 
 ## Overview
 
@@ -26,7 +26,7 @@ From GitHub instead:
 wget -qO /tmp/lg.sh https://raw.githubusercontent.com/wondtech/lg/main/lg.sh && sudo mv /tmp/lg.sh /usr/local/bin/lg && sudo chmod +x /usr/local/bin/lg
 ```
 
-Already installed? `sudo lg --update` fetches the latest release.
+Already installed? `sudo lg --update` fetches the latest release (v1.3).
 
 Verify before running:
 
@@ -52,6 +52,8 @@ sudo lg --auto-analyze          # Start background behavior monitoring (daemon)
 sudo lg --integrity             # Check integrity of critical system files
 sudo lg --php2shell             # php2shell (CVE-2026-109618/109619) status of every PHP + mitigation
 sudo lg --cves                  # Recent critical CVE check — report only
+sudo lg --auto --php-strict     # Single-app box: also size/time limits, Phar off, Strict cookies
+sudo lg --auto --upgrade-packages # Run the distro package upgrade before hardening
 sudo lg --update                # Update to latest version from lg.wondtech.com
 sudo lg --help                  # Show all options
 ```
@@ -63,12 +65,12 @@ sudo lg --help                  # Show all options
 | [1] | **Binary Lockdown** | Restricts nc, gcc, python, perl, curl, wget and 30+ tools to root only |
 | [2] | **Kernel Hardening** | Blocks dccp, sctp, rds, tipc modules — applies ASLR, SYN cookies, reverse path filtering |
 | [3] | **System Files** | Hardens /etc/shadow, /etc/passwd, sshd_config, cron directories |
-| [4] | **Apache & MySQL / MariaDB** | ServerTokens, ServerSignature, UseCanonicalName and Binds database to 127.0.0.1 |
-| [5] | **PHP Hardening** | Disables 60+ dangerous functions + sets open_basedir per site + date.timezone |
+| [4] | **Apache & MySQL / MariaDB** | ServerTokens, ServerSignature, UseCanonicalName; binds the database to 127.0.0.1 only when it is publicly reachable (no edit, no restart otherwise) |
+| [5] | **PHP Hardening** | Disables 50+ dangerous functions + open_basedir per site + date.timezone. Hosting-grade defaults keep Composer, frameworks, mail and payment flows working; `--php-strict` adds size/time limits, Phar off and SameSite=Strict |
 | [5.1] | **PHP-FPM Pools** | Creates an isolated pool per site with open_basedir, session dir, and logs |
 | [5.2] | **Panel php.ini** | Fixes date.timezone in all panel-specific php.ini files |
 | [6] | **noexec** | Applies noexec/nosuid/nodev to /tmp, /var/tmp, and all site directories |
-| [7] | **AppArmor / SELinux** | Enforces MAC — fixes vmail/Dovecot contexts — loads dovecot_lg policy |
+| [7] | **AppArmor / SELinux** | Enforces MAC (permissive + relabel first on a disabled host) — fixes vmail/Dovecot contexts — loads dovecot_lg policy — reports httpd booleans instead of flipping them |
 | [8] | **Auditd** | Real-time alerts for webshell execution, privilege escalation, file changes |
 | [A] | **FTP + ClamAV** | Scans uploaded files — infected files removed immediately |
 | [B] | **Snuffleupagus** | PHP RASP runtime protection |
@@ -114,7 +116,7 @@ After the first run, `sudo lg` automatically shows:
 
 ```
 ────────────────────────────────────────────────────────────────────────
-   Linux Guardian v1.2.1 — Security Status Dashboard
+   Linux Guardian v1.3 — Security Status Dashboard
    Last applied: 2026-10-22 08:08:04
 ────────────────────────────────────────────────────────────────────────
 
@@ -332,8 +334,11 @@ tail -50 /var/log/lg-hardening.log
 
 ## Changelog
 
-**v1.2.1 — 2026-10-24**
+**v1.3 — 2026-10-24**
 
+- PHP defaults are now hosting-grade: Reflection*/Phar classes, socket and DNS functions, `allow_url_fopen`, SameSite=Strict, `cookie_secure` and the 2M/8M/128M/30s limits moved out of the defaults into `--php-strict` (never written to a CLI php.ini). Composer, Laravel/Symfony, WordPress plugins, PHPMailer and payment-gateway returns keep working out of the box.
+- SELinux httpd booleans are reported with the reason they matter, no longer forced off.
+- MySQL/MariaDB layer is idempotent: it edits and restarts only when the server is publicly bound, asks first in interactive mode, and never picks a `my.cnf` under `/home`.
 - Full code review: 28 defects fixed. Highlights: `local` used at top level aborted every real run under `set -e` (Layer 5 stopped after the first php.ini); unbound `_VMAIL_TYPE` aborted Layer 7 on SELinux hosts without a mail store; panel-private and per-site php.ini are now excluded in every mode (the interactive "all" used to include them); unknown flags are rejected instead of silently running a full hardening; `--undo` replays newest-first, honours `--dry-run`, removes files it created and reverses mounts/fstab precisely; backups are named by full path (FPM and CLI php.ini no longer overwrite each other).
 - PHP-FPM pools: session and log directories are inside `open_basedir` (logins used to fail), socket directory follows the distro, FPM is restarted only when `--test` passes, otherwise the new pools are removed.
 - noexec: the live `/tmp` and `/var/tmp` are bind-remounted (contents kept) instead of hidden under a fresh tmpfs; the tmpfs line is only written for the next boot.
