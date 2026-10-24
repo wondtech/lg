@@ -1,6 +1,6 @@
 #!/bin/bash
 # ══════════════════════════════════════════════════════════════════════════════
-# Linux Guardian v1.2 — Production-Ready Server Security Hardening
+# Linux Guardian v1.2.1 — Production-Ready Server Security Hardening
 # By Mogbil Sourketti WondTech.com | info@wondtech.com
 #
 # Security Layers (Defence in Depth):
@@ -47,6 +47,7 @@ UNDO_MODE=false
 FIXMAIL_MODE=false
 PHP2SHELL_MODE=false
 CVES_MODE=false
+ANALYZE_MODE=false
 SCAN_MODE=false
 AUTO_ANALYZE_MODE=false
 INTEGRITY_MODE=false
@@ -109,8 +110,6 @@ NC='\033[0m'
 _lg_exit() {
     local code=$?
     [ $code -eq 0 ] && return
-    # Only show error after globals are initialised (TIMESTAMP set)
-    [ -z "${TIMESTAMP:-}" ] && return
     echo -e "\n  ${RED}[ERROR]${NC}   Script exited unexpectedly (code: ${code})" >&2
     echo -e "  ${YELLOW}[WARN]${NC}    Some layers may be incomplete — review log: ${LOG_FILE:-/var/log/lg-hardening.log}" >&2
 }
@@ -126,7 +125,7 @@ print_banner() {
     echo "   ▐▙▄▄▖▗▄█▄▖▐▌  ▐▌▝▚▄▞▘▗▞▘▝▚▖  ▝▚▄▞▘▝▚▄▞▘▐▌ ▐▌▐▌ ▐▌▐▙▄▄▀▗▄█▄▖▐▌ ▐▌▐▌"
     echo ""
     echo "   ╔══════════════════════════════════════════════════════════════════╗"
-    echo "   ║  Linux Server Security Hardening  v1.2  |  WondTech.com          ║"
+    echo "   ║  Linux Server Security Hardening  v1.2.1 |  WondTech.com          ║"
     echo "   ║  One Script · Defence in Depth · Zero Compromise                 ║"
     echo "   ╚══════════════════════════════════════════════════════════════════╝"
     echo "────────────────────────────────────────────────────────────────────────"
@@ -162,8 +161,14 @@ _detect_timezone() {
 # ─── backup_file: copy + record in undo manifest ─────────────────────────────
 backup_file() {
     local src="$1" tag="${2:-file}"
-    [ -f "$src" ] || return 0
-    local dest="${BACKUP_DIR}/${tag}_$(basename "$src").${TIMESTAMP}"
+    if [ ! -f "$src" ]; then
+        # the caller is about to create it: undo = remove it
+        [ "$DRY_RUN" = false ] && echo "RMFILE:${src}" >> "$UNDO_MANIFEST"
+        return 0
+    fi
+    # full path in the name: /etc/php/8.1/fpm/php.ini and .../cli/php.ini
+    # used to collide and --undo restored the wrong one
+    local dest="${BACKUP_DIR}/${tag}_$(printf '%s' "$src" | sed 's|^/||; s|/|_|g').${TIMESTAMP}"
     if [ "$DRY_RUN" = false ]; then
         cp "$src" "$dest"
         chmod 600 "$dest"
@@ -191,9 +196,11 @@ secure_binary() {
         if [ "$DRY_RUN" = true ]; then
             log_dry "chmod 750 chown root:root $bin"
         else
-            chown root:root "$bin" 2>/dev/null
-            chmod 750       "$bin" 2>/dev/null
-            log_ok "Secured: $bin  →  $(stat -c '%A %U:%G' "$bin")"
+            if chown root:root "$bin" 2>/dev/null && chmod 750 "$bin" 2>/dev/null; then
+                log_ok "Secured: $bin  →  $(stat -c '%A %U:%G' "$bin")"
+            else
+                log_warn "Could not secure $bin (immutable or read-only?) — left as is"
+            fi
         fi
     else
         log_skip "$bin"
@@ -279,7 +286,7 @@ detect_site_paths() {
             [ -d "$_docroot" ] && _paths+=("$_docroot")
         done < <(grep -hEi \
             '^\s*(DocumentRoot|root)\s+"?([^";\s]+)"?' "$_conf" 2>/dev/null \
-            | awk '{print $NF}' | tr -d '"')
+            | awk '{print $NF}' | tr -d '";')
     done
     [ ${#_paths[@]} -gt 0 ] && printf '%s\n' "${_paths[@]}" | sort -u
 }
@@ -315,7 +322,7 @@ detect_php_mode() {
             || [ -x "/usr/sbin/${b}" ] \
             || [ -x "/usr/local/sbin/${b}" ] \
             && echo "fpm" && return
-    done < <(compgen -c 2>/dev/null | grep -E "^php-fpm|^php[0-9]" | sort -u || \
+    done < <(compgen -c 2>/dev/null | grep -E "^php(-fpm|[0-9.]+-fpm)[0-9.]*$" | sort -u || \
              find /usr/sbin /usr/local/sbin /usr/bin /usr/local/bin \
                   -name "php-fpm*" -o -name "php*-fpm" 2>/dev/null \
              | xargs -I{} basename {} | sort -u || true)
@@ -374,7 +381,7 @@ restart_php_services() {
             while IFS= read -r svc; do
                 systemctl is-active --quiet "$svc" 2>/dev/null && {
                     systemctl restart "$svc" 2>/dev/null \
-                        && { log_ok "Restarted: $svc"; _restarted=1; break; } \
+                        && { log_ok "Restarted: $svc"; _restarted=1; } \
                         || log_warn "Failed to restart: $svc"
                 }
             done < <({ systemctl list-units --type=service --state=active \
@@ -388,7 +395,7 @@ restart_php_services() {
             ;;
         cgi|mod_php)
             # FIX: was inlined 13-line loop, now uses shared helper
-            restart_active_webserver
+            restart_active_webserver || log_warn "No active web server to restart"
             ;;
     esac
     return 0
@@ -576,7 +583,7 @@ _lg_fixmail() {
     done
 
     # Apply dovecot_lg policy (FIX: was inlined ~40 lines, now uses helper)
-    _install_dovecot_lg_policy "$_FM_TYPE"
+    _install_dovecot_lg_policy "$_FM_TYPE" || log_warn "dovecot_lg policy not installed (checkmodule/semodule_package missing?)"
 
     setsebool -P domain_can_mmap_files 1 2>/dev/null \
         && log_ok "SELinux bool: domain_can_mmap_files = on" || true
@@ -604,9 +611,33 @@ _lg_fixmail() {
 # ══════════════════════════════════════════════════════════════════════════════
 # FUNCTION: _lg_scan — Scan for webshells and reverse shells
 # ══════════════════════════════════════════════════════════════════════════════
+LG_SCAN_ALLOW="/root/lg/scan.allow"      # one path or glob per line, # comments
+
 _lg_scan() {
     local SCAN_PATH="${1:-}"
     local PATHS=()
+    # files that are exact copies of this script (a published lg.sh under a web
+    # root) and anything the admin allow-listed are never reported
+    local LG_SELF_SIZE LG_SELF_SHA _g
+    LG_SELF_SIZE=$(stat -c %s "$0" 2>/dev/null || echo 0)
+    LG_SELF_SHA=$(sha256sum "$0" 2>/dev/null | cut -d" " -f1)
+    local SCAN_ALLOW=()
+    if [ -f "$LG_SCAN_ALLOW" ]; then
+        while IFS= read -r _g; do
+            _g="${_g%%#*}"; _g="${_g#"${_g%%[![:space:]]*}"}"; _g="${_g%"${_g##*[![:space:]]}"}"
+            [ -n "$_g" ] && SCAN_ALLOW+=("$_g")
+        done < "$LG_SCAN_ALLOW"
+    fi
+    _scan_allowed() {
+        local f="$1" g
+        if [ "$(stat -c %s "$f" 2>/dev/null)" = "$LG_SELF_SIZE" ] && \
+           [ "$(sha256sum "$f" 2>/dev/null | cut -d" " -f1)" = "$LG_SELF_SHA" ]; then return 0; fi
+        for g in ${SCAN_ALLOW[@]+"${SCAN_ALLOW[@]}"}; do
+            # shellcheck disable=SC2053
+            [[ "$f" == $g ]] && return 0
+        done
+        return 1
+    }
     if [ -n "$SCAN_PATH" ] && [ -d "$SCAN_PATH" ]; then
         PATHS=("$SCAN_PATH")
     else
@@ -618,6 +649,7 @@ _lg_scan() {
     section "SCAN: Malicious File Detection"
     log_info "Scanning: ${PATHS[*]}"
     log_info "Log: ${LG_SCAN_LOG}"
+    log_info "Allow-list: ${LG_SCAN_ALLOW} (${#SCAN_ALLOW[@]} entries)"
     echo ""
 
     local FOUND=0
@@ -625,7 +657,7 @@ _lg_scan() {
     TS=$(date '+%Y-%m-%d %H:%M:%S')
     echo "# Linux Guardian Scan — ${TS}" >> "$LG_SCAN_LOG"
 
-local PHP_PATTERNS=(
+    local PHP_PATTERNS=(
         'eval[[:space:]]*\([[:space:]]*(base64_decode|gzinflate|gzuncompress|str_rot13|strrev|rawurldecode)'
         'base64_decode[[:space:]]*\(.*eval|eval[[:space:]]*\(.*base64_decode'
         '@(eval|system|exec|passthru|shell_exec|popen|proc_open)[[:space:]]*\('
@@ -656,6 +688,7 @@ local PHP_PATTERNS=(
         [ -d "$dir" ] || return 0
         while IFS= read -r f; do
             [ -f "$f" ] || continue
+            _scan_allowed "$f" && continue
             for pat in "${PHP_PATTERNS[@]}"; do
                 if grep -qiP "$pat" "$f" 2>/dev/null || \
                    grep -qiE "$pat" "$f" 2>/dev/null; then
@@ -675,6 +708,7 @@ local PHP_PATTERNS=(
             2>/dev/null)
         while IFS= read -r f; do
             [ -f "$f" ] || continue
+            _scan_allowed "$f" && continue
             for pat in "${GENERAL_PATTERNS[@]}"; do
                 if grep -qiE "$pat" "$f" 2>/dev/null; then
                     echo -e "  ${RED}[WARN]${NC} Reverse shell: $f"
@@ -692,6 +726,7 @@ local PHP_PATTERNS=(
             2>/dev/null)
         while IFS= read -r f; do
             [ -f "$f" ] || continue
+            _scan_allowed "$f" && continue
             echo -e "  ${YELLOW}[WARN]${NC} Executable in web dir: $f"
             echo "[WARN] Executable in web dir: $f" >> "$LG_SCAN_LOG"
             FOUND=$((FOUND+1))
@@ -702,7 +737,7 @@ local PHP_PATTERNS=(
             2>/dev/null)
     }
 
-    for p in "${PATHS[@]}"; do
+    for p in ${PATHS[@]+"${PATHS[@]}"}; do
         log_info "Scanning: $p"
         _scan_dir "$p"
     done
@@ -734,17 +769,24 @@ _lg_analyze() {
 
     # ── 1. Suspicious outbound connections ────────────────────────────────────
     echo -e "  ${BOLD}[NET]${NC} Outbound connections:"
-    local EXPECTED_PORTS="80|443|22|25|143|465|587|993|3306|5432"
+    local EXPECTED_PORTS="80|443|22|25|53|143|465|587|993|3306|5432|11371|873"
+    # ports this host listens on: a connection whose LOCAL port is one of
+    # them is inbound (a client talking to us) and is not judged here
+    local LISTEN_PORTS
+    LISTEN_PORTS=$(ss -Htln 2>/dev/null | awk '{print $4}' | rev | cut -d: -f1 | rev | sort -u | tr '\n' '|' | sed 's/|$//')
     while IFS= read -r conn; do
-        local proc port
-        proc=$(echo "$conn" | awk '{print $7}' | cut -d/ -f2 || true)
-        port=$(echo "$conn" | awk '{print $5}' | rev | cut -d: -f1 | rev || true)
+        local proc port lport
+        # `ss -H ... state established` prints: Recv-Q Send-Q Local Peer Process
+        proc=$(echo "$conn" | awk '{print $5}' | cut -d/ -f2 || true)
+        lport=$(echo "$conn" | awk '{print $3}' | rev | cut -d: -f1 | rev || true)
+        port=$(echo "$conn" | awk '{print $4}' | rev | cut -d: -f1 | rev || true)
+        [ -n "$LISTEN_PORTS" ] && echo "$lport" | grep -qE "^(${LISTEN_PORTS})$" && continue
         if ! echo "$port" | grep -qE "^(${EXPECTED_PORTS})$"; then
             echo -e "    ${YELLOW}⚠${NC} Suspicious: $conn"
             echo "[WARN] Suspicious connection: $conn" >> "$LG_ANALYZE_LOG"
             ISSUES=$((ISSUES+1))
         fi
-    done < <(ss -tnp state established 2>/dev/null | grep -v "127.0.0.1\|::1" | tail -20 || true)
+    done < <(ss -Htnp state established 2>/dev/null | grep -v "127.0.0.1\|::1" | tail -20 || true)
     [ "$ISSUES" -eq 0 ] && echo -e "    ${GREEN}✓${NC} No suspicious connections"
 
     # ── 2. Suspicious running processes ───────────────────────────────────────
@@ -757,9 +799,14 @@ _lg_analyze() {
         echo "[WARN] Suspicious process: $proc" >> "$LG_ANALYZE_LOG"
         PROC_ISSUES=$((PROC_ISSUES+1))
     done < <(
-        ps aux 2>/dev/null \
-        | grep -E "/tmp/|/dev/shm" \
-        | grep -v grep \
+        # executable (or a deleted one) under a world-writable temp dir —
+        # argument strings like --socket=/tmp/mysql.sock are not evidence
+        for _pd in /proc/[0-9]*; do
+            _pe=$(readlink "$_pd/exe" 2>/dev/null) || continue
+            case "$_pe" in
+                (/tmp/*|/var/tmp/*|/dev/shm/*|*"(deleted)") echo "${_pd#/proc/}  ${_pe}  $(tr '\0' ' ' < "$_pd/cmdline" 2>/dev/null | cut -c1-120)" ;;
+            esac
+        done 2>/dev/null \
         | head -10 || true
     )
 
@@ -794,8 +841,8 @@ _lg_analyze() {
         echo "[WARN] System file modified: $f" >> "$LG_ANALYZE_LOG"
         FILE_ISSUES=$((FILE_ISSUES+1))
     done < <(find /etc /usr/bin /usr/sbin /bin /sbin \
-        -newer /proc/1/exe -type f 2>/dev/null \
-        | grep -vE "\.pyc$|__pycache__|\.log$" | head -10 || true)
+        -mmin -1440 -type f 2>/dev/null \
+        | grep -vE "\.pyc$|__pycache__|\.log$|/etc/pki/ca-trust/extracted/|/etc/ld\.so\.cache$|/etc/resolv\.conf$|/etc/mtab$|/etc/adjtime$|/etc/\.updated$|/etc/aliases\.db$|/etc/csf/|/etc/lg/" | head -10 || true)
     [ "$FILE_ISSUES" -eq 0 ] && echo -e "    ${GREEN}✓${NC} No system files modified"
     ISSUES=$((ISSUES+FILE_ISSUES))
 
@@ -849,13 +896,14 @@ _lg_analyze() {
     local KNOWN_PORTS="20|21|22|25|53|80|110|143|443|465|587|953|993|995|2812|3306|5432|8080|8443|8787|9000|9090|2030|2031|2082|2083|2086|2087|2095|2096|2302|2525|11211|6379"
     while IFS= read -r port_line; do
         local lport
-        lport=$(echo "$port_line" | awk '{print $5}' | rev | cut -d: -f1 | rev || true)
+        # `ss -Htlnp` prints: State Recv-Q Send-Q Local Peer Process
+        lport=$(echo "$port_line" | awk '{print $4}' | rev | cut -d: -f1 | rev || true)
         if ! echo "$lport" | grep -qE "^(${KNOWN_PORTS})$"; then
             echo -e "    ${YELLOW}⚠${NC} Unexpected port: $port_line"
             echo "[INFO] Unexpected listening port: $port_line" >> "$LG_ANALYZE_LOG"
             PORT_ISSUES=$((PORT_ISSUES+1))
         fi
-    done < <(ss -tlnp 2>/dev/null | tail -n +2 || true)
+    done < <(ss -Htlnp 2>/dev/null || true)
     [ "$PORT_ISSUES" -eq 0 ] && echo -e "    ${GREEN}✓${NC} All listening ports look normal"
 
     echo ""
@@ -973,10 +1021,19 @@ _lg_auto_analyze() {
         while true; do
             {
                 echo "# ── Auto-analyze $(date '+%Y-%m-%d %H:%M:%S') ──"
-                # 1. Suspicious processes
-                ps aux 2>/dev/null | grep -E "/tmp/|/dev/shm" | \
-                    grep -v grep | while read -r p; do
+                # 1. Suspicious processes — one mail per distinct command line
+                #    per hour (mysqld --socket=/tmp/mysql.sock used to mail root
+                #    every 5 minutes forever)
+                _SEEN=/run/lg-analyze.seen; touch "$_SEEN"
+                for _pd in /proc/[0-9]*; do
+                    _pe=$(readlink "$_pd/exe" 2>/dev/null) || continue
+                    case "$_pe" in (/tmp/*|/var/tmp/*|/dev/shm/*) echo "${_pd#/proc/} ${_pe} $(tr '\0' ' ' < "$_pd/cmdline" 2>/dev/null | cut -c1-120)" ;; esac
+                done 2>/dev/null | while read -r p; do
                     echo "[AUTO-WARN] Suspicious process: $p"
+                    _sig=$(printf '%s' "${p#* }" | md5sum | cut -c1-16)
+                    _last=$(grep "^${_sig} " "$_SEEN" 2>/dev/null | cut -d" " -f2)
+                    [ -n "$_last" ] && [ $(( $(date +%s) - _last )) -lt 3600 ] && continue
+                    { grep -v "^${_sig} " "$_SEEN" 2>/dev/null; echo "${_sig} $(date +%s)"; } > "${_SEEN}.tmp" && mv "${_SEEN}.tmp" "$_SEEN"
                     command -v mail &>/dev/null && \
                         echo "$p" | mail \
                             -s "[LG AUTO-ALERT] Suspicious process: $(hostname)" \
@@ -1096,8 +1153,8 @@ _php2shell_state() {
     ver=$("$bin" -n -v 2>/dev/null | sed -n 's/^PHP \([0-9][0-9.]*\).*/\1/p' | head -1)
     [ -n "$ver" ] || { echo "?|unknown"; return 0; }
     if command -v rpm >/dev/null 2>&1 && pkg=$(rpm -qf "$bin" 2>/dev/null) && [[ "$pkg" != *"not owned"* ]]; then
-        rpm -q --changelog "$pkg" 2>/dev/null | grep -q "CVE-2026-10961[89]" \
-            && { echo "$ver|vendor-patched"; return 0; }
+        local _cl; _cl=$(rpm -q --changelog "$pkg" 2>/dev/null || true)
+        grep -q "CVE-2026-10961[89]" <<< "$_cl" && { echo "$ver|vendor-patched"; return 0; }
     elif command -v dpkg >/dev/null 2>&1 && pkg=$(dpkg -S "$bin" 2>/dev/null | head -1 | cut -d: -f1) && [ -n "$pkg" ]; then
         zgrep -q "CVE-2026-10961[89]" "/usr/share/doc/${pkg}/changelog.Debian.gz" 2>/dev/null \
             && { echo "$ver|vendor-patched"; return 0; }
@@ -1355,7 +1412,7 @@ _lg_status() {
     echo ""
     echo -e "${BOLD}${CYAN}"
     echo "────────────────────────────────────────────────────────────────────────"
-    echo "   Linux Guardian v1.2 — Security Status Dashboard"
+    echo "   Linux Guardian v1.2.1 — Security Status Dashboard"
     printf "   Last applied: %s\n" "$LAST_RUN"
     echo "────────────────────────────────────────────────────────────────────────"
     echo -e "${NC}"
@@ -1366,7 +1423,10 @@ _lg_status() {
         || echo -e "  ${RED}✗${NC} $2"; }
 
     # [1] Binary Lockdown
-    ls -l /usr/bin/socat 2>/dev/null | grep -q "rwxr-x---" && _BIN=0 || _BIN=1
+    _BIN=1
+    for _b in /usr/bin/socat /usr/bin/nc /usr/bin/ncat /usr/bin/gcc /usr/bin/perl /usr/bin/wget; do
+        [ -e "$_b" ] && [ "$(stat -c %a "$_b" 2>/dev/null)" = "750" ] && { _BIN=0; break; }
+    done
     _st "$_BIN" "[1] Binary Lockdown       — $([ $_BIN -eq 0 ] && echo 'active' || echo 'not applied')"
 
     # [2] Kernel Hardening
@@ -1615,13 +1675,13 @@ watch_mode() {
     done < <(detect_site_paths)
 
     log_info "Sites found: ${#_CURRENT_SITES[@]}"
-    for _s in "${_CURRENT_SITES[@]}"; do
+    for _s in ${_CURRENT_SITES[@]+"${_CURRENT_SITES[@]}"}; do
         log_info "  → ${_s}"
     done
     echo ""
 
     # ── Apply noexec/nosuid/nodev to /tmp, /var/tmp, and all site dirs ────────
-    for _noexec_dir in /tmp /var/tmp "${_CURRENT_SITES[@]}"; do
+    for _noexec_dir in /tmp /var/tmp ${_CURRENT_SITES[@]+"${_CURRENT_SITES[@]}"}; do
         [ -d "$_noexec_dir" ] || continue
         if mount 2>/dev/null | grep -qE " on ${_noexec_dir} .*noexec"; then
             log_skip "noexec already active: ${_noexec_dir}"
@@ -1651,7 +1711,7 @@ watch_mode() {
     _PANEL_NAME="${_PANEL_INFO%%:*}"
     _W_TMPF=$(mktemp)
     { find / -maxdepth 7 -type f -name "php.ini" 2>/dev/null || true; } \
-        | grep -v "/cli/" | sort -u > "$_W_TMPF"
+        | { grep -v "/cli/" || true; } | sort -u > "$_W_TMPF"
 
     _UPDATED=0
     while IFS= read -r inifile; do
@@ -1674,7 +1734,7 @@ watch_mode() {
 
         # ── Build new open_basedir ────────────────────────────────────────────
         _NEW_OBD="/tmp:/usr/share/php:/usr/share/pear"
-        for _site in "${_CURRENT_SITES[@]}"; do
+        for _site in ${_CURRENT_SITES[@]+"${_CURRENT_SITES[@]}"}; do
             [ -d "$_site" ] && _NEW_OBD="${_NEW_OBD}:${_site}"
         done
 
@@ -1700,7 +1760,7 @@ watch_mode() {
 
     # ── Restart web server if updated (FIX: was inlined 12-line loop) ────────
     if [ "$_UPDATED" -gt 0 ]; then
-        restart_active_webserver
+        restart_active_webserver || log_warn "No active web server to restart"
         log_ok "Watch complete — ${_UPDATED} file(s) updated"
     else
         log_ok "Watch complete — open_basedir already in sync"
@@ -1723,10 +1783,10 @@ _lg_update() {
 
     # Download
     if command -v curl &>/dev/null; then
-        curl -fsSL "$UPDATE_URL" -o "$TMP_FILE" 2>/dev/null \
+        curl -fsSL --max-time 60 --retry 2 "$UPDATE_URL" -o "$TMP_FILE" 2>/dev/null \
             || { log_error "Download failed — check: ${UPDATE_URL}"; rm -f "$TMP_FILE"; exit 1; }
     elif command -v wget &>/dev/null; then
-        wget -q "$UPDATE_URL" -O "$TMP_FILE" 2>/dev/null \
+        wget -q --timeout=60 --tries=2 "$UPDATE_URL" -O "$TMP_FILE" 2>/dev/null \
             || { log_error "Download failed — check: ${UPDATE_URL}"; rm -f "$TMP_FILE"; exit 1; }
     else
         log_error "curl or wget required for update"
@@ -1744,19 +1804,32 @@ _lg_update() {
     # Extract version from downloaded file
     local NEW_VER
     NEW_VER=$(grep -m1 "^# Linux Guardian v" "$TMP_FILE" 2>/dev/null \
-        | grep -oE 'v[0-9]+.[0-9]+' | head -1 || echo "unknown")
+        | grep -oE 'v[0-9]+(\.[0-9]+)+' | head -1 || echo "unknown")
 
     # Extract current version
     local CUR_VER
     CUR_VER=$(grep -m1 "^# Linux Guardian v" "$INSTALL_PATH" 2>/dev/null \
-        | grep -oE 'v[0-9]+.[0-9]+' | head -1 || echo "unknown")
+        | grep -oE 'v[0-9]+(\.[0-9]+)+' | head -1 || echo "unknown")
 
     log_info "Current version: ${CUR_VER}"
     log_info "New version:     ${NEW_VER}"
     echo ""
+    if [ "$NEW_VER" = "unknown" ]; then
+        log_error "Downloaded file is not a Linux Guardian release (no version header) — aborting update"
+        rm -f "$TMP_FILE"
+        exit 1
+    fi
 
     if [ "$NEW_VER" = "$CUR_VER" ] && [ "$NEW_VER" != "unknown" ]; then
         log_ok "Already up to date (${CUR_VER})"
+        rm -f "$TMP_FILE"
+        exit 0
+    fi
+    # never replace a newer local build with an older download (mirror lag,
+    # a rolled-back release): install only when the download sorts higher
+    if [ "$NEW_VER" != "unknown" ] && [ "$CUR_VER" != "unknown" ] && \
+       [ "$(printf '%s\n%s\n' "${NEW_VER#v}" "${CUR_VER#v}" | sort -V | tail -1)" = "${CUR_VER#v}" ]; then
+        log_warn "Downloaded ${NEW_VER} is older than installed ${CUR_VER} — not installing"
         rm -f "$TMP_FILE"
         exit 0
     fi
@@ -1866,7 +1939,12 @@ for arg in "$@"; do
         --auto-analyze)   AUTO_ANALYZE_MODE=true ;;
         --integrity)      INTEGRITY_MODE=true ;;
         --update)         UPDATE_MODE=true ;;
+        --analyze)        ANALYZE_MODE=true ;;
+        --version|-V)     grep -m1 "^# Linux Guardian v" "$0" | grep -oE 'v[0-9]+(\.[0-9]+)+'; exit 0 ;;
         --help|-h)        HELP_MODE=true ;;
+        --cron|--setup-auto|--upgrade-packages|--path|--path=*) ;;   # handled elsewhere / positional
+        --*)              echo "Unknown option: $arg  (see: lg --help)" >&2; exit 2 ;;
+        *)                ;;                           # positional (scan path)
     esac
 done
 
@@ -1876,6 +1954,7 @@ if [ "$UPDATE_MODE" = true ];       then _lg_update;       exit 0; fi
 if [ "$FIXMAIL_MODE" = true ];      then _lg_fixmail;      exit 0; fi
 if [ "$PHP2SHELL_MODE" = true ];    then print_banner; _lg_php2shell; exit 0; fi
 if [ "$CVES_MODE" = true ];         then print_banner; _lg_cves;      exit 0; fi
+if [ "$ANALYZE_MODE" = true ];      then print_banner; _lg_analyze;   exit 0; fi
 if [ "$AUTO_ANALYZE_MODE" = true ]; then _lg_auto_analyze; exit 0; fi
 if [ "$INTEGRITY_MODE" = true ];    then _lg_integrity;    exit 0; fi
 if [ "$SCAN_MODE" = true ]; then
@@ -1932,7 +2011,11 @@ PHP_TIMEZONE=$(_detect_timezone)
 
 if [[ "$RUN_MODE" == "interactive" ]] && [ "$DRY_RUN" = false ] && [ "$UNDO_MODE" = false ]; then
     echo ""
-    read -r -p "  Alert email for security notifications (default: root): " _INPUT_EMAIL
+    if [ -t 0 ]; then
+        read -r -p "  Alert email for security notifications (default: root): " _INPUT_EMAIL || _INPUT_EMAIL=""
+    else
+        _INPUT_EMAIL=""
+    fi
     [ -n "$_INPUT_EMAIL" ] && ALERT_EMAIL="$_INPUT_EMAIL"
     echo -e "  ${GREEN}[OK]${NC}      Alert email: ${ALERT_EMAIL}"
     echo ""
@@ -1978,10 +2061,13 @@ if [ "$UNDO_MODE" = true ]; then
     log_info "Manifest: $LATEST"
     echo ""
 
+    # Replay newest change first: a file backed up twice in one run (Layer 5,
+    # then Part B) must end up as its Layer-5 copy — the original.
     while IFS= read -r line; do
         [ -z "$line" ] && continue
         T="${line%%:*}"
         REST="${line#*:}"
+        if [ "$DRY_RUN" = true ]; then log_dry "undo ${T}: ${REST}"; continue; fi
         case "$T" in
             FILE)
                 ORIG="${REST%%:*}"
@@ -2002,15 +2088,28 @@ if [ "$UNDO_MODE" = true ]; then
                 fi
                 ;;
             MOUNT_NOEXEC)
-                MNT="$REST"
-                mount -o remount,exec "$MNT" 2>/dev/null \
-                    && log_ok "Re-enabled exec: $MNT" \
-                    || log_warn "Could not remount: $MNT"
+                MNT="${REST%%:*}"; HOW="${REST#*:}"; [ "$HOW" = "$REST" ] && HOW=remount
+                case "$HOW" in
+                    bind|tmpfs) umount "$MNT" 2>/dev/null && log_ok "Unmounted noexec layer: $MNT" \
+                                    || log_warn "Could not unmount: $MNT (busy?)" ;;
+                    *)          mount -o remount,exec,suid,dev "$MNT" 2>/dev/null && log_ok "Re-enabled exec: $MNT" \
+                                    || log_warn "Could not remount: $MNT" ;;
+                esac
                 ;;
-            FSTAB_TMP)
-                sed -i '/Linux Guardian: noexec/d'    /etc/fstab 2>/dev/null || true
-                sed -i '/tmpfs.*noexec.*nosuid/d'     /etc/fstab 2>/dev/null || true
-                log_ok "Removed noexec entries from /etc/fstab"
+            FSTAB_LINE)
+                # remove exactly the line we added (and our comment above it)
+                _esc=$(printf '%s' "$REST" | sed 's/[][\\.*^$/]/\\&/g')
+                sed -i "/^${_esc}\$/d; /^# Linux Guardian: noexec /d" /etc/fstab 2>/dev/null || true
+                log_ok "Removed from /etc/fstab: ${REST%% *} ${REST#* }"
+                ;;
+            FSTAB_SUB)
+                sed -i "/\s${REST//\//\\/}\s/ s/defaults,noexec,nosuid,nodev/defaults/" /etc/fstab 2>/dev/null || true
+                log_ok "Reverted noexec options in /etc/fstab: $REST"
+                ;;
+            FSTAB_TMP)   # manifests written by lg <= 1.2
+                sed -i '/Linux Guardian: noexec/d' /etc/fstab 2>/dev/null || true
+                sed -i '/^tmpfs\s\+\(\/tmp\|\/var\/tmp\)\s\+tmpfs\s\+defaults,noexec,nosuid,nodev,size=/d' /etc/fstab 2>/dev/null || true
+                log_ok "Removed lg noexec entries from /etc/fstab"
                 ;;
             MODPROBE)
                 rm -f "$REST" && log_ok "Removed modprobe conf: $REST"
@@ -2043,7 +2142,9 @@ if [ "$UNDO_MODE" = true ]; then
                 log_ok "Removed: $REST"
                 ;;
         esac
-    done < "$LATEST"
+    done < <(tac "$LATEST")
+    # a consumed manifest must not be replayed over newer edits
+    [ "$DRY_RUN" = true ] || mv "$LATEST" "${LATEST}.done" 2>/dev/null || true
 
     echo ""
     log_ok "Undo complete — system restored to previous state"
@@ -2053,7 +2154,18 @@ fi
 # ══════════════════════════════════════════════════════════════════════════════
 # PRE-FLIGHT: Update packages
 # ══════════════════════════════════════════════════════════════════════════════
-if [ "$DRY_RUN" = false ]; then
+UPGRADE_PACKAGES=false
+for _a in "$@"; do [ "$_a" = "--upgrade-packages" ] && UPGRADE_PACKAGES=true; done
+if [ "$DRY_RUN" = false ] && [ "$UPGRADE_PACKAGES" = false ] && [ "$RUN_MODE" != "auto" ] && [ -t 0 ]; then
+    echo ""
+    read -r -p "  Upgrade all system packages first (kernel, PHP, MariaDB may restart)? [y/N]: " -n 1 _UPG || _UPG=""
+    echo ""
+    [[ "$_UPG" =~ ^[Yy]$ ]] && UPGRADE_PACKAGES=true
+fi
+if [ "$DRY_RUN" = false ] && [ "$UPGRADE_PACKAGES" = false ]; then
+    log_info "Pre-flight: package upgrade skipped (run with --upgrade-packages, or answer y) — Part D reports what is pending"
+fi
+if [ "$DRY_RUN" = false ] && [ "$UPGRADE_PACKAGES" = true ]; then
     section "Pre-flight: Updating System Packages"
     if command -v apt-get &>/dev/null; then
         DEBIAN_FRONTEND=noninteractive apt-get update -qq   2>&1 | tail -2 || true
@@ -2404,6 +2516,29 @@ TMPF=$(mktemp)
 while IFS= read -r line; do PHP_INI_FILES+=("$line"); done < "$TMPF"
 rm -f "$TMPF"
 
+# Never touch panel-private php.ini (the panel UI/webmail need exec) nor
+# per-site/per-user php.ini under docroots (a combined open_basedir there
+# would let one account read every other). Applies in every mode — the
+# interactive "a=all" used to include them.
+_PANEL_INFO=$(detect_panel); _PANEL_NAME="${_PANEL_INFO%%:*}"
+_INI_KEEP=()
+for _ini in ${PHP_INI_FILES[@]+"${PHP_INI_FILES[@]}"}; do
+    case "$_ini" in
+        /home/*|/var/www/*|/srv/*|/usr/share/*|/root/*|/tmp/*|/var/tmp/*|*/public_html/*|*/htdocs/*|*/httpdocs/*) continue ;;
+    esac
+    case "$_PANEL_NAME" in
+        CWP)        [[ "$_ini" == /usr/local/cwp/* || "$_ini" == /opt/alt/* ]]          && continue ;;
+        cPanel)     [[ "$_ini" == /usr/local/cpanel/* || "$_ini" == /opt/cpanel/* ]]   && continue ;;
+        Plesk)      [[ "$_ini" == /opt/plesk/* || "$_ini" == /usr/local/psa/* ]]       && continue ;;
+        CyberPanel) [[ "$_ini" == /usr/local/lsws/* ]]                                  && continue ;;
+        aaPanel)    [[ "$_ini" == /www/server/php/* ]]                                  && continue ;;
+        InterWorx)  [[ "$_ini" == /usr/local/interworx/* ]]                             && continue ;;
+        CentminMod) [[ "$_ini" == /usr/local/lib/php* ]]                                && continue ;;
+    esac
+    _INI_KEEP+=("$_ini")
+done
+PHP_INI_FILES=(${_INI_KEEP[@]+"${_INI_KEEP[@]}"})
+
 if [ ${#PHP_INI_FILES[@]} -eq 0 ]; then
     log_warn "No php.ini found — skipping PHP hardening"
     PHP_SKIP=true
@@ -2428,8 +2563,7 @@ else
             case "$_PANEL_NAME" in
                 CWP)        [[ "$_ini" == /usr/local/cwp/* ]]        && continue ;;
                 cPanel)     [[ "$_ini" == /usr/local/cpanel/* ]]     && continue ;;
-                Plesk)      [[ "$_ini" == /opt/plesk/* ]]            && continue ;;
-                Plesk)      [[ "$_ini" == /usr/local/psa/* ]]        && continue ;;
+                Plesk)      [[ "$_ini" == /opt/plesk/* || "$_ini" == /usr/local/psa/* ]] && continue ;;
                 CyberPanel) [[ "$_ini" == /usr/local/lsws/* ]]       && continue ;;
                 HestiaCP)   [[ "$_ini" == /etc/php/* ]]              && continue ;;
                 VestaCP)    [[ "$_ini" == /etc/php/* ]]              && continue ;;
@@ -2459,7 +2593,7 @@ else
                 SELECTED_FILES=("${PHP_INI_FILES[@]}")
             else
                 IFS=',' read -ra nums <<< "$choice"
-                for n in "${nums[@]}"; do
+                for n in ${nums[@]+"${nums[@]}"}; do
                     n=$(echo "$n" | tr -d ' ')
                     if [[ "$n" =~ ^[0-9]+$ ]] && \
                        [ "$n" -ge 1 ] && [ "$n" -le "${#PHP_INI_FILES[@]}" ]; then
@@ -2520,7 +2654,7 @@ if [ "$PHP_SKIP" = false ] && [ ${#SELECTED_FILES[@]} -gt 0 ]; then
 
         # ── Global security settings (FIX: was using declare -A PHPSEC; now
         #    uses flat key:value pairs from global PHPSEC_PAIRS array) ────────
-        local _pair _key _val
+        _pair=""; _key=""; _val=""
         for _pair in "${PHPSEC_PAIRS[@]}"; do
             _key="${_pair%%:*}"
             _val="${_pair#*:}"
@@ -2551,7 +2685,7 @@ if [ "$PHP_SKIP" = false ] && [ ${#SELECTED_FILES[@]} -gt 0 ]; then
             done < <(detect_site_paths)
 
             # ── Panel-specific paths not covered by detect_site_paths ────────
-            local _panel_extra=(
+            _panel_extra=(
                 /usr/local/cwpsrv/htdocs
                 /var/www/vhosts/*/httpdocs
                 /var/www/vhosts/*/web
@@ -2563,7 +2697,7 @@ if [ "$PHP_SKIP" = false ] && [ ${#SELECTED_FILES[@]} -gt 0 ]; then
                 /home/*/htdocs
                 /var/customers/webs/*
             )
-            local _pe
+            _pe=""
             for _pe in "${_panel_extra[@]}"; do
                 # shellcheck disable=SC2086
                 for _d in $_pe; do
@@ -2578,7 +2712,7 @@ if [ "$PHP_SKIP" = false ] && [ ${#SELECTED_FILES[@]} -gt 0 ]; then
 
             if [ ${#_SITES_OBD[@]} -gt 0 ]; then
                 # Build combined open_basedir
-                local _OBD_VALUE=""
+                _OBD_VALUE=""
                 for _s in "${_SITES_OBD[@]}"; do
                     _OBD_VALUE="${_OBD_VALUE}${_s}:"
                 done
@@ -2704,6 +2838,7 @@ setup_phpfpm_pools() {
     LOG_BASE="/var/log/php-fpm"
     [ "$DRY_RUN" = false ] && mkdir -p "$SESSION_BASE" "$LOG_BASE"
 
+    _NEW_POOLS=()
     for site in "${SITES[@]}"; do
         # Derive site name and user
         if [[ "$site" == /home/* ]]; then
@@ -2715,6 +2850,10 @@ setup_phpfpm_pools() {
             SITE_USER=$(stat -c '%U' "$site" 2>/dev/null || echo "www-data")
             SITE_ROOT="$site"
         fi
+        # the name lands in an unquoted heredoc and in file names: letters,
+        # digits, dot, dash, underscore only; not the web server's own dirs
+        SITE_NAME=$(printf '%s' "$SITE_NAME" | tr -c 'A-Za-z0-9_.-' '_')
+        case "$SITE_NAME" in cgi-bin|html|icons|error|manual|"") continue ;; esac
 
         # SECURITY: refuse root-owned sites — running PHP-FPM as root
         # would defeat the entire pool-isolation layer.
@@ -2733,10 +2872,16 @@ setup_phpfpm_pools() {
         SOCK_GROUP=$(id -gn "$SOCK_OWNER" 2>/dev/null || echo "$SOCK_OWNER")
 
         POOL_CONF="${POOL_DIR}/${SITE_NAME}.conf"
-        SOCK_PATH="/run/php-fpm/${SITE_NAME}.sock"
+        # socket directory: whatever the distro's own pool uses (/run/php on
+        # Debian/Ubuntu, /run/php-fpm on RHEL); fall back to /run/php-fpm
+        SOCK_DIR=$(grep -hE '^\s*listen\s*=\s*/' "${POOL_DIR}"/www.conf 2>/dev/null | head -1 | sed -E 's/.*=\s*//; s|/[^/]*$||')
+        [ -n "$SOCK_DIR" ] || SOCK_DIR=/run/php-fpm
+        SOCK_PATH="${SOCK_DIR}/${SITE_NAME}.sock"
         SESSION_PATH="${SESSION_BASE}/${SITE_NAME}"
         ERROR_LOG="${LOG_BASE}/${SITE_NAME}-error.log"
-        OPEN_BASEDIR="${SITE_ROOT}:/tmp:/usr/share/php:/usr/share/pear"
+        # the session dir and log dir MUST be inside open_basedir or every
+        # session write fails and nobody can log in
+        OPEN_BASEDIR="${SITE_ROOT}:${SESSION_PATH}:${LOG_BASE}:/tmp:/usr/share/php:/usr/share/pear"
 
         log_info "Pool: ${SITE_NAME}  user=${SITE_USER}  root=${SITE_ROOT}"
 
@@ -2746,10 +2891,13 @@ setup_phpfpm_pools() {
             continue
         fi
 
-        mkdir -p "$SESSION_PATH" 2>/dev/null
-        chown "${SITE_USER}:${SITE_GROUP}" "$SESSION_PATH" 2>/dev/null
-        chmod 700 "$SESSION_PATH" 2>/dev/null
-        backup_file "$POOL_CONF" "phpfpm_pool"
+        mkdir -p "$SESSION_PATH" "$SOCK_DIR" 2>/dev/null || true
+        chown "${SITE_USER}:${SITE_GROUP}" "$SESSION_PATH" 2>/dev/null || true
+        chmod 700 "$SESSION_PATH" 2>/dev/null || true
+        # survive reboots when the socket dir lives on tmpfs
+        [ -d /etc/tmpfiles.d ] && printf 'd %s 0755 root root -\n' "$SOCK_DIR" > /etc/tmpfiles.d/lg-php-fpm.conf
+        backup_file "$POOL_CONF" "phpfpm_pool"     # records FILE: or RMFILE: for undo
+        _NEW_POOLS+=("$POOL_CONF")
 
         # SECURITY: quoted heredoc prevents command injection via $SITE_ROOT
         # (was: unquoted `<< EOF` evaluated $ and backticks in site paths).
@@ -2800,8 +2948,6 @@ setup_phpfpm_pools() {
 POOL_EOF
 
         chmod 640 "$POOL_CONF"
-        echo "FILE:${POOL_CONF}:${BACKUP_DIR}/phpfpm_pool_${SITE_NAME}.${TIMESTAMP}" \
-            >> "$UNDO_MANIFEST"
         log_ok "Pool created: $POOL_CONF"
     done
 
@@ -2810,14 +2956,17 @@ POOL_EOF
         echo ""
         # FIX: was unquoted — if $PHPFPM_BIN empty, would run bare "--test" as cmd.
         # FIX: was unquoted — paths with spaces would word-split.
+        _FPM_OK=1
         if [ -x "$PHPFPM_BIN" ] && "$PHPFPM_BIN" --test 2>/dev/null; then
             log_ok "PHP-FPM config test passed"
         else
-            log_warn "PHP-FPM config test failed — check pool files"
-            [ -x "$PHPFPM_BIN" ] && "$PHPFPM_BIN" --test 2>&1 | tail -10
+            _FPM_OK=0
+            log_warn "PHP-FPM config test failed — the pools written in this run are being removed so existing sites keep working"
+            [ -x "$PHPFPM_BIN" ] && { "$PHPFPM_BIN" --test 2>&1 | tail -10 || true; }
+            for _pc in ${_NEW_POOLS[@]+"${_NEW_POOLS[@]}"}; do rm -f "$_pc"; done
         fi
 
-        if [ -n "$PHPFPM_SVC" ]; then
+        if [ -n "$PHPFPM_SVC" ] && [ "$_FPM_OK" = 1 ]; then
             systemctl enable "$PHPFPM_SVC" 2>/dev/null
             systemctl restart "$PHPFPM_SVC" 2>/dev/null \
                 && log_ok "PHP-FPM restarted: $PHPFPM_SVC" \
@@ -2860,42 +3009,53 @@ _apply_noexec_dir() {
             log_dry "remount ${mnt} noexec,nosuid,nodev"
         else
             mount -o remount,noexec,nosuid,nodev "$mnt" 2>/dev/null \
-                && log_ok "${mnt}  →  remounted noexec" \
+                && { log_ok "${mnt}  →  remounted noexec"; echo "MOUNT_NOEXEC:${mnt}:remount" >> "$UNDO_MANIFEST"; } \
                 || { log_warn "${mnt}  →  remount failed"; true; }
-            echo "MOUNT_NOEXEC:${mnt}" >> "$UNDO_MANIFEST"
         fi
 
         # Persist in /etc/fstab
         if [ "$DRY_RUN" = false ]; then
             if grep -qE "\s${mnt}\s" /etc/fstab 2>/dev/null; then
                 if ! grep -E "\s${mnt}\s" /etc/fstab | grep -q "noexec"; then
+                    backup_file /etc/fstab "fstab"
                     sed -i "/\s${mnt//\//\\/}\s/ s/defaults/defaults,noexec,nosuid,nodev/" \
-                        /etc/fstab 2>/dev/null
-                    echo "FSTAB_TMP:${mnt}" >> "$UNDO_MANIFEST"
-                    log_ok "${mnt}  →  noexec persisted in /etc/fstab"
+                        /etc/fstab 2>/dev/null || true
+                    if grep -E "\s${mnt}\s" /etc/fstab | grep -q "noexec"; then
+                        echo "FSTAB_SUB:${mnt}" >> "$UNDO_MANIFEST"
+                        log_ok "${mnt}  →  noexec persisted in /etc/fstab"
+                    else
+                        log_warn "${mnt}  →  fstab line has no 'defaults' option — add noexec,nosuid,nodev by hand"
+                    fi
                 fi
             fi
         fi
 
     elif [ "$allow_tmpfs" = "true" ]; then
-        # Not a mountpoint + tmpfs allowed (/tmp, /var/tmp)
+        # Not a mountpoint (/tmp, /var/tmp on the root fs). On the LIVE system
+        # bind-mount the directory onto itself and flip the flags, so nothing
+        # already in it (mysql.sock, PHP sessions, screen sockets) disappears.
+        # A fresh tmpfs is only configured for the next boot.
         if [ "$DRY_RUN" = true ]; then
-            log_dry "overlay ${mnt} with tmpfs noexec (size=${size})"
+            log_dry "bind-remount ${mnt} noexec now; tmpfs (size=${size}) from next boot"
         else
-            mount -t tmpfs -o "size=${size},noexec,nosuid,nodev" tmpfs "$mnt" 2>/dev/null \
-                && log_ok "${mnt}  →  overlaid with noexec tmpfs (${size})" \
-                || log_warn "${mnt}  →  tmpfs overlay failed"
-            echo "MOUNT_NOEXEC:${mnt}" >> "$UNDO_MANIFEST"
+            if mount --bind "$mnt" "$mnt" 2>/dev/null && mount -o remount,bind,noexec,nosuid,nodev "$mnt" 2>/dev/null; then
+                log_ok "${mnt}  →  noexec (bind, contents kept)"
+                echo "MOUNT_NOEXEC:${mnt}:bind" >> "$UNDO_MANIFEST"
+            else
+                umount "$mnt" 2>/dev/null || true
+                log_warn "${mnt}  →  bind-remount failed"
+            fi
         fi
 
         # Persist in /etc/fstab
         if [ "$DRY_RUN" = false ]; then
             if ! grep -qE "tmpfs\s+${mnt}\s" /etc/fstab 2>/dev/null; then
+                backup_file /etc/fstab "fstab"
+                _fl="tmpfs ${mnt} tmpfs defaults,noexec,nosuid,nodev,size=${size} 0 0"
                 echo "# Linux Guardian: noexec ${mnt}" >> /etc/fstab
-                echo "tmpfs ${mnt} tmpfs defaults,noexec,nosuid,nodev,size=${size} 0 0" \
-                    >> /etc/fstab
-                echo "FSTAB_TMP:${mnt}" >> "$UNDO_MANIFEST"
-                log_ok "${mnt}  →  added to /etc/fstab"
+                echo "$_fl" >> /etc/fstab
+                echo "FSTAB_LINE:${_fl}" >> "$UNDO_MANIFEST"
+                log_ok "${mnt}  →  tmpfs (${size}) in /etc/fstab for the next boot"
             fi
         fi
 
@@ -2907,7 +3067,7 @@ _apply_noexec_dir() {
             if mount --bind "$mnt" "$mnt" 2>/dev/null; then
                 if mount -o remount,noexec,nosuid,nodev,bind "$mnt" 2>/dev/null; then
                     log_ok "${mnt}  →  bind-mounted noexec"
-                    echo "MOUNT_NOEXEC:${mnt}" >> "$UNDO_MANIFEST"
+                    echo "MOUNT_NOEXEC:${mnt}:bind" >> "$UNDO_MANIFEST"
                 else
                     log_warn "${mnt}  →  remount after bind failed"
                     # Undo the bind since remount failed
@@ -3064,11 +3224,16 @@ case "$MAC_SYSTEM" in
 
         if [ "${SE_STATUS}" != "enabled" ]; then
             if [ "$DRY_RUN" = true ]; then
-                log_dry "Enable SELinux in /etc/selinux/config + reboot"
+                log_dry "Enable SELinux as PERMISSIVE in /etc/selinux/config + schedule a relabel (reboot)"
             else
-                sed -i 's/^SELINUX=.*/SELINUX=enforcing/' /etc/selinux/config
-                log_warn "SELinux was disabled — set to enforcing in config"
-                log_warn "A reboot is required to fully enable SELinux"
+                # booting an unlabelled box straight into enforcing is the
+                # classic no-ssh / unbootable outcome: permissive + relabel
+                # first, enforcing on a later run once ausearch -m avc is clean
+                backup_file /etc/selinux/config "selinux"
+                sed -i 's/^SELINUX=.*/SELINUX=permissive/' /etc/selinux/config
+                touch /.autorelabel 2>/dev/null || true
+                log_warn "SELinux was disabled — set to PERMISSIVE and a full relabel is scheduled for the next reboot"
+                log_warn "After the reboot check 'ausearch -m avc -ts boot', then run lg again to switch to enforcing"
             fi
         else
             # Ensure enforcing mode
@@ -3117,14 +3282,14 @@ case "$MAC_SYSTEM" in
                 # FIX: was inside else-block with `declare -A` which can be
                 # unreliable in strict mode under certain bash versions.
                 # Now uses a flat key=value list to keep it portable.
-                local _sebool_pairs=(
+                _sebool_pairs=(
                     "httpd_execmem:off"
                     "httpd_execute_tmp:off"
                     "httpd_unified:off"
                     "httpd_can_network_connect:off"
                     "httpd_can_network_relay:off"
                 )
-                local _pair _bname _bval _current
+                _pair=""; _bname=""; _bval=""; _current=""
                 for _pair in "${_sebool_pairs[@]}"; do
                     _bname="${_pair%%:*}"
                     _bval="${_pair#*:}"
@@ -3147,6 +3312,7 @@ case "$MAC_SYSTEM" in
 
             # ── Fix vmail + Dovecot SELinux contexts ──────────────────────────
             # This is the ONLY panel-specific fix in Layer 7
+            _L7_VMAIL=""; _VMAIL_TYPE=""
             if [ "$DRY_RUN" = false ]; then
                 # FIX: was inlined 4-line loop, now uses shared helper
                 _L7_VMAIL=$(detect_vmail_dir 2>/dev/null) || _L7_VMAIL=""
@@ -3220,7 +3386,9 @@ case "$MAC_SYSTEM" in
                 fi
 
                 # FIX: was inlined ~55 lines, now uses shared helper
-                _install_dovecot_lg_policy "$_VMAIL_TYPE"
+                if [ -n "${_VMAIL_TYPE:-}" ]; then
+                    _install_dovecot_lg_policy "$_VMAIL_TYPE" || log_warn "dovecot_lg policy not installed (checkmodule/semodule_package missing?)"
+                fi
                 # Enable mmap for Dovecot index files
                 setsebool -P domain_can_mmap_files 1 2>/dev/null \
                     && log_ok "SELinux bool: domain_can_mmap_files = on" || true
@@ -3299,9 +3467,9 @@ case "$MAC_SYSTEM" in
                     log_ok "SELinux set to enforcing in /etc/selinux/config"
                 else
                     cat > /etc/selinux/config << 'SECONF'
-                    # Linux Guardian — SELinux configuration
-                    SELINUX=enforcing
-                    SELINUXTYPE=targeted
+# Linux Guardian — SELinux configuration
+SELINUX=enforcing
+SELINUXTYPE=targeted
 SECONF
                     log_ok "SELinux config created"
                 fi
@@ -3458,12 +3626,29 @@ else
         -a always,exit -F arch=b64 -S execve -F auid=unset -F uid=${WWWUID}${WEB_EXCL:+ -F exe!=$WEB_EXCL} -k webshell
 "
 
+        # a b32 rule aborts the whole file on kernels without 32-bit compat
+        # (aarch64, some cloud x86 builds) — probe first
+        B32_RULE="        # (no 32-bit syscall ABI on this kernel)"
+        if auditctl -a never,exit -F arch=b32 -S execve -F key=lg_probe >/dev/null 2>&1; then
+            auditctl -d never,exit -F arch=b32 -S execve -F key=lg_probe >/dev/null 2>&1 || true
+            B32_RULE="        -a always,exit -F arch=b32 -S execve -F dir=/tmp     -k tmp_exec"
+        fi
+        # PHP configuration lives in different places per distro; a watch on
+        # a missing path fails the load at every boot
+        PHP_CONF_RULES=""
+        for _pc in /etc/php /etc/php.ini /etc/php.d /etc/php-fpm.d /usr/local/php/php.ini /usr/local/php/php.d /opt/alt /opt/cpanel/ea-php*/root/etc; do
+            [ -e "$_pc" ] && PHP_CONF_RULES="${PHP_CONF_RULES}        -w ${_pc} -p wa -k php_config
+"
+        done
+        [ -n "$PHP_CONF_RULES" ] || PHP_CONF_RULES="        # (no PHP configuration directory found)
+"
+
         cat > "$AUDIT_RULES" << EOF
         ## Linux Guardian Audit Rules — ${TIMESTAMP}
 
         # Webshell execution — exec from writable dirs
         -a always,exit -F arch=b64 -S execve -F dir=/tmp     -k tmp_exec
-        -a always,exit -F arch=b32 -S execve -F dir=/tmp     -k tmp_exec
+${B32_RULE}
         -a always,exit -F arch=b64 -S execve -F dir=/var/tmp -k tmp_exec
 
         # PHP/web spawning a process (webshell / RCE) — see "webshell rule
@@ -3489,7 +3674,7 @@ ${WEBSHELL_RULES}
         -a always,exit -F arch=b64 -S execve -F dir=/home -k home_exec
 
         # PHP config changes
-        -w /etc/php -p wa -k php_config
+${PHP_CONF_RULES}
 EOF
         chmod 640 "$AUDIT_RULES"
         echo "AUDITD_RULE:${AUDIT_RULES}" >> "$UNDO_MANIFEST"
@@ -3521,6 +3706,18 @@ while IFS= read -r LINE; do
     TS=\$(date '+%Y-%m-%d %H:%M:%S')
     COMM=\$(printf '%s' "\$LINE" | sed -n 's/.* comm="\([^"]*\)".*/\1/p'); COMM=\${COMM:-unknown}
     PID=\$(printf '%s' "\$LINE" | sed -n 's/.* pid=\([0-9]*\).*/\1/p'); PID=\${PID:-?}
+    # account maintenance run by root outside any login session (auid unset):
+    # panel nightly jobs lock system users with passwd -l / usermod. Logged,
+    # not mailed — a real intruder shows up first as webshell/priv_esc.
+    EUID_=\$(printf '%s' "\$LINE" | sed -n 's/.* uid=\([^ ]*\).*/\1/p')
+    AUID_=\$(printf '%s' "\$LINE" | sed -n 's/.* auid=\([^ ]*\).*/\1/p')
+    case "\$COMM" in
+        passwd|usermod|chpasswd|useradd|usermod|groupmod|chage|pwconv|grpconv)
+            if [ "\$EUID_" = 0 ] && { [ "\$AUID_" = 4294967295 ] || [ "\$AUID_" = -1 ] || [ "\$AUID_" = unset ]; }; then
+                echo "\$TS [INFO] \$KEY — \$COMM (PID \$PID) root maintenance, no mail" >> "\$LOG"
+                continue
+            fi ;;
+    esac
     echo "\$TS [ALERT] \$KEY — \$COMM (PID \$PID)" >> "\$LOG"
     STAMP="\$STATE/\$(printf '%s' "\$KEY" | tr -c 'A-Za-z0-9_,' '_')"
     NOW=\$(date +%s); LAST=\$(cat "\$STAMP" 2>/dev/null || echo 0)
@@ -3543,10 +3740,10 @@ ALERTEOF
         if command -v getenforce >/dev/null 2>&1 && [ "$(getenforce 2>/dev/null)" != "Disabled" ]; then
             if command -v semanage >/dev/null 2>&1; then
                 semanage fcontext -a -t audisp_exec_t "${AUDISP_ALERT//./\\.}" 2>/dev/null \
-                  || semanage fcontext -m -t audisp_exec_t "${AUDISP_ALERT//./\\.}" 2>/dev/null
-                restorecon "$AUDISP_ALERT" 2>/dev/null
+                  || semanage fcontext -m -t audisp_exec_t "${AUDISP_ALERT//./\\.}" 2>/dev/null || true
+                restorecon "$AUDISP_ALERT" 2>/dev/null || true
             else
-                chcon -t audisp_exec_t "$AUDISP_ALERT" 2>/dev/null
+                chcon -t audisp_exec_t "$AUDISP_ALERT" 2>/dev/null || true
             fi
             log_ok "SELinux label: $(ls -Z "$AUDISP_ALERT" 2>/dev/null | awk '{print $1}' | cut -d: -f3)"
 
@@ -3556,7 +3753,7 @@ ALERTEOF
             # auditd logs "terminated unexpectedly" and disables the plugin).
             # One allow rule, shipped as a tiny policy module.
             if command -v semodule >/dev/null 2>&1; then
-                command -v checkmodule >/dev/null 2>&1 || { command -v dnf >/dev/null 2>&1 && dnf -q -y install checkpolicy >/dev/null 2>&1; }
+                command -v checkmodule >/dev/null 2>&1 || { command -v dnf >/dev/null 2>&1 && dnf -q -y install checkpolicy >/dev/null 2>&1; } || true
                 if command -v checkmodule >/dev/null 2>&1; then
                     _SPD=$(mktemp -d /tmp/lg-audisp.XXXXXX)
                     cat > "$_SPD/lg-audisp.te" << SEEOF
@@ -3728,9 +3925,9 @@ ALERT="${ALERT_EMAIL}"
 [ -z "\$1" ] || [ ! -f "\$1" ] && exit 0
 if [ "\${UPLOAD_SIZE:-0}" -le "\$MAXSIZE" ] && command -v clamdscan &>/dev/null; then
     # Single scan, capture full output once
-    RESULT=\$(clamdscan --no-summary --infected "\$1" 2>/dev/null)
+    RESULT=\$(clamdscan --fdpass --no-summary --infected "\$1" 2>/dev/null)
     if printf '%s' "\$RESULT" | grep -q FOUND; then
-        clamdscan --remove --no-summary "\$1" 2>/dev/null
+        rm -f "\$1" 2>/dev/null
         printf "Infected upload removed:\n%s\n" "\$RESULT" \
             | mail -s "[LG] Infected Upload" "\$ALERT"
     fi
@@ -3739,10 +3936,35 @@ CLAMAVEOF
         chmod 750 /etc/pure-ftpd/clamav_check.sh
         log_ok "ClamAV scanner: /etc/pure-ftpd/clamav_check.sh"
 
-        pkill -f pure-uploadscript 2>/dev/null || true
-        /usr/sbin/pure-uploadscript -B -r /etc/pure-ftpd/clamav_check.sh 2>/dev/null \
-            && log_ok "pure-uploadscript started" \
-            || log_warn "pure-uploadscript failed — ensure Pure-FTPd is running"
+        # run the upload-script daemon as a service so it survives reboots
+        # (CallUploadScript stays on in the config; without the daemon uploads
+        # would queue to a dead socket)
+        _UPS=$(command -v pure-uploadscript || echo /usr/sbin/pure-uploadscript)
+        if [ -x "$_UPS" ] && [ -d /etc/systemd/system ]; then
+            cat > /etc/systemd/system/lg-uploadscript.service << UPSEOF
+[Unit]
+Description=Linux Guardian — Pure-FTPd upload scanner (ClamAV)
+After=pure-ftpd.service pure-ftpd-mysql.service clamd.service clamav-daemon.service
+[Service]
+Type=simple
+ExecStart=${_UPS} -r /etc/pure-ftpd/clamav_check.sh
+Restart=on-failure
+RestartSec=5
+[Install]
+WantedBy=multi-user.target
+UPSEOF
+            pkill -f pure-uploadscript 2>/dev/null || true
+            systemctl daemon-reload 2>/dev/null || true
+            systemctl enable --now lg-uploadscript.service 2>/dev/null \
+                && log_ok "pure-uploadscript running as lg-uploadscript.service" \
+                || log_warn "lg-uploadscript.service failed to start — ensure Pure-FTPd is running"
+            echo "RMFILE:/etc/systemd/system/lg-uploadscript.service" >> "$UNDO_MANIFEST"
+        else
+            pkill -f pure-uploadscript 2>/dev/null || true
+            "$_UPS" -B -r /etc/pure-ftpd/clamav_check.sh 2>/dev/null \
+                && log_ok "pure-uploadscript started" \
+                || log_warn "pure-uploadscript failed — ensure Pure-FTPd is running"
+        fi
 
         # ── Step 5: Restart Pure-FTPd to activate CallUploadScript ─────────────
         if systemctl restart pure-ftpd 2>/dev/null; then
@@ -3854,43 +4076,62 @@ setup_snuffleupagus() {
     mkdir -p "$SNUFF_DIR"
     chmod 755 "$SNUFF_DIR"
 
-    cat > "$SNUFF_RULES" << 'RULESEOF'
-    # ══════════════════════════════════════════════════════════════════════════════
-    # Linux Guardian — Snuffleupagus Rules (shared — all sites)
-    # ══════════════════════════════════════════════════════════════════════════════
+    # cookie encryption and unserialize HMAC refuse to start without a
+    # secret key — and a missing key means PHP itself refuses to start
+    if [ -f "$SNUFF_RULES" ] && grep -q '^sp.global.secret_key' "$SNUFF_RULES"; then
+        SNUFF_KEY=$(grep -m1 '^sp.global.secret_key' "$SNUFF_RULES" | grep -oE '[0-9a-f]{32,}')
+    fi
+    [ -n "${SNUFF_KEY:-}" ] || SNUFF_KEY=$(openssl rand -hex 32 2>/dev/null || head -c 32 /dev/urandom | od -An -tx1 | tr -d ' \n')
+    backup_file "$SNUFF_RULES" "snuffleupagus"
+    {
+        printf '# Linux Guardian — Snuffleupagus rules (shared — all sites) — %s\n' "$TIMESTAMP"
+        printf 'sp.global.secret_key("%s");\n' "$SNUFF_KEY"
+        # the cookie-encryption key is derived from the secret + a request
+        # variable; the User-Agent survives IP changes (mobile users), the
+        # remote address does not
+        printf 'sp.global.cookie_env_var("HTTP_USER_AGENT");\n'
+        cat << 'RULESEOF'
 
-    # ── Disable dangerous execution functions ─────────────────────────────────────
-    sp.disable_function.function("system").drop();
-    sp.disable_function.function("exec").drop();
-    sp.disable_function.function("shell_exec").drop();
-    sp.disable_function.function("passthru").drop();
-    sp.disable_function.function("popen").drop();
-    sp.disable_function.function("proc_open").drop();
-    sp.disable_function.function("pcntl_exec").drop();
-    sp.disable_function.function("pcntl_fork").drop();
-    sp.disable_function.function("posix_setuid").drop();
-    sp.disable_function.function("posix_setgid").drop();
-    sp.disable_function.function("posix_seteuid").drop();
-    sp.disable_function.function("posix_setegid").drop();
+# ── Dangerous execution functions ─────────────────────────────────────────────
+sp.disable_function.function("system").drop();
+sp.disable_function.function("exec").drop();
+sp.disable_function.function("shell_exec").drop();
+sp.disable_function.function("passthru").drop();
+sp.disable_function.function("popen").drop();
+sp.disable_function.function("proc_open").drop();
+sp.disable_function.function("pcntl_exec").drop();
+sp.disable_function.function("pcntl_fork").drop();
+sp.disable_function.function("posix_setuid").drop();
+sp.disable_function.function("posix_setgid").drop();
+sp.disable_function.function("posix_seteuid").drop();
+sp.disable_function.function("posix_setegid").drop();
 
-    # ── Eval — log first, switch to .drop() when confident ───────────────────────
-    sp.disable_function.function("eval").log();
+# ── eval() is a language construct, not a hookable function: block the
+#    dangerous functions INSIDE eval'd code instead
+sp.eval_blacklist.list("system,exec,shell_exec,passthru,popen,proc_open,pcntl_exec,assert,create_function");
 
-    # ── Cookie protection ─────────────────────────────────────────────────────────
-    sp.cookie.name("*").encrypt().samesite("Strict").readonly();
+# ── Uploads: PHP source must never be written by move_uploaded_file()
+#    (positional parameter — PHP 8 renamed it, names no longer match)
+sp.disable_function.function("move_uploaded_file").pos("1").value_r("\\.ph(p[0-9]?|tml|ar|t)$").drop();
+sp.disable_function.function("move_uploaded_file").pos("1").value_r("\\.ht").drop();
 
-    # ── Block dangerous upload extensions ────────────────────────────────────────
-    sp.upload.disable_upload.extensions("php,phtml,phar,php7,php8,pht").drop();
+# ── Cookies: the session cookie is encrypted (a stolen PHPSESSID is useless
+#    elsewhere); every cookie gets SameSite=Lax (Strict breaks OAuth and
+#    payment-gateway returns) and Secure on HTTPS. HttpOnly is set in php.ini.
+sp.cookie.name("PHPSESSID").encrypt();
+sp.cookie.name_r(".*").samesite("Lax");
+sp.auto_cookie_secure.enable();
 
-    # ── XXE protection ────────────────────────────────────────────────────────────
-    sp.xxe_protection.enable();
+# ── XXE protection
+sp.xxe_protection.enable();
 
-    # ── Unserialize HMAC — prevent object injection ───────────────────────────────
-    sp.unserialize_hmac.enable();
+# ── Unserialize HMAC — object injection
+sp.unserialize_hmac.enable();
 
-    # ── Global strict mode ────────────────────────────────────────────────────────
-    sp.global_strict.enable();
+# ── Strict types for every file is opt-in: it breaks legacy sites
+# sp.global_strict.enable();
 RULESEOF
+    } > "$SNUFF_RULES"
 
     chmod 640 "$SNUFF_RULES"
     log_ok "Shared rules: $SNUFF_RULES"

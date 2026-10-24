@@ -2,7 +2,7 @@
 
 <img src="https://lg.wondtech.com/logo.png" alt="Linux Guardian" width="200">
 
-**[Linux Guardian v1.2](https://lg.wondtech.com/)** — Production-Ready Linux Server Security Hardening https://lg.wondtech.com/
+**[Linux Guardian v1.2.1](https://lg.wondtech.com/)** — Production-Ready Linux Server Security Hardening https://lg.wondtech.com/
 
 ## Overview
 
@@ -114,7 +114,7 @@ After the first run, `sudo lg` automatically shows:
 
 ```
 ────────────────────────────────────────────────────────────────────────
-   Linux Guardian v1.2 — Security Status Dashboard
+   Linux Guardian v1.2.1 — Security Status Dashboard
    Last applied: 2026-10-22 08:08:04
 ────────────────────────────────────────────────────────────────────────
 
@@ -331,6 +331,21 @@ tail -50 /var/log/lg-hardening.log
 ```
 
 ## Changelog
+
+**v1.2.1 — 2026-10-24**
+
+- Full code review: 28 defects fixed. Highlights: `local` used at top level aborted every real run under `set -e` (Layer 5 stopped after the first php.ini); unbound `_VMAIL_TYPE` aborted Layer 7 on SELinux hosts without a mail store; panel-private and per-site php.ini are now excluded in every mode (the interactive "all" used to include them); unknown flags are rejected instead of silently running a full hardening; `--undo` replays newest-first, honours `--dry-run`, removes files it created and reverses mounts/fstab precisely; backups are named by full path (FPM and CLI php.ini no longer overwrite each other).
+- PHP-FPM pools: session and log directories are inside `open_basedir` (logins used to fail), socket directory follows the distro, FPM is restarted only when `--test` passes, otherwise the new pools are removed.
+- noexec: the live `/tmp` and `/var/tmp` are bind-remounted (contents kept) instead of hidden under a fresh tmpfs; the tmpfs line is only written for the next boot.
+- Snuffleupagus rules: `sp.global.secret_key` is generated (encryption/HMAC refused to start without it), `eval` handled via `sp.eval_blacklist`, cookie rule uses the regex form, the non-existent `sp.upload` directive replaced by positional `move_uploaded_file` rules, strict mode opt-in.
+- Audit rules: 32-bit rule only where the kernel supports it, PHP config watch per distro (a missing path failed the whole load at boot).
+- Analyzer: `ss` column positions fixed (every connection and port was "suspicious"), boot-relative file check, mysqld's `/tmp/mysql.sock` no longer mailed every 5 minutes, per-command throttle.
+- SELinux: a disabled host is moved to permissive with a scheduled relabel, never straight to enforcing; `/etc/selinux/config` written with keys at column 0.
+- ClamAV: `--fdpass` so clamd can read user uploads; the upload scanner runs as `lg-uploadscript.service` and survives reboots.
+- Pre-flight full package upgrade is opt-in (`--upgrade-packages` or prompt); Part D reports what is pending.
+- `--scan`: allow-list at `/root/lg/scan.allow` (one path or glob per line) and automatic skipping of files that are byte-identical to lg itself (a published `lg.sh` under a web root is not a reverse shell).
+- Auditd alerts: account maintenance run by root outside a login session (panel nightly jobs locking system users with `passwd -l` / `usermod`) is logged but no longer e-mailed.
+- `--update`: compares full dotted versions and never replaces a newer installed build with an older download.
 
 **v1.2 — 2026-10-22**
 
