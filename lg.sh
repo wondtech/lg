@@ -2658,7 +2658,8 @@ if [ "$PHP_SKIP" = false ] && [ ${#SELECTED_FILES[@]} -gt 0 ]; then
         if [ "$DRY_RUN" = true ]; then
             log_dry "Apply global security settings → $inifile"
             log_dry "  disable_functions (global)"
-            log_dry "  session, error, limits (global)"
+            log_dry "  session + error settings (hosting-grade defaults)"
+            [ "$PHP_STRICT" = true ] && [[ "$inifile" != *cli* ]] && log_dry "  --php-strict: upload/post/memory/time limits, Phar off, cookie_secure, SameSite=Strict"
             log_dry "  open_basedir → set per-site in PART 5.1"
             continue
         fi
